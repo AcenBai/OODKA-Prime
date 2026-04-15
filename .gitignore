@@ -1,0 +1,31 @@
+# Data & model artifacts
+nnUNet/
+biomedparse_preprocessed/
+outputs/
+old_output/
+distangler3_output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.eggs/
+dist/
+build/
+
+# Checkpoints & weights
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
