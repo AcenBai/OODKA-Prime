@@ -1,4 +1,4 @@
-# OODKA: Out-of-Distribution Knowledge Adaptation — Pipeline Reference
+# OODKA: Out-of-Distribution Knowledge Amalgamation — Pipeline Reference
 
 
 OODKA/
