@@ -1,6 +1,6 @@
 # OODKA: Out-of-Distribution Knowledge Amalgamation — Pipeline Reference
 
-
+```
 OODKA/
 ├── oodka/                          # Core Python package
 │   ├── config.py                   # Centralized paths & hyperparameter dataclasses
