@@ -240,8 +240,8 @@ class OODKATrainer:
 
             plot_training_curves(self.history, cfg.output_dir, epoch, self.P)
 
-        log_fh.close()
         _log(f"\nTraining complete. Best val dice: {self.best_val_dice:.4f}")
+        log_fh.close()
 
     @torch.no_grad()
     def _validate_full_cases(
