@@ -29,3 +29,6 @@ build/
 .DS_Store
 Thumbs.db
 
+# Runtime logs
+docs/error_logs.txt
+*.log
