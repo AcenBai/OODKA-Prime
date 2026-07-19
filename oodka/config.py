@@ -9,8 +9,7 @@ parent (SegMan/) by default but can be overridden via environment variables.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-from typing import List, Optional
+from dataclasses import dataclass
 
 
 OODKA_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -60,19 +59,6 @@ def nnunet_results_dir(dataset_name: str, trainer_tag: str) -> str:
     return os.path.join(NNUNET_RESULTS, dataset_name, trainer_tag)
 
 
-def biomedparse_output_dir(dataset_name: str, split: str = "") -> str:
-    """Return BiomedParse preprocessed directory, optionally under a split subfolder.
-
-    Args:
-        split: one of "", "train", "val", "test".
-               Empty string returns the dataset root (backward compat).
-    """
-    base = os.path.join(OODKA_ROOT, "biomedparse_preprocessed", dataset_name)
-    if split:
-        return os.path.join(base, split)
-    return base
-
-
 # ---------------------------------------------------------------------------
 # Training configuration dataclass
 # ---------------------------------------------------------------------------
@@ -85,6 +71,12 @@ class TrainConfig:
     fold: int = 0
     block_z: int = 4
 
+    # Contiguous full-slice-block dual-input data path.
+    image_size: int = 512
+    raw_cache_cases: int = 2
+    require_no_crop: bool = True
+    biomedparse_modality: int = 0
+
     norm_mode: str = "ct"
     window_level: float = 40.0
     window_width: float = 400.0
@@ -92,7 +84,7 @@ class TrainConfig:
     high_percentile: float = 99.0
 
     n_epochs: int = 100
-    batch_size: int = 2
+    batch_size: int = 1
     lr: float = 1e-4
     weight_decay: float = 1e-4
     seed: int = 42
@@ -105,9 +97,8 @@ class TrainConfig:
     p_reg_warmup_epochs: int = 5
     p_reg_decay_epochs: int = 0
 
-    num_epoch_cycles: int = 4
+    num_workers: int = 2
     val_every_epochs: int = 5
-    tile_step_size: float = 0.5
 
     device: str = "cuda:0"
 
@@ -123,9 +114,6 @@ class TrainConfig:
         self.nnunet_model_dir = nnunet_results_dir(
             self.dataset_name, self.nnunet_trainer_tag
         )
-        self.biomedparse_preproc_dir = biomedparse_output_dir(self.dataset_name)
-        self.biomedparse_preproc_train = biomedparse_output_dir(self.dataset_name, "train")
-        self.biomedparse_preproc_val = biomedparse_output_dir(self.dataset_name, "val")
         self.splits_final_json = os.path.join(
             nnunet_preprocessed_dir(self.dataset_name), "splits_final.json"
         )
@@ -134,6 +122,11 @@ class TrainConfig:
         self.nnunet_checkpoint = os.path.join(
             self.nnunet_model_dir, f"fold_{self.fold}", "checkpoint_best.pth"
         )
+        raw_base = nnunet_raw_dir(self.dataset_name)
+        self.imagesTr_dir = os.path.join(raw_base, "imagesTr")
+        self.labelsTr_dir = os.path.join(raw_base, "labelsTr")
+        self.imagesTs_dir = os.path.join(raw_base, "imagesTs")
+        self.labelsTs_dir = os.path.join(raw_base, "labelsTs")
         if not self.output_dir:
             self.output_dir = os.path.join(
                 OUTPUT_BASE, f"oodka_{self.dataset_name}"
@@ -147,6 +140,10 @@ class EvalConfig:
     nnunet_configuration: str = "2d"
     fold: int = 0
     block_z: int = 4
+    batch_size: int = 1
+    image_size: int = 512
+    require_no_crop: bool = True
+    biomedparse_modality: int = 0
 
     norm_mode: str = "ct"
     window_level: float = 40.0
@@ -169,10 +166,6 @@ class EvalConfig:
         self.nnunet_model_dir = nnunet_results_dir(
             self.dataset_name, self.nnunet_trainer_tag
         )
-        self.biomedparse_preproc_dir = biomedparse_output_dir(self.dataset_name)
-        self.biomedparse_preproc_train = biomedparse_output_dir(self.dataset_name, "train")
-        self.biomedparse_preproc_val = biomedparse_output_dir(self.dataset_name, "val")
-        self.biomedparse_preproc_test = biomedparse_output_dir(self.dataset_name, "test")
         self.plans_path = os.path.join(self.nnunet_model_dir, "plans.json")
         self.dataset_json_path = os.path.join(self.nnunet_model_dir, "dataset.json")
         self.nnunet_checkpoint = os.path.join(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -21,7 +21,11 @@ class ClassQueryPooler(nn.Module):
             kdim=C_e, vdim=C_e, batch_first=True,
         )
 
-    def forward(self, F_enc: torch.Tensor):
+    def forward(
+        self,
+        F_enc: torch.Tensor,
+        valid_z: Optional[torch.Tensor] = None,
+    ):
         """
         Args:
             F_enc: [B, C_e, D, H, W]
@@ -30,9 +34,28 @@ class ClassQueryPooler(nn.Module):
         """
         B = F_enc.shape[0]
         X = F_enc.flatten(2).transpose(1, 2)  # [B, S, C_e]
+        key_padding_mask = None
+        if valid_z is not None:
+            if valid_z.shape != (B, F_enc.shape[2]):
+                raise ValueError(
+                    f"valid_z must be [B,D]={B,F_enc.shape[2]}, got {valid_z.shape}"
+                )
+            if not torch.all(valid_z.any(dim=1)):
+                raise ValueError("Each block must contain at least one valid Z slice")
+            key_padding_mask = (
+                ~valid_z.bool()[:, :, None, None]
+                .expand(B, F_enc.shape[2], F_enc.shape[3], F_enc.shape[4])
+                .reshape(B, -1)
+            )
         Q = self.Q.unsqueeze(0).expand(B, self.P, self.d_q)
-        mu, attn = self.multihead_attn(query=Q, key=X, value=X,
-                                        need_weights=True, average_attn_weights=True)
+        mu, attn = self.multihead_attn(
+            query=Q,
+            key=X,
+            value=X,
+            key_padding_mask=key_padding_mask,
+            need_weights=True,
+            average_attn_weights=True,
+        )
         return mu, attn
 
 

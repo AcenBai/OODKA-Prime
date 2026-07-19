@@ -22,31 +22,54 @@ def parse_pixel_decoder_out(pd_out) -> Tuple[torch.Tensor, List[torch.Tensor]]:
     raise RuntimeError("Unexpected pixel_decoder output type")
 
 
-def slice_prompt_features(prompt_features: dict, idx: int) -> dict:
-    """Extract single-prompt features from a multi-prompt batch."""
-    pf = {}
-    for k, v in prompt_features.items():
-        if not torch.is_tensor(v):
-            pf[k] = v
-            continue
-        if k == "grounding_tokens":
-            if v.ndim == 3 and v.shape[1] > 1:
-                pf[k] = v[:, idx:idx + 1, :]
-            elif v.ndim == 3 and v.shape[0] > 1:
-                pf[k] = v[idx:idx + 1]
-            else:
-                pf[k] = v
-        elif k == "class_emb":
-            pf[k] = v[idx:idx + 1, :]
-        elif k == "num_prompts":
-            pf[k] = torch.tensor([1], device=v.device, dtype=v.dtype)
-        else:
-            pf[k] = v
+def expand_prompt_features_for_blocks(
+    prompt_features: dict,
+    *,
+    B: int,
+    Z: int,
+    P: int,
+) -> dict:
+    """Align prompt embeddings with visual samples flattened as ``[B,Z,P]``."""
+    visual_count = int(B) * int(Z)
+    pair_count = visual_count * int(P)
+    expanded = prompt_features.copy()
 
-    if "text" in prompt_features and "text" not in pf:
-        text_val = prompt_features["text"]
-        pf["text"] = [text_val[idx]] if isinstance(text_val, list) and len(text_val) > 1 else text_val
-    return pf
+    grounding = prompt_features.get("grounding_tokens")
+    if not torch.is_tensor(grounding) or grounding.ndim != 3:
+        raise ValueError(
+            "grounding_tokens must be a tensor shaped [L,P,D], "
+            f"got {type(grounding).__name__}"
+        )
+    if grounding.shape[1] != P:
+        raise ValueError(
+            f"grounding_tokens prompt count={grounding.shape[1]} != P={P}"
+        )
+    expanded["grounding_tokens"] = (
+        grounding[:, None, :, :]
+        .expand(-1, visual_count, -1, -1)
+        .reshape(grounding.shape[0], pair_count, grounding.shape[2])
+        .contiguous()
+    )
+
+    class_emb = prompt_features.get("class_emb")
+    if torch.is_tensor(class_emb):
+        if class_emb.ndim != 2 or class_emb.shape[0] != P:
+            raise ValueError(f"class_emb must be [P,D] with P={P}, got {class_emb.shape}")
+        expanded["class_emb"] = (
+            class_emb[None]
+            .expand(visual_count, -1, -1)
+            .reshape(pair_count, class_emb.shape[1])
+            .contiguous()
+        )
+
+    num_prompts = prompt_features.get("num_prompts")
+    if torch.is_tensor(num_prompts):
+        expanded["num_prompts"] = torch.ones(
+            pair_count,
+            device=num_prompts.device,
+            dtype=num_prompts.dtype,
+        )
+    return expanded
 
 
 def select_best_mask_from_queries(
@@ -60,19 +83,41 @@ def select_best_mask_from_queries(
 def run_biomedparse_predictor_override(
     sem_seg_head, multi_scale_features, mask_features, prompt_features,
 ) -> dict:
-    """Call BiomedParse predictor with injected features."""
-    N = multi_scale_features[0].shape[0] if multi_scale_features else mask_features.shape[0]
+    """Call the official predictor with already injected and aligned features."""
+    visual_batch = (
+        multi_scale_features[0].shape[0]
+        if multi_scale_features
+        else mask_features.shape[0]
+    )
+    if mask_features.shape[0] != visual_batch or any(
+        feature.shape[0] != visual_batch for feature in multi_scale_features
+    ):
+        raise ValueError("All predictor visual features must share the same batch size")
     pf = prompt_features.copy()
 
     if "grounding_tokens" in pf and torch.is_tensor(pf["grounding_tokens"]):
         gt = pf["grounding_tokens"]
-        if gt.ndim == 3:
-            pf["grounding_tokens"] = gt.repeat(1, N, 1)
+        if gt.ndim != 3:
+            raise ValueError(f"grounding_tokens must be [L,N,D], got {gt.shape}")
+        if gt.shape[1] == 1 and visual_batch > 1:
+            gt = gt.expand(-1, visual_batch, -1)
+        elif gt.shape[1] != visual_batch:
+            raise ValueError(
+                f"grounding token batch={gt.shape[1]} != visual batch={visual_batch}"
+            )
+        pf["grounding_tokens"] = gt
 
     if "class_emb" in pf and torch.is_tensor(pf["class_emb"]):
         ce = pf["class_emb"]
-        if ce.ndim == 2:
-            pf["class_emb"] = ce.repeat(N, 1)
+        if ce.ndim != 2:
+            raise ValueError(f"class_emb must be [N,D], got {ce.shape}")
+        if ce.shape[0] == 1 and visual_batch > 1:
+            ce = ce.expand(visual_batch, -1)
+        elif ce.shape[0] != visual_batch:
+            raise ValueError(
+                f"class embedding batch={ce.shape[0]} != visual batch={visual_batch}"
+            )
+        pf["class_emb"] = ce
 
     if hasattr(sem_seg_head, "predictor"):
         return sem_seg_head.predictor(multi_scale_features, mask_features, mask=None, extra=pf)

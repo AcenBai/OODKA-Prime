@@ -1,8 +1,8 @@
-"""Core forward pass: training one batch and inference for one patch."""
+"""Core forward passes for contiguous 2.5D OODKA slice blocks."""
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -11,16 +11,15 @@ import torch.nn.functional as F
 
 from ..models.feature_extraction import (
     extract_nnunet_features,
-    extract_biomedparse_backbone_embeds_and_res_levels_3d,
+    extract_biomedparse_backbone_features_2p5d,
 )
 from ..models.biomedparse_helpers import (
+    expand_prompt_features_for_blocks,
     parse_pixel_decoder_out,
-    slice_prompt_features,
     select_best_mask_from_queries,
     run_biomedparse_predictor_override,
 )
 from ..models.losses import (
-    mse_loss,
     ortho_corr_loss,
     spatial_cka_loss,
     entropy_loss,
@@ -69,7 +68,48 @@ def _disentangle_and_inject(
     return out
 
 
-def _compute_ae_ortho_ka_losses(feats: Dict, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _normalized_mse_5d(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    valid_z: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Energy-normalized MSE excluding repeated tail slices."""
+    B, C, D, H, W = target.shape
+    if valid_z.shape != (B, D):
+        raise ValueError(f"valid_z must be [B,D]={B,D}, got {valid_z.shape}")
+    mask = valid_z[:, None, :, None, None].to(target)
+    denom = mask.sum().clamp_min(1.0) * C * H * W
+    error = ((prediction - target).square() * mask).sum() / denom
+    energy = (target.square() * mask).sum() / denom
+    return error / (energy + eps)
+
+
+def _normalized_mse_flat_z(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    valid_z: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Energy-normalized MSE for pixel-decoder tensors shaped [B*Z,C,H,W]."""
+    B, D = valid_z.shape
+    if target.ndim != 4 or target.shape[0] != B * D:
+        raise ValueError(
+            f"Expected pixel-decoder tensor [B*Z,C,H,W] with B*Z={B*D}, "
+            f"got {target.shape}"
+        )
+    mask = valid_z.reshape(B * D, 1, 1, 1).to(target)
+    elements_per_slice = target.shape[1] * target.shape[2] * target.shape[3]
+    denom = mask.sum().clamp_min(1.0) * elements_per_slice
+    error = ((prediction - target).square() * mask).sum() / denom
+    energy = (target.square() * mask).sum() / denom
+    return error / (energy + eps)
+
+
+def _compute_ae_ortho_ka_losses(
+    feats: Dict,
+    valid_z: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute AE reconstruction, orthogonality, and CKA losses across all levels."""
     eps = 1e-8
     levels = [2, 3, 4, 5]
@@ -88,15 +128,15 @@ def _compute_ae_ortho_ka_losses(feats: Dict, device: torch.device) -> Tuple[torc
         Zb_p = feats[f"Zb{i}_p"]
         Zb_s = feats[f"Zb{i}_s"]
 
-        ae_n = mse_loss(Z_n, Zn_p_rec + Zn_s_rec) / (Z_n.pow(2).mean() + eps)
-        ae_b = mse_loss(Zb_res, Zb_p + Zb_s) / (Zb_res.pow(2).mean() + eps)
+        ae_n = _normalized_mse_5d(Zn_p_rec + Zn_s_rec, Z_n, valid_z, eps)
+        ae_b = _normalized_mse_5d(Zb_p + Zb_s, Zb_res, valid_z, eps)
         ae_losses.extend([ae_n, ae_b])
 
-        ortho_losses.append(ortho_corr_loss(Zb_p, Zb_s))
-        ortho_losses.append(ortho_corr_loss(Zn_p, Zn_s))
+        ortho_losses.append(ortho_corr_loss(Zb_p, Zb_s, valid_z=valid_z))
+        ortho_losses.append(ortho_corr_loss(Zn_p, Zn_s, valid_z=valid_z))
 
-        ka_losses.append(spatial_cka_loss(Zb_p, Zn_p))
-        ka_losses.append(spatial_cka_loss(Zb_s, Zn_s))
+        ka_losses.append(spatial_cka_loss(Zb_p, Zn_p, valid_z=valid_z))
+        ka_losses.append(spatial_cka_loss(Zb_s, Zn_s, valid_z=valid_z))
 
     return sum(ae_losses), sum(ortho_losses), sum(ka_losses)
 
@@ -123,11 +163,175 @@ def _run_pixel_decoder(
     return parse_pixel_decoder_out(pd_out)
 
 
+def _fuse_all_prompt_features(
+    private: torch.Tensor,
+    shared: torch.Tensor,
+    tau: torch.Tensor,
+    *,
+    B: int,
+    Z: int,
+) -> torch.Tensor:
+    """Create prompt-specific visual features and flatten in ``[B,Z,P]`` order."""
+    if private.shape != shared.shape or private.ndim != 4:
+        raise ValueError(
+            f"private/shared features must have equal [B*Z,C,H,W] shapes, "
+            f"got {private.shape} and {shared.shape}"
+        )
+    N, C, H, W = private.shape
+    if N != B * Z:
+        raise ValueError(f"Visual batch={N} != B*Z={B*Z}")
+    if tau.ndim != 3 or tau.shape[0] != B or tau.shape[2] != C:
+        raise ValueError(f"tau must be [B,P,C]=[{B},P,{C}], got {tau.shape}")
+    P = tau.shape[1]
+    private_bz = private.reshape(B, Z, C, H, W)[:, :, None]
+    shared_bz = shared.reshape(B, Z, C, H, W)[:, :, None]
+    tau_bzp = tau[:, None, :, :, None, None]
+    fused = tau_bzp * private_bz + (1.0 - tau_bzp) * shared_bz
+    return fused.reshape(B * Z * P, C, H, W).contiguous()
+
+
+def _predict_all_prompt_logits(
+    *,
+    sem_seg_head: nn.Module,
+    mask_features_p: torch.Tensor,
+    mask_features_s: torch.Tensor,
+    ms_p: List[torch.Tensor],
+    ms_s: List[torch.Tensor],
+    tau_mask: torch.Tensor,
+    tau_ms_list: List[torch.Tensor],
+    prompt_features: dict,
+    B: int,
+    Z: int,
+    P: int,
+    output_shape: Tuple[int, int, int],
+) -> torch.Tensor:
+    """Run one predictor call for all aligned visual-prompt pairs."""
+    if tau_mask.shape[:2] != (B, P):
+        raise ValueError(f"tau_mask must start with [B,P]={B,P}, got {tau_mask.shape}")
+    if not (len(ms_p) == len(ms_s) == len(tau_ms_list)):
+        raise ValueError(
+            "private/shared/tau multi-scale feature counts must match, got "
+            f"{len(ms_p)}, {len(ms_s)}, {len(tau_ms_list)}"
+        )
+
+    fused_mask = _fuse_all_prompt_features(
+        mask_features_p, mask_features_s, tau_mask, B=B, Z=Z
+    )
+    fused_multi_scale = [
+        _fuse_all_prompt_features(mp, ms, tau_ms, B=B, Z=Z)
+        for mp, ms, tau_ms in zip(ms_p, ms_s, tau_ms_list)
+    ]
+    expanded_prompts = expand_prompt_features_for_blocks(
+        prompt_features,
+        B=B,
+        Z=Z,
+        P=P,
+    )
+    pred_out = run_biomedparse_predictor_override(
+        sem_seg_head,
+        fused_multi_scale,
+        fused_mask,
+        expanded_prompts,
+    )
+    mask_logits = select_best_mask_from_queries(
+        pred_out["pred_gmasks"], pred_out.get("object_existence")
+    )
+    expected_pairs = B * Z * P
+    if mask_logits.shape[0] != expected_pairs:
+        raise RuntimeError(
+            f"Predictor output batch={mask_logits.shape[0]} != B*Z*P={expected_pairs}"
+        )
+
+    height, width = mask_logits.shape[-2:]
+    logits_bpzhw = (
+        mask_logits.reshape(B, Z, P, height, width)
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+    )
+    out_z, out_h, out_w = (int(value) for value in output_shape)
+    resized = F.interpolate(
+        logits_bpzhw.reshape(B * P, 1, Z, height, width),
+        size=(out_z, out_h, out_w),
+        mode="trilinear",
+        align_corners=False,
+    )
+    return resized.reshape(B, P, out_z, out_h, out_w)
+
+
+def _compute_segmentation_loss_and_metrics(
+    logits: torch.Tensor,
+    gt: torch.Tensor,
+    valid_z: torch.Tensor,
+    class_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, float, Dict[int, float | None]]:
+    """Vectorized BCE/Dice objective over all ``B*P`` class-volume pairs."""
+    B, P, Z, H, W = logits.shape
+    if gt.shape != (B, Z, H, W):
+        raise ValueError(f"GT must be [B,Z,H,W]={B,Z,H,W}, got {gt.shape}")
+    if valid_z.shape != (B, Z):
+        raise ValueError(f"valid_z must be [B,Z]={B,Z}, got {valid_z.shape}")
+    if class_ids.shape != (P,):
+        raise ValueError(f"class_ids must be [P]={P}, got {class_ids.shape}")
+
+    valid = (gt != -1) & valid_z[:, :, None, None]
+    valid_bp = valid[:, None]
+    valid_float = valid_bp.float()
+    gt_all = gt[:, None] == class_ids[None, :, None, None, None]
+    gt_float = gt_all.float()
+
+    valid_voxels = valid_bp.flatten(2).sum(dim=2).float()
+    threshold = valid_voxels * 0.0005
+    gt_foreground = (gt_all & valid_bp).flatten(2).sum(dim=2).float()
+    gt_empty = gt_foreground < threshold
+
+    bce = F.binary_cross_entropy_with_logits(logits, gt_float, reduction="none")
+    denominator = valid_float.sum(dim=(2, 3, 4)).clamp_min(1.0)
+    bce_per_pair = (bce * valid_float).sum(dim=(2, 3, 4)) / denominator
+
+    probabilities = torch.sigmoid(logits) * valid_float
+    targets = gt_float * valid_float
+    intersection = (probabilities * targets).sum(dim=(2, 3, 4))
+    union = probabilities.sum(dim=(2, 3, 4)) + targets.sum(dim=(2, 3, 4))
+    dice_soft = (2.0 * intersection + 1e-6) / (union + 1e-6)
+    dice_loss = 1.0 - dice_soft
+
+    loss_per_pair = torch.where(
+        gt_empty,
+        bce_per_pair,
+        bce_per_pair + dice_loss,
+    )
+    pair_weights = torch.where(
+        gt_empty,
+        torch.full_like(loss_per_pair, 0.5),
+        torch.ones_like(loss_per_pair),
+    )
+    loss_seg = (pair_weights * loss_per_pair).sum() / pair_weights.sum().clamp_min(1e-6)
+
+    dice_values = []
+    dice_per_class: Dict[int, float | None] = {}
+    with torch.no_grad():
+        predicted = torch.sigmoid(logits) > 0.5
+        hard_intersection = (predicted & gt_all & valid_bp).flatten(2).sum(2).float()
+        hard_union = (
+            (predicted & valid_bp).flatten(2).sum(2).float() + gt_foreground
+        )
+        hard_dice = (2.0 * hard_intersection + 1e-6) / (hard_union + 1e-6)
+        for prompt_index in range(P):
+            nonempty = ~gt_empty[:, prompt_index]
+            if nonempty.any():
+                value = float(hard_dice[nonempty, prompt_index].mean().item())
+                dice_per_class[prompt_index] = value
+                dice_values.append(value)
+            else:
+                dice_per_class[prompt_index] = None
+    dice_mean = float(np.mean(dice_values)) if dice_values else 0.0
+    return loss_seg, dice_mean, dice_per_class
+
+
 def forward_one_batch(
     batch_data: Dict,
-    patch_size: List[int],
+    block_shape: List[int],
     prompt_features: dict,
-    class_emb: torch.Tensor,
     P: int,
     prompt_to_class_id: Dict[int, int],
     w_seg: float,
@@ -139,7 +343,6 @@ def forward_one_batch(
     fusion_modules: Dict[str, nn.Module],
     device: torch.device,
     w_p_reg: float = 0.0,
-    train: bool = True,
 ) -> Tuple[torch.Tensor, Dict]:
     """
     Single training/validation forward pass on a batch.
@@ -151,11 +354,29 @@ def forward_one_batch(
     Returns:
         (total_loss, logs_dict)
     """
-    pd, ph, pw = patch_size
-    nnunet_patches = batch_data["nnunet_patch"].to(device)
-    biomedparse_patches = batch_data["biomedparse_patch"].to(device)
-    gt_patches = batch_data["nnunet_seg"].to(device)
-    B = nnunet_patches.shape[0]
+    pd, ph, pw = block_shape
+    nnunet_images = batch_data["nnunet_image"].to(device)
+    biomedparse_images = batch_data["biomedparse_image"].to(device)
+    gt_patches = batch_data["gt"].to(device)
+    valid_z = batch_data["valid_z"].to(device)
+    if nnunet_images.ndim != 5 or biomedparse_images.ndim != 5:
+        raise ValueError(
+            "Expected nnUNet [B,Z,C,H,W] and BiomedParse [B,Z,3,H,W], "
+            f"got {nnunet_images.shape} and {biomedparse_images.shape}"
+        )
+    B, batch_z = nnunet_images.shape[:2]
+    if batch_z != pd:
+        raise ValueError(f"Batch Z={batch_z} does not match configured block_z={pd}")
+    if biomedparse_images.shape[:2] != (B, batch_z) or biomedparse_images.shape[2] != 3:
+        raise ValueError(
+            f"BiomedParse batch must be [B,Z,3,H,W], got {biomedparse_images.shape}"
+        )
+    if gt_patches.shape != (B, batch_z, ph, pw):
+        raise ValueError(
+            f"GT must be [B,Z,H,W]=[{B},{batch_z},{ph},{pw}], got {gt_patches.shape}"
+        )
+    if valid_z.shape != (B, batch_z):
+        raise ValueError(f"valid_z must be [B,Z], got {valid_z.shape}")
 
     ae_mods = {k: fusion_modules[k] for k in fusion_modules if k.startswith("ae_")}
     dis_mods = {k: fusion_modules[k] for k in fusion_modules if k.startswith("dis_")}
@@ -163,9 +384,13 @@ def forward_one_batch(
     gate_net = fusion_modules["gate_net"]
 
     # Feature extraction
-    enc_feats, F_enc = extract_nnunet_features(model_nnunet, nnunet_patches, device)
-    img_embeds_base, res3d = extract_biomedparse_backbone_embeds_and_res_levels_3d(
-        model_biomedparse, biomedparse_patches, device, res_names=("res2", "res3", "res4", "res5")
+    nnunet_blocks = nnunet_images.permute(0, 2, 1, 3, 4).contiguous()
+    enc_feats, F_enc = extract_nnunet_features(model_nnunet, nnunet_blocks, device)
+    img_embeds_base, res3d = extract_biomedparse_backbone_features_2p5d(
+        model_biomedparse,
+        biomedparse_images,
+        device,
+        res_names=("res2", "res3", "res4", "res5"),
     )
     for rn in ["res2", "res3", "res4", "res5"]:
         img_embeds_base.pop(rn, None)
@@ -174,10 +399,12 @@ def forward_one_batch(
     feats = _disentangle_and_inject(enc_feats, res3d, img_embeds_base, ae_mods, dis_mods, device)
 
     # AE / Ortho / CKA losses
-    loss_ae_z, loss_ortho, loss_ka = _compute_ae_ortho_ka_losses(feats, device)
+    loss_ae_z, loss_ortho, loss_ka = _compute_ae_ortho_ka_losses(feats, valid_z)
 
     # Pixel decoder for p and s branches
     Dm = res3d["res3"].shape[2]
+    if Dm != batch_z:
+        raise RuntimeError(f"BiomedParse feature Z={Dm} != input Z={batch_z}")
     N = B * Dm
 
     mask_features_p, ms_p = _run_pixel_decoder(model_biomedparse, img_embeds_base, feats, "p", B, Dm)
@@ -194,101 +421,49 @@ def forward_one_batch(
     pd_out_full = model_biomedparse.sem_seg_head.pixel_decoder.forward_features(injected_full)
     mask_features_full, ms_full = parse_pixel_decoder_out(pd_out_full)
 
-    eps = 1e-8
-    loss_ae_pd_mask = mse_loss(mask_features_full, mask_features_p + mask_features_s) / (mask_features_full.pow(2).mean() + eps)
+    loss_ae_pd_mask = _normalized_mse_flat_z(
+        mask_features_p + mask_features_s,
+        mask_features_full,
+        valid_z,
+    )
     loss_ae_pd_ms = []
     for mf, mp, ms_ in zip(ms_full, ms_p, ms_s):
-        loss_ae_pd_ms.append(mse_loss(mf, mp + ms_) / (mf.pow(2).mean() + eps))
+        loss_ae_pd_ms.append(_normalized_mse_flat_z(mp + ms_, mf, valid_z))
     loss_ae_pd = (loss_ae_pd_mask + sum(loss_ae_pd_ms)) / (1 + len(loss_ae_pd_ms))
     loss_ae = (loss_ae_z + loss_ae_pd) / 9.0  # 8 Z-layer terms + 1 PD term in loss_ae_z
 
     # Gate
-    mu, _ = class_query_pooler(F_enc)
+    mu, _ = class_query_pooler(F_enc, valid_z=valid_z)
     tau_out = gate_net(mu)
     tau_mask = tau_out["mask"]
     tau_ms_list = tau_out.get("ms", [])
 
-    # Per-class segmentation
-    loss_seg_total = torch.tensor(0.0, device=device)
-    loss_seg_denom = torch.tensor(0.0, device=device)
-    dice_list = []
-    dice_per_class = {}
-
-    for p_idx in range(P):
-        pf1 = slice_prompt_features(prompt_features, p_idx)
-        for k, v in pf1.items():
-            if torch.is_tensor(v):
-                pf1[k] = v.to(device)
-
-        tau_mask_bp = tau_mask[:, p_idx, :]
-        C_mask = tau_mask_bp.shape[-1]
-        tau_2d = tau_mask_bp.unsqueeze(1).expand(B, Dm, C_mask).reshape(N, C_mask, 1, 1)
-        mask_features = tau_2d * mask_features_p + (1 - tau_2d) * mask_features_s
-
-        multi_scale_features = []
-        for i, (mp, ms_, tau_ms_i) in enumerate(zip(ms_p, ms_s, tau_ms_list)):
-            tau_ms_bp = tau_ms_i[:, p_idx, :]
-            C_i = tau_ms_bp.shape[-1]
-            tau_ms_2d = tau_ms_bp.unsqueeze(1).expand(B, Dm, C_i).reshape(N, C_i, 1, 1)
-            multi_scale_features.append(tau_ms_2d * mp + (1 - tau_ms_2d) * ms_)
-
-        pred_out = run_biomedparse_predictor_override(
-            model_biomedparse.sem_seg_head, multi_scale_features, mask_features, pf1
-        )
-        pred_gmasks = pred_out["pred_gmasks"]
-        obj_exist = pred_out.get("object_existence", None)
-        mask_logits = select_best_mask_from_queries(pred_gmasks, obj_exist)
-
-        class_id = prompt_to_class_id[p_idx]
-        valid = (gt_patches != -1).float().squeeze(1)
-        gt_bin = (gt_patches == class_id).float().squeeze(1)
-
-        mask_logits_3d = mask_logits.view(B, Dm, mask_logits.shape[-2], mask_logits.shape[-1])
-        mask_logits_3d_rs = F.interpolate(
-            mask_logits_3d.unsqueeze(1), size=(pd, ph, pw), mode="trilinear", align_corners=False
-        ).squeeze(1)
-
-        # Empty-GT protection (per sample)
-        valid_d = valid.detach()
-        valid_m = valid_d > 0.5
-        valid_vox = valid_m.flatten(1).sum(1).float()
-        thr = valid_vox * 0.0005
-        gt_fg = ((gt_bin.detach() > 0.5) & valid_m).flatten(1).sum(1).float()
-        gt_empty = gt_fg < thr
-
-        bce_map = F.binary_cross_entropy_with_logits(mask_logits_3d_rs, gt_bin, reduction="none")
-        bce_map = bce_map * valid_d
-        denom = valid_d.sum(dim=(1, 2, 3)).clamp_min(1.0)
-        l_bce = bce_map.sum(dim=(1, 2, 3)) / denom
-
-        probs = torch.sigmoid(mask_logits_3d_rs) * valid_d
-        tgt = gt_bin * valid_d
-        inter = (probs * tgt).sum(dim=(1, 2, 3))
-        union = probs.sum(dim=(1, 2, 3)) + tgt.sum(dim=(1, 2, 3))
-        dice_soft = (2.0 * inter + 1e-6) / (union + 1e-6)
-        l_dice = 1.0 - dice_soft
-
-        l_seg_per = torch.where(gt_empty, l_bce, l_bce + l_dice)
-        w_per = torch.where(gt_empty, torch.full_like(l_seg_per, 0.5), torch.ones_like(l_seg_per))
-        loss_seg_total = loss_seg_total + (w_per * l_seg_per).sum()
-        loss_seg_denom = loss_seg_denom + w_per.sum()
-
-        # Metrics
-        with torch.no_grad():
-            pred_bin = (torch.sigmoid(mask_logits_3d_rs) > 0.5).float()
-            nonempty = ~gt_empty
-            if nonempty.any():
-                inter_h = ((pred_bin > 0.5) & (gt_bin.detach() > 0.5) & valid_m).flatten(1).sum(1).float()
-                union_h = ((pred_bin > 0.5) & valid_m).flatten(1).sum(1).float() + gt_fg
-                dice_h = (2.0 * inter_h + 1e-6) / (union_h + 1e-6)
-                d = float(dice_h[nonempty].mean().item())
-                dice_list.append(d)
-                dice_per_class[p_idx] = d
-            else:
-                dice_per_class[p_idx] = None
-
-    loss_seg = loss_seg_total / loss_seg_denom.clamp_min(1e-6)
-    dice_mean = float(np.mean(dice_list)) if dice_list else 0.0
+    # All prompts run through one predictor batch in [B,Z,P] pair order.
+    all_prompt_logits = _predict_all_prompt_logits(
+        sem_seg_head=model_biomedparse.sem_seg_head,
+        mask_features_p=mask_features_p,
+        mask_features_s=mask_features_s,
+        ms_p=ms_p,
+        ms_s=ms_s,
+        tau_mask=tau_mask,
+        tau_ms_list=tau_ms_list,
+        prompt_features=prompt_features,
+        B=B,
+        Z=Dm,
+        P=P,
+        output_shape=(pd, ph, pw),
+    )
+    class_ids = torch.tensor(
+        [prompt_to_class_id[prompt_index] for prompt_index in range(P)],
+        device=device,
+        dtype=gt_patches.dtype,
+    )
+    loss_seg, dice_mean, dice_per_class = _compute_segmentation_loss_and_metrics(
+        all_prompt_logits,
+        gt_patches,
+        valid_z,
+        class_ids,
+    )
 
     # Tau entropy regularization
     if w_p_reg > 0:
@@ -314,19 +489,16 @@ def forward_one_batch(
         "tau_mean": float(tau_mask.detach().mean().item()),
         "tau_std": float(tau_mask.detach().std().item()),
         "tau_per_class_mean": tau_per_class_mean,
-        "tau_distribution": {
-            i: tau_mask[:, i, :].detach().cpu().numpy().flatten().tolist() for i in range(P)
-        },
-        "tau_per_class_channel": tau_mask.detach().cpu().numpy().mean(axis=0).tolist(),
     }
     return total_loss, logs
 
 
 @torch.no_grad()
-def predict_patch_logits_per_class(
-    nnunet_patch_5d: torch.Tensor,
-    biomedparse_patch_4d: torch.Tensor,
-    patch_size: List[int],
+def predict_block_logits_per_class(
+    nnunet_images: torch.Tensor,
+    biomedparse_images: torch.Tensor,
+    valid_z: torch.Tensor,
+    output_size: Tuple[int, int],
     prompt_features: dict,
     P: int,
     model_nnunet: nn.Module,
@@ -334,23 +506,37 @@ def predict_patch_logits_per_class(
     fusion_modules: Dict[str, nn.Module],
     device: torch.device,
 ) -> torch.Tensor:
-    """
-    Inference-only forward on one 3D patch.
+    """Inference on independent contiguous blocks.
 
-    Returns: [P, Z, H, W] logits.
+    Inputs follow the training contract: nnUNet ``[B,Z,C,H,W]`` and
+    BiomedParse ``[B,Z,3,H,W]``. Returns ``[B,P,Z,H,W]`` logits.
     """
-    pd, ph, pw = [int(x) for x in patch_size]
+    if nnunet_images.ndim != 5 or biomedparse_images.ndim != 5:
+        raise ValueError("Expected 5D nnUNet and BiomedParse block tensors")
+    B, Dm = nnunet_images.shape[:2]
+    if biomedparse_images.shape[:3] != (B, Dm, 3):
+        raise ValueError(
+            f"BiomedParse input must be [B,Z,3,H,W], got {biomedparse_images.shape}"
+        )
+    if valid_z.shape != (B, Dm):
+        raise ValueError(f"valid_z must be [B,Z]={B,Dm}, got {valid_z.shape}")
+    ph, pw = (int(output_size[0]), int(output_size[1]))
 
     dis_mods = {k: fusion_modules[k] for k in fusion_modules if k.startswith("dis_")}
     class_query_pooler = fusion_modules["class_query_pooler"]
     gate_net = fusion_modules["gate_net"]
 
-    nnunet_patch_5d = nnunet_patch_5d.to(device)
-    biomedparse_patch_4d = biomedparse_patch_4d.to(device)
+    nnunet_images = nnunet_images.to(device)
+    biomedparse_images = biomedparse_images.to(device)
+    valid_z = valid_z.to(device)
 
-    _enc_feats, F_enc = extract_nnunet_features(model_nnunet, nnunet_patch_5d, device)
-    img_embeds_base, res3d = extract_biomedparse_backbone_embeds_and_res_levels_3d(
-        model_biomedparse, biomedparse_patch_4d, device, res_names=("res2", "res3", "res4", "res5")
+    nnunet_blocks = nnunet_images.permute(0, 2, 1, 3, 4).contiguous()
+    _enc_feats, F_enc = extract_nnunet_features(model_nnunet, nnunet_blocks, device)
+    img_embeds_base, res3d = extract_biomedparse_backbone_features_2p5d(
+        model_biomedparse,
+        biomedparse_images,
+        device,
+        res_names=("res2", "res3", "res4", "res5"),
     )
     for rn in ["res2", "res3", "res4", "res5"]:
         img_embeds_base.pop(rn, None)
@@ -364,13 +550,15 @@ def predict_patch_logits_per_class(
         disentangled[f"Zb{i}_s"] = Zb_s
         disentangled[f"Zb_res{i}"] = Zb
 
-    mu, _ = class_query_pooler(F_enc)
+    mu, _ = class_query_pooler(F_enc, valid_z=valid_z)
     tau_out = gate_net(mu)
     tau_mask = tau_out["mask"]
     tau_ms_list = tau_out["ms"]
 
-    B = 1
-    Dm = res3d["res3"].shape[2]
+    if res3d["res3"].shape[2] != Dm:
+        raise RuntimeError(
+            f"BiomedParse feature Z={res3d['res3'].shape[2]} != input Z={Dm}"
+        )
     N = B * Dm
 
     # Pixel decoder for p and s branches
@@ -386,34 +574,17 @@ def predict_patch_logits_per_class(
     mask_features_p, ms_p = _inject_and_decode("p")
     mask_features_s, ms_s = _inject_and_decode("s")
 
-    patch_logits_pc = []
-    for p_idx in range(P):
-        pf1 = slice_prompt_features(prompt_features, p_idx)
-        for k, v in pf1.items():
-            if torch.is_tensor(v):
-                pf1[k] = v.to(device)
-
-        tau_mask_bp = tau_mask[:, p_idx, :]
-        C_mask = tau_mask_bp.shape[-1]
-        tau_2d = tau_mask_bp.unsqueeze(1).expand(B, Dm, C_mask).reshape(N, C_mask, 1, 1)
-        mask_features = tau_2d * mask_features_p + (1 - tau_2d) * mask_features_s
-
-        multi_scale_features = []
-        for i_ms, (mp, ms_, tau_ms_i) in enumerate(zip(ms_p, ms_s, tau_ms_list)):
-            C_i = tau_ms_i[:, p_idx, :].shape[-1]
-            tau_ms_2d = tau_ms_i[:, p_idx, :].unsqueeze(1).expand(B, Dm, C_i).reshape(N, C_i, 1, 1)
-            multi_scale_features.append(tau_ms_2d * mp + (1 - tau_ms_2d) * ms_)
-
-        pred_out = run_biomedparse_predictor_override(
-            model_biomedparse.sem_seg_head, multi_scale_features, mask_features, pf1
-        )
-        pred_gmasks = pred_out["pred_gmasks"]
-        mask_logits = select_best_mask_from_queries(pred_gmasks, pred_out.get("object_existence"))
-
-        mask_logits_3d = mask_logits.view(B, Dm, mask_logits.shape[-2], mask_logits.shape[-1])
-        mask_logits_3d_rs = F.interpolate(
-            mask_logits_3d.unsqueeze(1), size=(pd, ph, pw), mode="trilinear", align_corners=False
-        ).squeeze(1)
-        patch_logits_pc.append(mask_logits_3d_rs[0])
-
-    return torch.stack(patch_logits_pc, dim=0)
+    return _predict_all_prompt_logits(
+        sem_seg_head=model_biomedparse.sem_seg_head,
+        mask_features_p=mask_features_p,
+        mask_features_s=mask_features_s,
+        ms_p=ms_p,
+        ms_s=ms_s,
+        tau_mask=tau_mask,
+        tau_ms_list=tau_ms_list,
+        prompt_features=prompt_features,
+        B=B,
+        Z=Dm,
+        P=P,
+        output_shape=(Dm, ph, pw),
+    )

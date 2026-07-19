@@ -22,10 +22,14 @@ def main():
     parser.add_argument("--dataset_name", type=str, default="Dataset009_CT_OOD")
     parser.add_argument("--nnunet_trainer_tag", type=str, default="nnUNetTrainer_500epochs__nnUNetPlans__2d")
     parser.add_argument("--fold", type=int, default=0)
-    parser.add_argument("--block_z", type=int, default=4)
+    parser.add_argument("--block_z", type=int, default=4,
+                        help="Number Z of consecutive slices per block")
     parser.add_argument("--norm_mode", type=str, default="ct", choices=("ct", "mri"))
     parser.add_argument("--n_epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=1,
+                        help="Number B of independent contiguous-Z blocks")
+    parser.add_argument("--image_size", type=int, default=512)
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--output_dir", type=str, default="")
@@ -35,7 +39,6 @@ def main():
     parser.add_argument("--w_ort", type=float, default=0.3)
     parser.add_argument("--w_ka", type=float, default=0.5)
     parser.add_argument("--val_every_epochs", type=int, default=5)
-    parser.add_argument("--num_epoch_cycles", type=int, default=4)
     args = parser.parse_args()
 
     cfg = TrainConfig(
@@ -46,6 +49,8 @@ def main():
         norm_mode=args.norm_mode,
         n_epochs=args.n_epochs,
         batch_size=args.batch_size,
+        image_size=args.image_size,
+        num_workers=args.num_workers,
         lr=args.lr,
         device=args.device,
         output_dir=args.output_dir,
@@ -55,7 +60,6 @@ def main():
         w_ort=args.w_ort,
         w_ka=args.w_ka,
         val_every_epochs=args.val_every_epochs,
-        num_epoch_cycles=args.num_epoch_cycles,
     )
     cfg.resolve_paths()
     device = torch.device(cfg.device)
@@ -76,7 +80,7 @@ def main():
     print(f"Prompts: {P} classes")
 
     print("Building prompt features...")
-    prompt_features, class_emb = build_prompt_features(model_biomedparse, text_prompts, device)
+    prompt_features = build_prompt_features(model_biomedparse, text_prompts, device)
 
     print("Building fusion modules...")
     fusion_modules = build_fusion_modules(model_nnunet, model_biomedparse, P, device)
@@ -89,7 +93,6 @@ def main():
         model_biomedparse=model_biomedparse,
         fusion_modules=fusion_modules,
         prompt_features=prompt_features,
-        class_emb=class_emb,
         prompt_to_class_id=prompt_to_class_id,
         P=P,
     )
