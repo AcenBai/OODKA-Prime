@@ -209,11 +209,8 @@ def build_prompt_features(
     model_biomedparse: nn.Module,
     text_prompts: Dict[str, str],
     device: torch.device,
-) -> Tuple[dict, torch.Tensor]:
-    """Encode text prompts through BiomedParse's text encoder.
-
-    Returns (prompt_features, class_emb).
-    """
+) -> dict:
+    """Encode text prompts through BiomedParse's text encoder."""
     ids = sorted([int(k) for k in text_prompts.keys() if k != "instance_label"])
     text = "[SEP]".join([text_prompts[str(i)] for i in ids])
 
@@ -226,7 +223,4 @@ def build_prompt_features(
         for k, v in prompt_features.items():
             if torch.is_tensor(v):
                 prompt_features[k] = v.to(device)
-    class_emb = prompt_features.get(
-        "class_emb", torch.zeros(len(ids), 256, device=device)
-    )
-    return prompt_features, class_emb
+    return prompt_features
