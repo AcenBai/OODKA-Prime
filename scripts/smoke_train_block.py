@@ -34,6 +34,9 @@ def main() -> None:
     parser.add_argument("--block_z", type=int, default=2)
     parser.add_argument("--backward", action="store_true")
     parser.add_argument("--block_index", type=int, default=0)
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--w_p_ot", type=float, default=0.0)
+    parser.add_argument("--w_s_ot", type=float, default=0.0)
     args = parser.parse_args()
 
     cfg = TrainConfig(
@@ -95,29 +98,32 @@ def main() -> None:
         count_predictor_call
     )
     print("running forward...")
-    loss, logs = forward_one_batch(
-        batch_data=batch,
-        block_shape=[cfg.block_z, cfg.image_size, cfg.image_size],
-        prompt_features=prompt_features,
-        P=P,
-        prompt_to_class_id=prompt_to_class_id,
-        w_seg=cfg.w_seg,
-        w_ae=cfg.w_ae,
-        w_ort=cfg.w_ort,
-        w_ka=cfg.w_ka,
-        model_nnunet=model_nnunet,
-        model_biomedparse=model_biomedparse,
-        fusion_modules=fusion_modules,
-        device=device,
-    )
+    with torch.autocast(
+        device_type=device.type,
+        dtype=torch.float16,
+        enabled=args.amp and device.type == "cuda",
+    ):
+        loss, logs = forward_one_batch(
+            batch_data=batch,
+            block_shape=[cfg.block_z, cfg.image_size, cfg.image_size],
+            prompt_features=prompt_features,
+            P=P,
+            prompt_to_class_id=prompt_to_class_id,
+            w_seg=cfg.w_seg,
+            w_ae=cfg.w_ae,
+            w_ort=cfg.w_ort,
+            model_nnunet=model_nnunet,
+            model_biomedparse=model_biomedparse,
+            fusion_modules=fusion_modules,
+            device=device,
+            w_p_ot=args.w_p_ot,
+            w_s_ot=args.w_s_ot,
+        )
     predictor_hook.remove()
     assert predictor_calls == 1, f"Expected one predictor call, got {predictor_calls}"
     print(f"predictor_calls={predictor_calls}")
     print("loss:", float(loss.detach()))
-    print("logs:", {
-        key: value for key, value in logs.items()
-        if key not in {"tau_distribution", "tau_per_class_channel"}
-    })
+    print("logs:", logs)
     if args.backward:
         print("running backward...")
         loss.backward()

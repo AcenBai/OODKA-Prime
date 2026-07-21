@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional
+from typing import Dict
 
 import numpy as np
 
@@ -17,8 +17,6 @@ def plot_training_curves(
     output_dir: str,
     epoch: int,
     P: int,
-    current_tau_distribution: Optional[Dict[int, list]] = None,
-    current_tau_matrix: Optional[List[List[float]]] = None,
 ):
     log_dir = os.path.join(output_dir, "plots")
     os.makedirs(log_dir, exist_ok=True)
@@ -32,14 +30,11 @@ def plot_training_curves(
             ("train_loss_total", "val_loss_total", "Total Loss"),
             ("train_loss_seg", "val_loss_seg", "Segmentation Loss"),
             ("train_loss_ae", "val_loss_ae", "Autoencoder Loss"),
-            ("train_loss_ortho", "val_loss_ortho", "Ortho & KA Loss"),
+            ("train_loss_ortho", "val_loss_ortho", "P/S Separation Loss"),
         ],
     ):
         ax.plot(epochs, history[train_key], "b-", label="Train", linewidth=2)
         ax.plot(epochs, history[val_key], "r-", label="Val", linewidth=2)
-        if title == "Ortho & KA Loss":
-            ax.plot(epochs, history["train_loss_ka"], "g-", label="Train KA", linewidth=2)
-            ax.plot(epochs, history["val_loss_ka"], color="orange", label="Val KA", linewidth=2)
         ax.set_xlabel("Epoch")
         ax.set_title(title)
         ax.legend()
@@ -80,16 +75,18 @@ def plot_training_curves(
     plt.savefig(os.path.join(log_dir, "mean_dice.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
-    # 4. Tau heatmap
-    if current_tau_matrix is not None:
-        tau_arr = np.array(current_tau_matrix)
-        fig, ax = plt.subplots(figsize=(20, max(6, P * 0.8)))
-        im = ax.imshow(tau_arr, aspect="auto", cmap="YlOrRd", vmin=0, vmax=1)
-        ax.set_xlabel("Channel")
-        ax.set_ylabel("Class")
-        ax.set_title(f"Tau Heatmap (Epoch {epoch})")
-        ax.set_yticks(range(P))
-        plt.colorbar(im, ax=ax)
-        plt.tight_layout()
-        plt.savefig(os.path.join(log_dir, "tau_heatmap.png"), dpi=150, bbox_inches="tight")
-        plt.close()
+    # 4. OT and route losses
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for key, label in [
+        ("train_loss_p_ot", "Train P-OT"),
+        ("train_loss_s_ot", "Train S-UOT"),
+        ("train_loss_route", "Train Route KL"),
+    ]:
+        ax.plot(epochs, history[key], label=label, linewidth=2)
+    ax.set_xlabel("Epoch")
+    ax.set_title(f"OT / Route Losses (Epoch {epoch})")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(log_dir, "ot_route_curves.png"), dpi=150, bbox_inches="tight")
+    plt.close()

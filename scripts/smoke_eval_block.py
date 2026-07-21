@@ -15,19 +15,18 @@ import numpy as np
 import SimpleITK as sitk
 import torch
 
-from oodka.config import EvalConfig, ensure_nnunet_on_path
+from oodka.config import EvalConfig
 from oodka.data.slice_dataset import normalize_biomedparse_volume
 from oodka.eval.eval_oodka import (
     _block_logits_to_raw_labels,
     _make_block_batch,
-    _preprocess_nnunet_case,
 )
 from oodka.models.prompts import build_text_prompts_for_dataset
 from oodka.train.forward import predict_block_logits_per_class
 from oodka.train.model_builder import (
     build_fusion_modules,
     build_prompt_features,
-    load_frozen_backbones,
+    load_frozen_biomedparse,
 )
 from oodka.utils.io_utils import find_raw_image_files
 
@@ -43,25 +42,13 @@ def main() -> None:
 
     cfg = EvalConfig(device=args.device, block_z=args.block_z)
     cfg.resolve_paths()
-    ensure_nnunet_on_path()
-    from batchgenerators.utilities.file_and_folder_operations import load_json
-    from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
-
-    dataset_json = load_json(cfg.dataset_json_path)
-    plans_manager = PlansManager(load_json(cfg.plans_path))
-    configuration_manager = plans_manager.get_configuration(cfg.nnunet_configuration)
+    import json
+    with open(cfg.dataset_json_path, encoding="utf-8") as file_handle:
+        dataset_json = json.load(file_handle)
     file_ending = dataset_json.get("file_ending", ".nii.gz")
     image_files = find_raw_image_files(cfg.imagesTs_dir, args.case_id, file_ending)
     raw_image = np.asarray(sitk.GetArrayFromImage(sitk.ReadImage(image_files[0])))
     raw_shape = tuple(int(value) for value in raw_image.shape)
-    nn_data = _preprocess_nnunet_case(
-        image_files,
-        plans_manager=plans_manager,
-        configuration_manager=configuration_manager,
-        dataset_json=dataset_json,
-        raw_shape=raw_shape,
-        require_no_crop=True,
-    )
     bp_u8 = normalize_biomedparse_volume(
         raw_image,
         norm_mode=cfg.norm_mode,
@@ -72,42 +59,39 @@ def main() -> None:
     )
     starts = list(range(0, raw_shape[0], cfg.block_z))
     start = starts[args.block_index]
-    nn_blocks, bp_blocks, valid_z, valid_counts = _make_block_batch(
-        nn_data,
+    bp_blocks, valid_z, valid_counts = _make_block_batch(
         bp_u8,
         [start],
         block_z=cfg.block_z,
         image_size=cfg.image_size,
     )
     print(
-        f"case={args.case_id} raw_shape={raw_shape} nn_shape={nn_data.shape} "
+        f"case={args.case_id} raw_shape={raw_shape} "
         f"z_start={start} valid_count={valid_counts[0]}"
     )
     print(
-        f"nn={tuple(nn_blocks.shape)} bp={tuple(bp_blocks.shape)} "
+        f"bp={tuple(bp_blocks.shape)} "
         f"valid_z={valid_z.tolist()}"
     )
 
     device = torch.device(cfg.device)
-    model_nnunet, model_biomedparse = load_frozen_backbones(
-        cfg.nnunet_model_dir, cfg.fold, device
-    )
+    model_biomedparse = load_frozen_biomedparse(device)
     text_prompts, prompt_to_class_id = build_text_prompts_for_dataset(
         dataset_name=cfg.dataset_name
     )
     prompt_features = build_prompt_features(model_biomedparse, text_prompts, device)
     fusion_modules = build_fusion_modules(
-        model_nnunet, model_biomedparse, len(text_prompts), device
+        None,
+        model_biomedparse,
+        len(text_prompts),
+        device,
+        text_dim=int(prompt_features["class_emb"].shape[-1]),
     )
-    ckpt_path = args.ckpt or os.path.join(
-        ROOT,
-        "outputs",
-        f"oodka_{cfg.dataset_name}",
-        "fusion_disentangle_best.pth",
-    )
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    for name, module in fusion_modules.items():
-        module.load_state_dict(checkpoint[name])
+    if args.ckpt:
+        checkpoint = torch.load(args.ckpt, map_location=device)
+        for name, module in fusion_modules.items():
+            module.load_state_dict(checkpoint[name])
+    for module in fusion_modules.values():
         module.eval()
 
     predictor_calls = 0
@@ -121,13 +105,11 @@ def main() -> None:
     )
 
     logits = predict_block_logits_per_class(
-        nnunet_images=nn_blocks,
         biomedparse_images=bp_blocks,
         valid_z=valid_z,
         output_size=(cfg.image_size, cfg.image_size),
         prompt_features=prompt_features,
         P=len(text_prompts),
-        model_nnunet=model_nnunet,
         model_biomedparse=model_biomedparse,
         fusion_modules=fusion_modules,
         device=device,

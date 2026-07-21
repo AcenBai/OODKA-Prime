@@ -92,13 +92,35 @@ class TrainConfig:
     w_seg: float = 3.0
     w_ae: float = 0.2
     w_ort: float = 0.3
-    w_ka: float = 0.5
-    w_p_reg: float = 0.0
-    p_reg_warmup_epochs: int = 5
-    p_reg_decay_epochs: int = 0
+    w_route: float = 1e-3
+    route_warmup_epochs: int = 5
+    route_prior_alpha: float = 2.0
+    route_prior_beta: float = 2.0
+
+    w_p_ot: float = 0.1
+    w_s_ot: float = 0.1
+    p_ot_start_epoch: int = 2
+    s_ot_start_epoch: int = 3
+    ot_warmup_epochs: int = 5
+    ot_sinkhorn_iterations: int = 30
+    ot_feature_weight: float = 1.0
+    ot_coordinate_weight: float = 0.1
+    p_ot_semantic_weight: float = 0.25
+    p_ot_epsilon: float = 0.1
+    s_ot_epsilon: float = 0.1
+    s_ot_rho_base: float = 1.0
+    s_ot_rho_expert: float = 0.2
+
+    amp: bool = True
+    amp_dtype: str = "float16"
+    resume_checkpoint: str = ""
 
     num_workers: int = 2
     val_every_epochs: int = 5
+    train_case_limit: int = 0
+    val_case_limit: int = 0
+    max_train_batches: int = 0
+    max_val_batches: int = 0
 
     device: str = "cuda:0"
 
@@ -118,11 +140,11 @@ class TrainConfig:
             nnunet_preprocessed_dir(self.dataset_name), "splits_final.json"
         )
         self.plans_path = os.path.join(self.nnunet_model_dir, "plans.json")
-        self.dataset_json_path = os.path.join(self.nnunet_model_dir, "dataset.json")
         self.nnunet_checkpoint = os.path.join(
             self.nnunet_model_dir, f"fold_{self.fold}", "checkpoint_best.pth"
         )
         raw_base = nnunet_raw_dir(self.dataset_name)
+        self.dataset_json_path = os.path.join(raw_base, "dataset.json")
         self.imagesTr_dir = os.path.join(raw_base, "imagesTr")
         self.labelsTr_dir = os.path.join(raw_base, "labelsTr")
         self.imagesTs_dir = os.path.join(raw_base, "imagesTs")
@@ -154,6 +176,7 @@ class EvalConfig:
     tile_step_size: float = 0.5
     device: str = "cuda:0"
     case_limit: int = 0
+    split: str = "test"
 
     distangler_ckpt: str = ""
     out_dir: str = ""
@@ -167,11 +190,14 @@ class EvalConfig:
             self.dataset_name, self.nnunet_trainer_tag
         )
         self.plans_path = os.path.join(self.nnunet_model_dir, "plans.json")
-        self.dataset_json_path = os.path.join(self.nnunet_model_dir, "dataset.json")
         self.nnunet_checkpoint = os.path.join(
             self.nnunet_model_dir, f"fold_{self.fold}", "checkpoint_best.pth"
         )
         raw_base = nnunet_raw_dir(self.dataset_name)
+        self.splits_final_json = os.path.join(
+            nnunet_preprocessed_dir(self.dataset_name), "splits_final.json"
+        )
+        self.dataset_json_path = os.path.join(raw_base, "dataset.json")
         self.imagesTs_dir = os.path.join(raw_base, "imagesTs")
         self.labelsTs_dir = os.path.join(raw_base, "labelsTs")
         self.imagesTr_dir = os.path.join(raw_base, "imagesTr")

@@ -12,7 +12,11 @@ def extract_nnunet_features(
     model: nn.Module,
     blocks: torch.Tensor,
     device: torch.device,
-) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    *,
+    return_logits: bool = False,
+) -> Tuple[Dict[str, torch.Tensor], torch.Tensor] | Tuple[
+    Dict[str, torch.Tensor], torch.Tensor, torch.Tensor
+]:
     """Extract nnUNet stages 2-5 and restore flattened 2D slices to 5D.
 
     ``blocks`` is ``[B,C,Z,H,W]``. A 2D nnUNet sees ``B*Z`` slices and each
@@ -51,9 +55,16 @@ def extract_nnunet_features(
                 .contiguous()
             )
             reshape_back = (B, Z)
-            model(slices)
+            model_output = model(slices)
         else:
-            model(blocks)
+            model_output = model(blocks)
+
+    if isinstance(model_output, (list, tuple)):
+        model_output = model_output[0]
+    if not torch.is_tensor(model_output):
+        raise TypeError(
+            f"nnUNet output must be a tensor, got {type(model_output).__name__}"
+        )
 
     for handle in handles:
         handle.remove()
@@ -77,6 +88,9 @@ def extract_nnunet_features(
 
         deepest = unflatten(deepest)
         result = {name: unflatten(feature) for name, feature in result.items()}
+        model_output = unflatten(model_output)
+    if return_logits:
+        return result, deepest, model_output.detach()
     return result, deepest
 
 

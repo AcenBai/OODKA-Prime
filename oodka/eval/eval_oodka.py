@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from ..config import EvalConfig, ensure_nnunet_on_path
+from ..config import EvalConfig
 from ..data.slice_dataset import (
     make_biomedparse_block,
     normalize_biomedparse_volume,
@@ -29,81 +29,14 @@ from ..utils.metrics import dice_no_ignore, precision_recall_hd95_no_ignore
 from ..utils.postprocessing import keep_largest_component_per_class
 
 
-def _full_bbox(shape: Sequence[int]) -> List[List[int]]:
-    return [[0, int(size)] for size in shape]
-
-
-def _normalize_bbox(bbox) -> List[List[int]] | None:
-    if bbox is None:
-        return None
-    return [[int(value) for value in axis] for axis in bbox]
-
-
-def _preprocess_nnunet_case(
-    image_files: Sequence[str],
-    *,
-    plans_manager,
-    configuration_manager,
-    dataset_json: dict,
-    raw_shape: Tuple[int, int, int],
-    require_no_crop: bool,
-) -> np.ndarray:
-    """Run only nnUNet's official preprocessing in memory for one case."""
-    from nnunetv2.preprocessing.preprocessors.default_preprocessor import (
-        DefaultPreprocessor,
-    )
-
-    preprocessor = DefaultPreprocessor(verbose=False)
-    data, _seg, properties = preprocessor.run_case(
-        list(image_files),
-        None,
-        plans_manager,
-        configuration_manager,
-        dataset_json,
-    )
-    shape_before_crop = tuple(
-        int(value) for value in properties.get("shape_before_cropping", raw_shape)
-    )
-    bbox = _normalize_bbox(properties.get("bbox_used_for_cropping"))
-    if shape_before_crop != raw_shape:
-        raise ValueError(
-            f"nnUNet shape_before_cropping={shape_before_crop} != raw shape={raw_shape}"
-        )
-    if require_no_crop and bbox != _full_bbox(shape_before_crop):
-        raise ValueError(
-            f"nnUNet crop {bbox} does not cover full shape {shape_before_crop}; "
-            "Z-slice correspondence is unsafe"
-        )
-
-    data = np.asarray(data, dtype=np.float32)
-    if data.ndim != 4:
-        raise ValueError(f"Expected nnUNet data [C,Z,H,W], got {data.shape}")
-    if data.shape[1] != raw_shape[0]:
-        raise ValueError(
-            f"nnUNet preprocessed Z={data.shape[1]} != raw Z={raw_shape[0]}"
-        )
-    return data
-
-
-def _resize_nnunet_slices(data_zchw: np.ndarray, image_size: int) -> torch.Tensor:
-    return F.interpolate(
-        torch.from_numpy(np.ascontiguousarray(data_zchw)).float(),
-        size=(image_size, image_size),
-        mode="bilinear",
-        align_corners=False,
-    )
-
-
 def _make_block_batch(
-    nn_data: np.ndarray,
     bp_u8: np.ndarray,
     starts: Sequence[int],
     *,
     block_z: int,
     image_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
+) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
     """Materialize B independent blocks while keeping each block's Z contiguous."""
-    nn_blocks = []
     bp_blocks = []
     valid_masks = []
     valid_counts = []
@@ -115,18 +48,10 @@ def _make_block_batch(
         centers = list(range(int(z_start), int(z_start) + valid_count))
         centers.extend([centers[-1]] * (block_z - valid_count))
 
-        nn_valid = nn_data[:, z_start : z_start + valid_count].transpose(1, 0, 2, 3)
-        if valid_count < block_z:
-            nn_valid = np.concatenate(
-                [nn_valid, np.repeat(nn_valid[-1:], block_z - valid_count, axis=0)],
-                axis=0,
-            )
-        nn_blocks.append(_resize_nnunet_slices(nn_valid, image_size))
         bp_blocks.append(make_biomedparse_block(bp_u8, centers, image_size))
         valid_masks.append(torch.arange(block_z) < valid_count)
 
     return (
-        torch.stack(nn_blocks),
         torch.stack(bp_blocks),
         torch.stack(valid_masks),
         valid_counts,
@@ -161,35 +86,36 @@ def _block_logits_to_raw_labels(
 
 def evaluate_oodka_blocks(
     cfg: EvalConfig,
-    model_nnunet,
     model_biomedparse,
     fusion_modules: Dict[str, torch.nn.Module],
     prompt_features: dict,
     prompt_to_class_id: Dict[int, int],
     P: int,
 ):
-    """Evaluate every real slice exactly once using contiguous Z blocks."""
-    ensure_nnunet_on_path()
-    from batchgenerators.utilities.file_and_folder_operations import load_json
-    from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
-
+    """Evaluate every real slice with the pure BiomedParse/OODKA student."""
     device = torch.device(cfg.device)
-    dataset_json = load_json(cfg.dataset_json_path)
-    plans_manager = PlansManager(load_json(cfg.plans_path))
-    configuration_manager = plans_manager.get_configuration(cfg.nnunet_configuration)
+    with open(cfg.dataset_json_path, encoding="utf-8") as file_handle:
+        dataset_json = json.load(file_handle)
     file_ending = dataset_json.get("file_ending", ".nii.gz")
     labels_dict = dataset_json.get("labels", {})
     class_ids = sorted(int(value) for value in labels_dict.values() if int(value) > 0)
 
-    test_ids = discover_case_ids_from_dir(cfg.labelsTs_dir, file_ending)
+    if cfg.split == "val":
+        with open(cfg.splits_final_json, encoding="utf-8") as file_handle:
+            split_data = json.load(file_handle)
+        test_ids = list(split_data[cfg.fold]["val"])
+        primary_images_dir = cfg.imagesTr_dir
+        primary_labels_dir = cfg.labelsTr_dir
+    else:
+        test_ids = discover_case_ids_from_dir(cfg.labelsTs_dir, file_ending)
+        if not test_ids:
+            test_ids = discover_case_ids_from_dir(
+                cfg.imagesTs_dir, file_ending, strip_modality=True
+            )
+        primary_images_dir = cfg.imagesTs_dir
+        primary_labels_dir = cfg.labelsTs_dir
     if not test_ids:
-        test_ids = discover_case_ids_from_dir(
-            cfg.imagesTs_dir, file_ending, strip_modality=True
-        )
-    if not test_ids:
-        raise FileNotFoundError(
-            f"No test cases found in {cfg.imagesTs_dir} / {cfg.labelsTs_dir}"
-        )
+        raise FileNotFoundError(f"No cases found for split={cfg.split}")
     if cfg.case_limit > 0:
         test_ids = test_ids[: cfg.case_limit]
 
@@ -201,7 +127,7 @@ def evaluate_oodka_blocks(
 
     all_rows = []
     for case_id in tqdm(test_ids, desc="OODKA block eval"):
-        image_files = find_raw_image_files(cfg.imagesTs_dir, case_id, file_ending)
+        image_files = find_raw_image_files(primary_images_dir, case_id, file_ending)
         if not image_files:
             image_files = find_raw_image_files(cfg.imagesTr_dir, case_id, file_ending)
         if not image_files:
@@ -212,7 +138,7 @@ def evaluate_oodka_blocks(
                 f"but only {len(image_files)} modalities were found"
             )
 
-        label_path = os.path.join(cfg.labelsTs_dir, case_id + file_ending)
+        label_path = os.path.join(primary_labels_dir, case_id + file_ending)
         if not os.path.isfile(label_path):
             label_path = os.path.join(cfg.labelsTr_dir, case_id + file_ending)
         if not os.path.isfile(label_path):
@@ -227,14 +153,6 @@ def evaluate_oodka_blocks(
                 f"{case_id}: GT shape={gt_arr.shape} != raw shape={raw_shape}"
             )
 
-        nn_data = _preprocess_nnunet_case(
-            image_files,
-            plans_manager=plans_manager,
-            configuration_manager=configuration_manager,
-            dataset_json=dataset_json,
-            raw_shape=raw_shape,
-            require_no_crop=cfg.require_no_crop,
-        )
         bp_u8 = normalize_biomedparse_volume(
             raw_image,
             norm_mode=cfg.norm_mode,
@@ -248,21 +166,18 @@ def evaluate_oodka_blocks(
         all_starts = list(range(0, raw_shape[0], cfg.block_z))
         for batch_start in range(0, len(all_starts), cfg.batch_size):
             starts = all_starts[batch_start : batch_start + cfg.batch_size]
-            nn_blocks, bp_blocks, valid_z, valid_counts = _make_block_batch(
-                nn_data,
+            bp_blocks, valid_z, valid_counts = _make_block_batch(
                 bp_u8,
                 starts,
                 block_z=cfg.block_z,
                 image_size=cfg.image_size,
             )
             block_logits = predict_block_logits_per_class(
-                nnunet_images=nn_blocks,
                 biomedparse_images=bp_blocks,
                 valid_z=valid_z,
                 output_size=(cfg.image_size, cfg.image_size),
                 prompt_features=prompt_features,
                 P=P,
-                model_nnunet=model_nnunet,
                 model_biomedparse=model_biomedparse,
                 fusion_modules=fusion_modules,
                 device=device,

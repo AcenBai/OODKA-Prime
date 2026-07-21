@@ -21,8 +21,6 @@ from ..models.biomedparse_helpers import (
 )
 from ..models.losses import (
     ortho_corr_loss,
-    spatial_cka_loss,
-    entropy_loss,
 )
 
 
@@ -75,14 +73,17 @@ def _normalized_mse_5d(
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """Energy-normalized MSE excluding repeated tail slices."""
-    B, C, D, H, W = target.shape
-    if valid_z.shape != (B, D):
-        raise ValueError(f"valid_z must be [B,D]={B,D}, got {valid_z.shape}")
-    mask = valid_z[:, None, :, None, None].to(target)
-    denom = mask.sum().clamp_min(1.0) * C * H * W
-    error = ((prediction - target).square() * mask).sum() / denom
-    energy = (target.square() * mask).sum() / denom
-    return error / (energy + eps)
+    with torch.autocast(device_type=target.device.type, enabled=False):
+        prediction = prediction.float()
+        target = target.float()
+        B, C, D, H, W = target.shape
+        if valid_z.shape != (B, D):
+            raise ValueError(f"valid_z must be [B,D]={B,D}, got {valid_z.shape}")
+        mask = valid_z[:, None, :, None, None].to(target)
+        denom = mask.sum().clamp_min(1.0) * C * H * W
+        error = ((prediction - target).square() * mask).sum() / denom
+        energy = (target.square() * mask).sum() / denom
+        return error / (energy + eps)
 
 
 def _normalized_mse_flat_z(
@@ -92,31 +93,33 @@ def _normalized_mse_flat_z(
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """Energy-normalized MSE for pixel-decoder tensors shaped [B*Z,C,H,W]."""
-    B, D = valid_z.shape
-    if target.ndim != 4 or target.shape[0] != B * D:
-        raise ValueError(
-            f"Expected pixel-decoder tensor [B*Z,C,H,W] with B*Z={B*D}, "
-            f"got {target.shape}"
-        )
-    mask = valid_z.reshape(B * D, 1, 1, 1).to(target)
-    elements_per_slice = target.shape[1] * target.shape[2] * target.shape[3]
-    denom = mask.sum().clamp_min(1.0) * elements_per_slice
-    error = ((prediction - target).square() * mask).sum() / denom
-    energy = (target.square() * mask).sum() / denom
-    return error / (energy + eps)
+    with torch.autocast(device_type=target.device.type, enabled=False):
+        prediction = prediction.float()
+        target = target.float()
+        B, D = valid_z.shape
+        if target.ndim != 4 or target.shape[0] != B * D:
+            raise ValueError(
+                f"Expected pixel-decoder tensor [B*Z,C,H,W] with B*Z={B*D}, "
+                f"got {target.shape}"
+            )
+        mask = valid_z.reshape(B * D, 1, 1, 1).to(target)
+        elements_per_slice = target.shape[1] * target.shape[2] * target.shape[3]
+        denom = mask.sum().clamp_min(1.0) * elements_per_slice
+        error = ((prediction - target).square() * mask).sum() / denom
+        energy = (target.square() * mask).sum() / denom
+        return error / (energy + eps)
 
 
-def _compute_ae_ortho_ka_losses(
+def _compute_reconstruction_separation_losses(
     feats: Dict,
     valid_z: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute AE reconstruction, orthogonality, and CKA losses across all levels."""
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute reconstruction and P/S separation across all levels."""
     eps = 1e-8
     levels = [2, 3, 4, 5]
 
     ae_losses = []
     ortho_losses = []
-    ka_losses = []
 
     for i in levels:
         Z_n = feats[f"Z_n{i}"]
@@ -132,13 +135,15 @@ def _compute_ae_ortho_ka_losses(
         ae_b = _normalized_mse_5d(Zb_p + Zb_s, Zb_res, valid_z, eps)
         ae_losses.extend([ae_n, ae_b])
 
-        ortho_losses.append(ortho_corr_loss(Zb_p, Zb_s, valid_z=valid_z))
-        ortho_losses.append(ortho_corr_loss(Zn_p, Zn_s, valid_z=valid_z))
+        with torch.autocast(device_type=Zb_p.device.type, enabled=False):
+            ortho_losses.append(
+                ortho_corr_loss(Zb_p.float(), Zb_s.float(), valid_z=valid_z)
+            )
+            ortho_losses.append(
+                ortho_corr_loss(Zn_p.float(), Zn_s.float(), valid_z=valid_z)
+            )
 
-        ka_losses.append(spatial_cka_loss(Zb_p, Zn_p, valid_z=valid_z))
-        ka_losses.append(spatial_cka_loss(Zb_s, Zn_s, valid_z=valid_z))
-
-    return sum(ae_losses), sum(ortho_losses), sum(ka_losses)
+    return sum(ae_losses), sum(ortho_losses)
 
 
 def _run_pixel_decoder(
@@ -164,29 +169,29 @@ def _run_pixel_decoder(
 
 
 def _fuse_all_prompt_features(
-    private: torch.Tensor,
-    shared: torch.Tensor,
-    tau: torch.Tensor,
+    p_feature: torch.Tensor,
+    s_feature: torch.Tensor,
+    gate: torch.Tensor,
     *,
     B: int,
     Z: int,
 ) -> torch.Tensor:
     """Create prompt-specific visual features and flatten in ``[B,Z,P]`` order."""
-    if private.shape != shared.shape or private.ndim != 4:
+    if p_feature.shape != s_feature.shape or p_feature.ndim != 4:
         raise ValueError(
-            f"private/shared features must have equal [B*Z,C,H,W] shapes, "
-            f"got {private.shape} and {shared.shape}"
+            f"P/S features must have equal [B*Z,C,H,W] shapes, "
+            f"got {p_feature.shape} and {s_feature.shape}"
         )
-    N, C, H, W = private.shape
+    N, C, H, W = p_feature.shape
     if N != B * Z:
         raise ValueError(f"Visual batch={N} != B*Z={B*Z}")
-    if tau.ndim != 3 or tau.shape[0] != B or tau.shape[2] != C:
-        raise ValueError(f"tau must be [B,P,C]=[{B},P,{C}], got {tau.shape}")
-    P = tau.shape[1]
-    private_bz = private.reshape(B, Z, C, H, W)[:, :, None]
-    shared_bz = shared.reshape(B, Z, C, H, W)[:, :, None]
-    tau_bzp = tau[:, None, :, :, None, None]
-    fused = tau_bzp * private_bz + (1.0 - tau_bzp) * shared_bz
+    if gate.ndim != 3 or gate.shape[0] != B or gate.shape[2] != 1:
+        raise ValueError(f"gate must be [B,P,1], got {gate.shape}")
+    P = gate.shape[1]
+    p_bz = p_feature.reshape(B, Z, C, H, W)[:, :, None]
+    s_bz = s_feature.reshape(B, Z, C, H, W)[:, :, None]
+    gate_bzp = gate[:, None, :, :, None, None]
+    fused = gate_bzp * p_bz + (1.0 - gate_bzp) * s_bz
     return fused.reshape(B * Z * P, C, H, W).contiguous()
 
 
@@ -197,8 +202,7 @@ def _predict_all_prompt_logits(
     mask_features_s: torch.Tensor,
     ms_p: List[torch.Tensor],
     ms_s: List[torch.Tensor],
-    tau_mask: torch.Tensor,
-    tau_ms_list: List[torch.Tensor],
+    gate: torch.Tensor,
     prompt_features: dict,
     B: int,
     Z: int,
@@ -206,20 +210,20 @@ def _predict_all_prompt_logits(
     output_shape: Tuple[int, int, int],
 ) -> torch.Tensor:
     """Run one predictor call for all aligned visual-prompt pairs."""
-    if tau_mask.shape[:2] != (B, P):
-        raise ValueError(f"tau_mask must start with [B,P]={B,P}, got {tau_mask.shape}")
-    if not (len(ms_p) == len(ms_s) == len(tau_ms_list)):
+    if gate.shape != (B, P, 1):
+        raise ValueError(f"gate must be [B,P,1]=[{B},{P},1], got {gate.shape}")
+    if len(ms_p) != len(ms_s):
         raise ValueError(
-            "private/shared/tau multi-scale feature counts must match, got "
-            f"{len(ms_p)}, {len(ms_s)}, {len(tau_ms_list)}"
+            "P/S multi-scale feature counts must match, got "
+            f"{len(ms_p)} and {len(ms_s)}"
         )
 
     fused_mask = _fuse_all_prompt_features(
-        mask_features_p, mask_features_s, tau_mask, B=B, Z=Z
+        mask_features_p, mask_features_s, gate, B=B, Z=Z
     )
     fused_multi_scale = [
-        _fuse_all_prompt_features(mp, ms, tau_ms, B=B, Z=Z)
-        for mp, ms, tau_ms in zip(ms_p, ms_s, tau_ms_list)
+        _fuse_all_prompt_features(mp, ms, gate, B=B, Z=Z)
+        for mp, ms in zip(ms_p, ms_s)
     ]
     expanded_prompts = expand_prompt_features_for_blocks(
         prompt_features,
@@ -328,6 +332,61 @@ def _compute_segmentation_loss_and_metrics(
     return loss_seg, dice_mean, dice_per_class
 
 
+def _compute_detached_pixel_error_maps(
+    base_logits: torch.Tensor,
+    expert_logits: torch.Tensor,
+    gt: torch.Tensor,
+    valid_z: torch.Tensor,
+    class_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return comparable prompt-wise BCE maps for student and expert.
+
+    Base logits are ``[B,P,Z,H,W]``. nnUNet logits are
+    ``[B,C_nn,Z,H_nn,W_nn]`` and are explicitly indexed by semantic class id.
+    Both returned maps are detached ``[B,Z,H,W]`` tensors.
+    """
+    B, P, Z, H, W = base_logits.shape
+    if gt.shape != (B, Z, H, W) or valid_z.shape != (B, Z):
+        raise ValueError("GT/valid_z do not match base logits")
+    if class_ids.shape != (P,):
+        raise ValueError(f"class_ids must be [P]={P}, got {class_ids.shape}")
+    if expert_logits.ndim != 5 or expert_logits.shape[0] != B:
+        raise ValueError(
+            f"expert_logits must be [B,C,Z,H,W], got {expert_logits.shape}"
+        )
+    max_class = int(class_ids.max().item())
+    if expert_logits.shape[1] <= max_class:
+        raise ValueError(
+            f"nnUNet has {expert_logits.shape[1]} channels but class id "
+            f"{max_class} was requested"
+        )
+
+    with torch.no_grad():
+        selected_expert = expert_logits[:, class_ids.long()]
+        if selected_expert.shape[-3:] != (Z, H, W):
+            selected_expert = F.interpolate(
+                selected_expert.float(),
+                size=(Z, H, W),
+                mode="trilinear",
+                align_corners=False,
+            )
+        target = (
+            gt[:, None] == class_ids[None, :, None, None, None]
+        ).float()
+        base_error = F.binary_cross_entropy_with_logits(
+            base_logits.detach().float(), target, reduction="none"
+        ).mean(dim=1)
+        expert_error = F.binary_cross_entropy_with_logits(
+            selected_expert.detach().float(), target, reduction="none"
+        ).mean(dim=1)
+        valid = (gt != -1) & valid_z[:, :, None, None]
+        base_error = torch.where(valid, base_error, torch.zeros_like(base_error))
+        expert_error = torch.where(
+            valid, expert_error, torch.zeros_like(expert_error)
+        )
+    return base_error, expert_error
+
+
 def forward_one_batch(
     batch_data: Dict,
     block_shape: List[int],
@@ -337,12 +396,15 @@ def forward_one_batch(
     w_seg: float,
     w_ae: float,
     w_ort: float,
-    w_ka: float,
     model_nnunet: nn.Module,
     model_biomedparse: nn.Module,
     fusion_modules: Dict[str, nn.Module],
     device: torch.device,
-    w_p_reg: float = 0.0,
+    w_route: float = 0.0,
+    w_p_ot: float = 0.0,
+    w_s_ot: float = 0.0,
+    route_sample: bool | None = None,
+    ot_expert_perturbation: str | None = None,
 ) -> Tuple[torch.Tensor, Dict]:
     """
     Single training/validation forward pass on a batch.
@@ -380,12 +442,13 @@ def forward_one_batch(
 
     ae_mods = {k: fusion_modules[k] for k in fusion_modules if k.startswith("ae_")}
     dis_mods = {k: fusion_modules[k] for k in fusion_modules if k.startswith("dis_")}
-    class_query_pooler = fusion_modules["class_query_pooler"]
-    gate_net = fusion_modules["gate_net"]
+    beta_router = fusion_modules["beta_router"]
 
     # Feature extraction
     nnunet_blocks = nnunet_images.permute(0, 2, 1, 3, 4).contiguous()
-    enc_feats, F_enc = extract_nnunet_features(model_nnunet, nnunet_blocks, device)
+    enc_feats, _F_enc, expert_logits = extract_nnunet_features(
+        model_nnunet, nnunet_blocks, device, return_logits=True
+    )
     img_embeds_base, res3d = extract_biomedparse_backbone_features_2p5d(
         model_biomedparse,
         biomedparse_images,
@@ -398,8 +461,10 @@ def forward_one_batch(
     # Disentangle
     feats = _disentangle_and_inject(enc_feats, res3d, img_embeds_base, ae_mods, dis_mods, device)
 
-    # AE / Ortho / CKA losses
-    loss_ae_z, loss_ortho, loss_ka = _compute_ae_ortho_ka_losses(feats, valid_z)
+    # Reconstruction and P/S separation losses.
+    loss_ae_z, loss_ortho = _compute_reconstruction_separation_losses(
+        feats, valid_z
+    )
 
     # Pixel decoder for p and s branches
     Dm = res3d["res3"].shape[2]
@@ -432,11 +497,14 @@ def forward_one_batch(
     loss_ae_pd = (loss_ae_pd_mask + sum(loss_ae_pd_ms)) / (1 + len(loss_ae_pd_ms))
     loss_ae = (loss_ae_z + loss_ae_pd) / 9.0  # 8 Z-layer terms + 1 PD term in loss_ae_z
 
-    # Gate
-    mu, _ = class_query_pooler(F_enc, valid_z=valid_z)
-    tau_out = gate_net(mu)
-    tau_mask = tau_out["mask"]
-    tau_ms_list = tau_out.get("ms", [])
+    # Prompt-only scalar P/S routing. Expert features never enter this path.
+    text_embedding = prompt_features.get("class_emb")
+    if not torch.is_tensor(text_embedding):
+        raise ValueError("prompt_features['class_emb'] is required by PromptBetaRouter")
+    route = beta_router(
+        text_embedding.detach(), batch_size=B, sample=route_sample
+    )
+    gate = route["gate"]
 
     # All prompts run through one predictor batch in [B,Z,P] pair order.
     all_prompt_logits = _predict_all_prompt_logits(
@@ -445,8 +513,7 @@ def forward_one_batch(
         mask_features_s=mask_features_s,
         ms_p=ms_p,
         ms_s=ms_s,
-        tau_mask=tau_mask,
-        tau_ms_list=tau_ms_list,
+        gate=gate,
         prompt_features=prompt_features,
         B=B,
         Z=Dm,
@@ -465,55 +532,98 @@ def forward_one_batch(
         class_ids,
     )
 
-    # Tau entropy regularization
-    if w_p_reg > 0:
-        tau_all = [tau_mask] + list(tau_ms_list)
-        tau_cat = torch.cat(tau_all, dim=-1) if len(tau_all) > 1 else tau_mask
-        loss_p_reg = entropy_loss(tau_cat.reshape(-1, tau_cat.shape[-1]))
+    # Dynamic expert transports are a detached training-only supervision path.
+    if w_p_ot > 0 or w_s_ot > 0:
+        base_error, expert_error = _compute_detached_pixel_error_maps(
+            all_prompt_logits,
+            expert_logits,
+            gt_patches,
+            valid_z,
+            class_ids,
+        )
+        ot_output = fusion_modules["ot_distillation"](
+            feats,
+            gt=gt_patches,
+            base_error=base_error,
+            expert_error=expert_error,
+            valid_z=valid_z,
+            class_ids=[int(value) for value in class_ids.tolist()],
+            enable_p=w_p_ot > 0,
+            enable_s=w_s_ot > 0,
+            expert_perturbation=ot_expert_perturbation,
+        )
+        loss_p_ot = ot_output["loss_p"]
+        loss_s_ot = ot_output["loss_s"]
     else:
-        loss_p_reg = torch.tensor(0.0, device=device)
+        loss_p_ot = all_prompt_logits.sum() * 0.0
+        loss_s_ot = all_prompt_logits.sum() * 0.0
+        ot_output = {"levels": {}}
 
-    total_loss = w_seg * loss_seg + w_ae * loss_ae + w_ort * loss_ortho + w_ka * loss_ka + w_p_reg * loss_p_reg
+    loss_route = route["kl"]
+    total_loss = (
+        w_seg * loss_seg
+        + w_ae * loss_ae
+        + w_ort * loss_ortho
+        + w_route * loss_route
+        + w_p_ot * loss_p_ot
+        + w_s_ot * loss_s_ot
+    )
 
-    tau_per_class_mean = {i: float(tau_mask[:, i, :].detach().mean().item()) for i in range(P)}
+    gate_per_class_mean = {
+        i: float(route["mean"][i].detach().item()) for i in range(P)
+    }
 
     logs = {
         "loss_total": float(total_loss.detach().item()),
         "loss_seg": float(loss_seg.detach().item()),
         "loss_ae": float(loss_ae.detach().item()),
         "loss_ortho": float(loss_ortho.detach().item()),
-        "loss_ka": float(loss_ka.detach().item()),
-        "loss_p_reg": float(loss_p_reg.detach().item()),
+        "loss_route": float(loss_route.detach().item()),
+        "loss_p_ot": float(loss_p_ot.detach().item()),
+        "loss_s_ot": float(loss_s_ot.detach().item()),
         "dice_mean": dice_mean,
         "dice_per_class": dice_per_class,
-        "tau_mean": float(tau_mask.detach().mean().item()),
-        "tau_std": float(tau_mask.detach().std().item()),
-        "tau_per_class_mean": tau_per_class_mean,
+        "gate_mean": float(gate.detach().mean().item()),
+        "gate_std": float(gate.detach().std().item()),
+        "gate_per_class_mean": gate_per_class_mean,
+        "alpha_mean": float(route["alpha"].detach().mean().item()),
+        "beta_mean": float(route["beta"].detach().mean().item()),
+        "concentration_mean": float(
+            route["concentration"].detach().mean().item()
+        ),
+        "ot_levels": {
+            int(level): {
+                name: float(value.detach().item())
+                for name, value in values.items()
+            }
+            for level, values in ot_output["levels"].items()
+        },
     }
+    for level, values in logs["ot_levels"].items():
+        for name, value in values.items():
+            logs[f"ot_res{level}_{name}"] = value
     return total_loss, logs
 
 
 @torch.no_grad()
 def predict_block_logits_per_class(
-    nnunet_images: torch.Tensor,
     biomedparse_images: torch.Tensor,
     valid_z: torch.Tensor,
     output_size: Tuple[int, int],
     prompt_features: dict,
     P: int,
-    model_nnunet: nn.Module,
     model_biomedparse: nn.Module,
     fusion_modules: Dict[str, nn.Module],
     device: torch.device,
 ) -> torch.Tensor:
-    """Inference on independent contiguous blocks.
+    """Pure-student inference on independent contiguous blocks.
 
-    Inputs follow the training contract: nnUNet ``[B,Z,C,H,W]`` and
-    BiomedParse ``[B,Z,3,H,W]``. Returns ``[B,P,Z,H,W]`` logits.
+    BiomedParse input is ``[B,Z,3,H,W]``. Returns ``[B,P,Z,H,W]`` logits.
+    No nnUNet input, module, preprocessing, or cached expert statistic is used.
     """
-    if nnunet_images.ndim != 5 or biomedparse_images.ndim != 5:
-        raise ValueError("Expected 5D nnUNet and BiomedParse block tensors")
-    B, Dm = nnunet_images.shape[:2]
+    if biomedparse_images.ndim != 5:
+        raise ValueError("Expected a 5D BiomedParse block tensor")
+    B, Dm = biomedparse_images.shape[:2]
     if biomedparse_images.shape[:3] != (B, Dm, 3):
         raise ValueError(
             f"BiomedParse input must be [B,Z,3,H,W], got {biomedparse_images.shape}"
@@ -523,15 +633,11 @@ def predict_block_logits_per_class(
     ph, pw = (int(output_size[0]), int(output_size[1]))
 
     dis_mods = {k: fusion_modules[k] for k in fusion_modules if k.startswith("dis_")}
-    class_query_pooler = fusion_modules["class_query_pooler"]
-    gate_net = fusion_modules["gate_net"]
+    beta_router = fusion_modules["beta_router"]
 
-    nnunet_images = nnunet_images.to(device)
     biomedparse_images = biomedparse_images.to(device)
     valid_z = valid_z.to(device)
 
-    nnunet_blocks = nnunet_images.permute(0, 2, 1, 3, 4).contiguous()
-    _enc_feats, F_enc = extract_nnunet_features(model_nnunet, nnunet_blocks, device)
     img_embeds_base, res3d = extract_biomedparse_backbone_features_2p5d(
         model_biomedparse,
         biomedparse_images,
@@ -550,10 +656,10 @@ def predict_block_logits_per_class(
         disentangled[f"Zb{i}_s"] = Zb_s
         disentangled[f"Zb_res{i}"] = Zb
 
-    mu, _ = class_query_pooler(F_enc, valid_z=valid_z)
-    tau_out = gate_net(mu)
-    tau_mask = tau_out["mask"]
-    tau_ms_list = tau_out["ms"]
+    text_embedding = prompt_features.get("class_emb")
+    if not torch.is_tensor(text_embedding):
+        raise ValueError("prompt_features['class_emb'] is required by PromptBetaRouter")
+    route = beta_router(text_embedding.detach(), batch_size=B, sample=False)
 
     if res3d["res3"].shape[2] != Dm:
         raise RuntimeError(
@@ -580,8 +686,7 @@ def predict_block_logits_per_class(
         mask_features_s=mask_features_s,
         ms_p=ms_p,
         ms_s=ms_s,
-        tau_mask=tau_mask,
-        tau_ms_list=tau_ms_list,
+        gate=route["gate"],
         prompt_features=prompt_features,
         B=B,
         Z=Dm,

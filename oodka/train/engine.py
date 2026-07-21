@@ -6,6 +6,7 @@ import json
 import os
 import random
 from contextlib import nullcontext
+from dataclasses import asdict
 from datetime import datetime
 from typing import Dict, List, Tuple
 
@@ -62,21 +63,39 @@ class OODKATrainer:
 
         trainable_params = []
         for module in fusion_modules.values():
-            trainable_params.extend(module.parameters())
+            trainable_params.extend(
+                parameter for parameter in module.parameters()
+                if parameter.requires_grad
+            )
+        self.trainable_params = trainable_params
         self.optimizer = torch.optim.AdamW(
             trainable_params, lr=cfg.lr, weight_decay=cfg.weight_decay
+        )
+        self.amp_enabled = bool(cfg.amp and self.device.type == "cuda")
+        self.amp_dtype = (
+            torch.bfloat16 if cfg.amp_dtype == "bfloat16" else torch.float16
+        )
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=self.amp_enabled and self.amp_dtype == torch.float16
         )
         self.history = {
             "epochs": [],
             "train_loss_total": [], "train_loss_seg": [],
-            "train_loss_ae": [], "train_loss_ortho": [], "train_loss_ka": [],
+            "train_loss_ae": [], "train_loss_ortho": [],
+            "train_loss_route": [],
+            "train_loss_p_ot": [], "train_loss_s_ot": [],
             "val_loss_total": [], "val_loss_seg": [],
-            "val_loss_ae": [], "val_loss_ortho": [], "val_loss_ka": [],
+            "val_loss_ae": [], "val_loss_ortho": [],
+            "val_loss_route": [],
+            "val_loss_p_ot": [], "val_loss_s_ot": [],
             "train_dice_mean": [], "val_dice_mean": [],
             "train_dice_per_class": [], "val_dice_per_class": [],
-            "train_tau_per_class": [],
+            "train_gate_per_class": [],
         }
         self.best_val_dice = -float("inf")
+        self.start_epoch = 1
+        if cfg.resume_checkpoint:
+            self._load_checkpoint(cfg.resume_checkpoint)
 
     def _set_fusion_mode(self, train: bool) -> None:
         for module in self.fusion_modules.values():
@@ -132,14 +151,30 @@ class OODKATrainer:
         *,
         train: bool,
         epoch: int,
-        w_p_reg: float,
+        w_route: float,
+        w_p_ot: float,
+        w_s_ot: float,
     ) -> Tuple[dict, float, dict]:
         cfg = self.cfg
         self._set_fusion_mode(train)
         meter = {
             key: 0.0
-            for key in ["loss_total", "loss_seg", "loss_ae", "loss_ortho", "loss_ka"]
+            for key in [
+                "loss_total", "loss_seg", "loss_ae", "loss_ortho",
+                "loss_route",
+                "loss_p_ot", "loss_s_ot",
+            ]
         }
+        ot_keys = [
+            f"ot_res{level}_{name}"
+            for level in [2, 3, 4, 5]
+            for name in [
+                "p_cost", "p_row_error", "p_col_error", "p_entropy",
+                "s_cost", "s_received", "s_transported", "s_rejected",
+                "s_accept_ratio", "s_entropy", "s_gain",
+            ]
+        ]
+        meter.update({key: 0.0 for key in ot_keys})
         dice_pc_sum = np.zeros(self.P, dtype=np.float64)
         dice_pc_cnt = np.zeros(self.P, dtype=np.int64)
         n_batches = 0
@@ -148,32 +183,42 @@ class OODKATrainer:
 
         with grad_context:
             for batch_data in tqdm(loader, desc=f"[{label} {epoch:03d}]", leave=False):
-                total_loss, logs = forward_one_batch(
-                    batch_data=batch_data,
-                    block_shape=self.block_shape,
-                    prompt_features=self.prompt_features,
-                    P=self.P,
-                    prompt_to_class_id=self.prompt_to_class_id,
-                    w_seg=cfg.w_seg,
-                    w_ae=cfg.w_ae,
-                    w_ort=cfg.w_ort,
-                    w_ka=cfg.w_ka,
-                    model_nnunet=self.model_nnunet,
-                    model_biomedparse=self.model_biomedparse,
-                    fusion_modules=self.fusion_modules,
-                    device=self.device,
-                    w_p_reg=w_p_reg,
+                max_batches = (
+                    cfg.max_train_batches if train else cfg.max_val_batches
                 )
+                if max_batches > 0 and n_batches >= max_batches:
+                    break
+                with torch.autocast(
+                    device_type=self.device.type,
+                    dtype=self.amp_dtype,
+                    enabled=self.amp_enabled,
+                ):
+                    total_loss, logs = forward_one_batch(
+                        batch_data=batch_data,
+                        block_shape=self.block_shape,
+                        prompt_features=self.prompt_features,
+                        P=self.P,
+                        prompt_to_class_id=self.prompt_to_class_id,
+                        w_seg=cfg.w_seg,
+                        w_ae=cfg.w_ae,
+                        w_ort=cfg.w_ort,
+                        model_nnunet=self.model_nnunet,
+                        model_biomedparse=self.model_biomedparse,
+                        fusion_modules=self.fusion_modules,
+                        device=self.device,
+                        w_route=w_route,
+                        w_p_ot=w_p_ot,
+                        w_s_ot=w_s_ot,
+                    )
                 if train:
                     self.optimizer.zero_grad(set_to_none=True)
-                    total_loss.backward()
-                    params = [
-                        parameter
-                        for module in self.fusion_modules.values()
-                        for parameter in module.parameters()
-                    ]
-                    torch.nn.utils.clip_grad_norm_(params, max_norm=5.0)
-                    self.optimizer.step()
+                    self.scaler.scale(total_loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.trainable_params, max_norm=5.0
+                    )
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
 
                 for key in meter:
                     meter[key] += logs.get(key, 0.0)
@@ -199,6 +244,12 @@ class OODKATrainer:
         cfg = self.cfg
         set_seed(cfg.seed)
         maybe_mkdir_p(cfg.output_dir)
+        with open(
+            os.path.join(cfg.output_dir, "resolved_config.json"),
+            "w",
+            encoding="utf-8",
+        ) as config_handle:
+            json.dump(asdict(cfg), config_handle, indent=2)
         log_dir = os.path.join(cfg.output_dir, "logs")
         maybe_mkdir_p(log_dir)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -214,6 +265,10 @@ class OODKATrainer:
             log_fh.flush()
 
         train_ids, val_ids = load_fold_cases(cfg.splits_final_json, cfg.fold)
+        if cfg.train_case_limit > 0:
+            train_ids = train_ids[: cfg.train_case_limit]
+        if cfg.val_case_limit > 0:
+            val_ids = val_ids[: cfg.val_case_limit]
         with open(cfg.dataset_json_path, encoding="utf-8") as f:
             file_ending = json.load(f).get("file_ending", ".nii.gz")
         train_dataset = self._make_dataset(train_ids, file_ending)
@@ -229,34 +284,62 @@ class OODKATrainer:
             f"C_nn=dataset, C_bp=3, H=W={cfg.image_size}")
         log(f"Output: {cfg.output_dir}")
 
-        for epoch in range(1, cfg.n_epochs + 1):
+        for epoch in range(self.start_epoch, cfg.n_epochs + 1):
             train_sampler.set_epoch(epoch)
             val_sampler.set_epoch(epoch)
-            if cfg.p_reg_warmup_epochs > 0 and epoch <= cfg.p_reg_warmup_epochs:
-                w_p_reg = cfg.w_p_reg * (epoch / cfg.p_reg_warmup_epochs)
-            elif cfg.p_reg_decay_epochs > 0 and epoch > cfg.n_epochs - cfg.p_reg_decay_epochs:
-                decay_start = cfg.n_epochs - cfg.p_reg_decay_epochs
-                w_p_reg = cfg.w_p_reg * (
-                    1.0 - (epoch - decay_start) / cfg.p_reg_decay_epochs
-                )
+            if cfg.route_warmup_epochs > 0 and epoch <= cfg.route_warmup_epochs:
+                w_route = cfg.w_route * (epoch / cfg.route_warmup_epochs)
             else:
-                w_p_reg = cfg.w_p_reg
+                w_route = cfg.w_route
+
+            def scheduled_weight(target: float, start: int) -> float:
+                if epoch < start:
+                    return 0.0
+                if cfg.ot_warmup_epochs <= 0:
+                    return target
+                progress = min(
+                    1.0, (epoch - start + 1) / cfg.ot_warmup_epochs
+                )
+                return target * progress
+
+            w_p_ot = scheduled_weight(cfg.w_p_ot, cfg.p_ot_start_epoch)
+            w_s_ot = scheduled_weight(cfg.w_s_ot, cfg.s_ot_start_epoch)
 
             train_meter, train_dice, train_pc = self._run_loader(
-                train_loader, train=True, epoch=epoch, w_p_reg=w_p_reg
+                train_loader,
+                train=True,
+                epoch=epoch,
+                w_route=w_route,
+                w_p_ot=w_p_ot,
+                w_s_ot=w_s_ot,
             )
             log(f"[Epoch {epoch:03d}] Train: "
-                f"loss={train_meter['loss_total']:.4f} dice={train_dice:.4f}")
+                f"loss={train_meter['loss_total']:.4f} dice={train_dice:.4f} "
+                f"wP={w_p_ot:.4g} wS={w_s_ot:.4g}")
 
             val_meter = {key: 0.0 for key in train_meter}
             val_dice = 0.0
             val_pc = {pi: None for pi in range(self.P)}
             if epoch % cfg.val_every_epochs == 0 or epoch == cfg.n_epochs:
                 val_meter, val_dice, val_pc = self._run_loader(
-                    val_loader, train=False, epoch=epoch, w_p_reg=0.0
+                    val_loader,
+                    train=False,
+                    epoch=epoch,
+                    w_route=w_route,
+                    w_p_ot=w_p_ot,
+                    w_s_ot=w_s_ot,
                 )
                 log(f"[Epoch {epoch:03d}] Val: "
                     f"loss={val_meter['loss_total']:.4f} dice={val_dice:.4f}")
+                if w_p_ot > 0:
+                    log(
+                        "  OT: "
+                        f"P={val_meter['loss_p_ot']:.4f} "
+                        f"S={val_meter['loss_s_ot']:.4f} "
+                        f"res4_row={val_meter['ot_res4_p_row_error']:.3e} "
+                        f"res4_col={val_meter['ot_res4_p_col_error']:.3e} "
+                        f"res4_accept={val_meter['ot_res4_s_accept_ratio']:.4f}"
+                    )
                 for pi in range(self.P):
                     log(f"  class {self.prompt_to_class_id[pi]}: {val_pc[pi]}")
                 if val_dice > self.best_val_dice:
@@ -265,7 +348,11 @@ class OODKATrainer:
                     log(f"  -> New best model saved (dice={val_dice:.4f})")
 
             self.history["epochs"].append(epoch)
-            for key in ["loss_total", "loss_seg", "loss_ae", "loss_ortho", "loss_ka"]:
+            for key in [
+                "loss_total", "loss_seg", "loss_ae", "loss_ortho",
+                "loss_route",
+                "loss_p_ot", "loss_s_ot",
+            ]:
                 self.history[f"train_{key}"].append(train_meter[key])
                 self.history[f"val_{key}"].append(val_meter[key])
             self.history["train_dice_mean"].append(train_dice)
@@ -279,9 +366,42 @@ class OODKATrainer:
         log_fh.close()
 
     def _save_checkpoint(self, epoch: int, best: bool = False) -> None:
-        state = {"epoch": epoch, "best_val_dice": self.best_val_dice}
+        state = {
+            "epoch": epoch,
+            "best_val_dice": self.best_val_dice,
+            "config": asdict(self.cfg),
+        }
         for name, module in self.fusion_modules.items():
             state[name] = module.state_dict()
         state["optimizer"] = self.optimizer.state_dict()
+        state["scaler"] = self.scaler.state_dict()
         filename = "fusion_disentangle_best.pth" if best else f"checkpoint_epoch{epoch:03d}.pth"
         torch.save(state, os.path.join(self.cfg.output_dir, filename))
+        deploy_state = {
+            "epoch": epoch,
+            "best_val_dice": self.best_val_dice,
+            "format": "oodka_student_v1",
+        }
+        for name, module in self.fusion_modules.items():
+            if name.startswith("dis_b_") or name == "beta_router":
+                deploy_state[name] = module.state_dict()
+        deploy_name = (
+            "student_deploy_best.pth"
+            if best
+            else f"student_deploy_epoch{epoch:03d}.pth"
+        )
+        torch.save(deploy_state, os.path.join(self.cfg.output_dir, deploy_name))
+
+    def _load_checkpoint(self, checkpoint_path: str) -> None:
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        for name, module in self.fusion_modules.items():
+            if name in checkpoint:
+                module.load_state_dict(checkpoint[name])
+        if "optimizer" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+        if "scaler" in checkpoint:
+            self.scaler.load_state_dict(checkpoint["scaler"])
+        self.best_val_dice = float(
+            checkpoint.get("best_val_dice", self.best_val_dice)
+        )
+        self.start_epoch = int(checkpoint.get("epoch", 0)) + 1

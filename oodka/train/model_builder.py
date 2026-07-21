@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -15,7 +15,8 @@ from ..config import (
     BIOMEDPARSE_CKPT,
 )
 from ..models.disentangle import TwoBranchDisentangle, DualBranchAutoEncoder
-from ..models.gate import ClassQueryPooler, GateNet
+from ..models.beta_router import PromptBetaRouter
+from ..models.ot import MultiScaleOTDistillation
 
 
 # ---------------------------------------------------------------------------
@@ -128,74 +129,73 @@ def _detect_nnunet_enc_channels(model_nnunet: nn.Module, device: torch.device) -
     return {k: v.shape[1] for k, v in feat.items()}
 
 
-def _detect_pixel_decoder_ms_channels(model_biomedparse: nn.Module, device: torch.device) -> Tuple[int, List[int]]:
-    """Probe pixel decoder to detect mask_features channels and multi_scale_features channels."""
-    from ..models.biomedparse_helpers import parse_pixel_decoder_out
-    import torch
-
-    dummy = torch.randn(1, 3, 256, 256, device=device)
-    pixel_mean = model_biomedparse.pixel_mean.view(1, 3, 1, 1).to(device)
-    pixel_std = model_biomedparse.pixel_std.view(1, 3, 1, 1).to(device)
-    dummy = (dummy - pixel_mean) / pixel_std
-
-    with torch.no_grad():
-        img_embeds = model_biomedparse.backbone(dummy)
-        pd_out = model_biomedparse.sem_seg_head.pixel_decoder.forward_features(img_embeds)
-
-    mf, ms = parse_pixel_decoder_out(pd_out)
-    return mf.shape[1], [m.shape[1] for m in ms]
-
-
 def build_fusion_modules(
-    model_nnunet: nn.Module,
+    model_nnunet: Optional[nn.Module],
     model_biomedparse: nn.Module,
     P: int,
     device: torch.device,
-    d_q: int = 256,
-    n_heads: int = 8,
+    text_dim: int = 512,
+    route_hidden_dim: int = 256,
+    route_prior_alpha: float = 2.0,
+    route_prior_beta: float = 2.0,
+    ot_feature_weight: float = 1.0,
+    ot_coordinate_weight: float = 0.1,
+    p_ot_semantic_weight: float = 0.25,
+    p_ot_epsilon: float = 0.1,
+    s_ot_epsilon: float = 0.1,
+    s_ot_rho_base: float = 1.0,
+    s_ot_rho_expert: float = 0.2,
+    ot_sinkhorn_iterations: int = 30,
 ) -> Dict[str, nn.Module]:
     """
     Build all trainable fusion modules.
 
     Returns dict with keys:
-        ae_enc2_to_res2..ae_enc5_to_res5 (4 DualBranchAutoEncoder),
+        During training, ae_enc2_to_res2..ae_enc5_to_res5
+        (4 DualBranchAutoEncoder),
         dis_b_res2..dis_b_res5 (4 TwoBranchDisentangle),
-        class_query_pooler,
-        gate_net
+        beta_router.
+
+        Passing ``model_nnunet=None`` builds only modules required for pure
+        student inference and does not import, initialize, or probe nnUNet.
     """
-    enc_ch = _detect_nnunet_enc_channels(model_nnunet, device)
+    if P <= 0:
+        raise ValueError(f"P must be positive, got {P}")
     res_ch = _detect_biomedparse_res_channels(model_biomedparse, device)
-    mask_ch, ms_ch_list = _detect_pixel_decoder_ms_channels(model_biomedparse, device)
-
-    # Detect deepest encoder channels for class query pooler
-    feat = {}
-    def _hook(m, i, o):
-        feat["deepest"] = o
-    h = model_nnunet.encoder.stages[-1].register_forward_hook(_hook)
-    is_2d = any(isinstance(m, nn.Conv2d) for m in model_nnunet.modules()) and \
-            not any(isinstance(m, nn.Conv3d) for m in model_nnunet.modules())
-    dummy = torch.randn(1, 1, 256, 256, device=device) if is_2d else torch.randn(1, 1, 32, 256, 256, device=device)
-    with torch.no_grad():
-        model_nnunet(dummy)
-    h.remove()
-    C_enc_deepest = feat["deepest"].shape[1]
-
     modules = {}
 
+    enc_ch = (
+        _detect_nnunet_enc_channels(model_nnunet, device)
+        if model_nnunet is not None
+        else {}
+    )
     for si in [2, 3, 4, 5]:
-        c_in = enc_ch.get(f"enc{si}", 64)
         c_out = res_ch.get(f"res{si}", 256)
-        c_mid = min(max(c_in, c_out) // 2, 256)
-        modules[f"ae_enc{si}_to_res{si}"] = DualBranchAutoEncoder(c_in, c_mid, c_out).to(device)
         modules[f"dis_b_res{si}"] = TwoBranchDisentangle(c_out).to(device)
+        if model_nnunet is not None:
+            c_in = enc_ch.get(f"enc{si}", 64)
+            c_mid = min(max(c_in, c_out) // 2, 256)
+            modules[f"ae_enc{si}_to_res{si}"] = DualBranchAutoEncoder(
+                c_in, c_mid, c_out
+            ).to(device)
 
-    modules["class_query_pooler"] = ClassQueryPooler(
-        P=P, C_e=C_enc_deepest, d_q=d_q, n_heads=n_heads
+    modules["beta_router"] = PromptBetaRouter(
+        text_dim=text_dim,
+        hidden_dim=route_hidden_dim,
+        prior_alpha=route_prior_alpha,
+        prior_beta=route_prior_beta,
     ).to(device)
-
-    modules["gate_net"] = GateNet(
-        d_q=d_q, out_ch_mask=mask_ch, out_ch_ms=ms_ch_list
-    ).to(device)
+    if model_nnunet is not None:
+        modules["ot_distillation"] = MultiScaleOTDistillation(
+            feature_weight=ot_feature_weight,
+            coordinate_weight=ot_coordinate_weight,
+            p_semantic_weight=p_ot_semantic_weight,
+            p_epsilon=p_ot_epsilon,
+            s_epsilon=s_ot_epsilon,
+            rho_base=s_ot_rho_base,
+            rho_expert=s_ot_rho_expert,
+            sinkhorn_iterations=ot_sinkhorn_iterations,
+        ).to(device)
 
     return modules
 

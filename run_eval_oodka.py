@@ -13,15 +13,17 @@ import torch
 
 from oodka.config import EvalConfig
 from oodka.models.prompts import build_text_prompts_for_dataset
-from oodka.train.model_builder import load_frozen_backbones, build_fusion_modules, build_prompt_features
+from oodka.train.model_builder import (
+    load_frozen_biomedparse,
+    build_fusion_modules,
+    build_prompt_features,
+)
 from oodka.eval.eval_oodka import evaluate_oodka_blocks
 
 
 def main():
     parser = argparse.ArgumentParser(description="OODKA contiguous-block evaluation")
     parser.add_argument("--dataset_name", type=str, default="Dataset009_CT_OOD")
-    parser.add_argument("--nnunet_trainer_tag", type=str, default="nnUNetTrainer_500epochs__nnUNetPlans__2d")
-    parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--block_z", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=1,
                         help="Number B of independent contiguous-Z blocks")
@@ -31,12 +33,12 @@ def main():
     parser.add_argument("--distangler_ckpt", type=str, required=True)
     parser.add_argument("--out_dir", type=str, default="")
     parser.add_argument("--case_limit", type=int, default=0)
+    parser.add_argument("--split", choices=("val", "test"), default="test")
+    parser.add_argument("--fold", type=int, default=0)
     args = parser.parse_args()
 
     cfg = EvalConfig(
         dataset_name=args.dataset_name,
-        nnunet_trainer_tag=args.nnunet_trainer_tag,
-        fold=args.fold,
         block_z=args.block_z,
         batch_size=args.batch_size,
         image_size=args.image_size,
@@ -45,12 +47,14 @@ def main():
         distangler_ckpt=args.distangler_ckpt,
         out_dir=args.out_dir or os.path.join("outputs", f"oodka_eval_{args.dataset_name}"),
         case_limit=args.case_limit,
+        split=args.split,
+        fold=args.fold,
     )
     cfg.resolve_paths()
     device = torch.device(cfg.device)
 
-    print("Loading frozen backbones...")
-    model_nnunet, model_biomedparse = load_frozen_backbones(cfg.nnunet_model_dir, cfg.fold, device)
+    print("Loading frozen BiomedParse student backbone...")
+    model_biomedparse = load_frozen_biomedparse(device)
 
     text_prompts, prompt_to_class_id = build_text_prompts_for_dataset(dataset_name=cfg.dataset_name)
     P = len(text_prompts)
@@ -59,7 +63,13 @@ def main():
     prompt_features = build_prompt_features(model_biomedparse, text_prompts, device)
 
     print("Building fusion modules...")
-    fusion_modules = build_fusion_modules(model_nnunet, model_biomedparse, P, device)
+    fusion_modules = build_fusion_modules(
+        None,
+        model_biomedparse,
+        P,
+        device,
+        text_dim=int(prompt_features["class_emb"].shape[-1]),
+    )
 
     # Load checkpoint
     print(f"Loading checkpoint: {cfg.distangler_ckpt}")
@@ -73,7 +83,6 @@ def main():
 
     evaluate_oodka_blocks(
         cfg=cfg,
-        model_nnunet=model_nnunet,
         model_biomedparse=model_biomedparse,
         fusion_modules=fusion_modules,
         prompt_features=prompt_features,

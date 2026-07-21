@@ -37,8 +37,20 @@ def main():
     parser.add_argument("--w_seg", type=float, default=3.0)
     parser.add_argument("--w_ae", type=float, default=0.2)
     parser.add_argument("--w_ort", type=float, default=0.3)
-    parser.add_argument("--w_ka", type=float, default=0.5)
+    parser.add_argument("--w_route", type=float, default=1e-3)
+    parser.add_argument("--route_warmup_epochs", type=int, default=5)
+    parser.add_argument("--w_p_ot", type=float, default=0.1)
+    parser.add_argument("--w_s_ot", type=float, default=0.1)
+    parser.add_argument("--p_ot_start_epoch", type=int, default=2)
+    parser.add_argument("--s_ot_start_epoch", type=int, default=3)
+    parser.add_argument("--ot_warmup_epochs", type=int, default=5)
+    parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument("--resume_checkpoint", type=str, default="")
     parser.add_argument("--val_every_epochs", type=int, default=5)
+    parser.add_argument("--train_case_limit", type=int, default=0)
+    parser.add_argument("--val_case_limit", type=int, default=0)
+    parser.add_argument("--max_train_batches", type=int, default=0)
+    parser.add_argument("--max_val_batches", type=int, default=0)
     args = parser.parse_args()
 
     cfg = TrainConfig(
@@ -58,8 +70,20 @@ def main():
         w_seg=args.w_seg,
         w_ae=args.w_ae,
         w_ort=args.w_ort,
-        w_ka=args.w_ka,
+        w_route=args.w_route,
+        route_warmup_epochs=args.route_warmup_epochs,
+        w_p_ot=args.w_p_ot,
+        w_s_ot=args.w_s_ot,
+        p_ot_start_epoch=args.p_ot_start_epoch,
+        s_ot_start_epoch=args.s_ot_start_epoch,
+        ot_warmup_epochs=args.ot_warmup_epochs,
+        amp=not args.no_amp,
+        resume_checkpoint=args.resume_checkpoint,
         val_every_epochs=args.val_every_epochs,
+        train_case_limit=args.train_case_limit,
+        val_case_limit=args.val_case_limit,
+        max_train_batches=args.max_train_batches,
+        max_val_batches=args.max_val_batches,
     )
     cfg.resolve_paths()
     device = torch.device(cfg.device)
@@ -83,7 +107,24 @@ def main():
     prompt_features = build_prompt_features(model_biomedparse, text_prompts, device)
 
     print("Building fusion modules...")
-    fusion_modules = build_fusion_modules(model_nnunet, model_biomedparse, P, device)
+    text_dim = int(prompt_features["class_emb"].shape[-1])
+    fusion_modules = build_fusion_modules(
+        model_nnunet,
+        model_biomedparse,
+        P,
+        device,
+        text_dim=text_dim,
+        route_prior_alpha=cfg.route_prior_alpha,
+        route_prior_beta=cfg.route_prior_beta,
+        ot_feature_weight=cfg.ot_feature_weight,
+        ot_coordinate_weight=cfg.ot_coordinate_weight,
+        p_ot_semantic_weight=cfg.p_ot_semantic_weight,
+        p_ot_epsilon=cfg.p_ot_epsilon,
+        s_ot_epsilon=cfg.s_ot_epsilon,
+        s_ot_rho_base=cfg.s_ot_rho_base,
+        s_ot_rho_expert=cfg.s_ot_rho_expert,
+        ot_sinkhorn_iterations=cfg.ot_sinkhorn_iterations,
+    )
     n_params = sum(p.numel() for m in fusion_modules.values() for p in m.parameters() if p.requires_grad)
     print(f"Trainable parameters: {n_params:,}")
 

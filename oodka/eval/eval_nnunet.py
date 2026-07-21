@@ -25,6 +25,23 @@ from ..utils.metrics import (
 )
 
 
+def _coerce_nnunet_segmentation(
+    prediction: np.ndarray | tuple, expected_shape: tuple[int, ...]
+) -> np.ndarray:
+    """Validate the segmentation returned by nnUNet's public numpy API."""
+    if isinstance(prediction, tuple):
+        prediction = prediction[0]
+    prediction = np.asarray(prediction)
+    if prediction.shape == (1, *expected_shape):
+        prediction = prediction[0]
+    if prediction.shape != expected_shape:
+        raise ValueError(
+            "nnUNet returned a segmentation with unexpected shape: "
+            f"prediction={prediction.shape}, ground_truth={expected_shape}"
+        )
+    return prediction.astype(np.int16, copy=False)
+
+
 def evaluate_nnunet_2d(cfg: EvalConfig):
     """Run nnUNet 2D inference on test cases, export predictions, compute metrics."""
     ensure_nnunet_on_path()
@@ -79,12 +96,12 @@ def evaluate_nnunet_2d(cfg: EvalConfig):
         img_arrays = [sitk.GetArrayFromImage(sitk.ReadImage(f)).astype(np.float32) for f in image_files]
         data_np = np.stack(img_arrays, axis=0) if len(img_arrays) > 1 else img_arrays[0][None]
 
-        pred_logits = predictor.predict_single_npy_array(
-            data_np, {"spacing": list(reversed(spacing_xyz))}
+        pred_seg = _coerce_nnunet_segmentation(
+            predictor.predict_single_npy_array(
+                data_np, {"spacing": list(reversed(spacing_xyz))}
+            ),
+            gt_arr.shape,
         )
-        if isinstance(pred_logits, tuple):
-            pred_logits = pred_logits[0]
-        pred_seg = np.argmax(pred_logits, axis=0).astype(np.int16)
 
         # Export prediction NIfTI
         ref_img = sitk.ReadImage(label_path)
