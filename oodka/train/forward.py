@@ -16,6 +16,7 @@ from ..models.feature_extraction import (
 from ..models.biomedparse_helpers import (
     expand_prompt_features_for_blocks,
     parse_pixel_decoder_out,
+    gates_for_biomedparse_predictor,
     select_best_mask_from_queries,
     run_biomedparse_predictor_override,
 )
@@ -185,12 +186,12 @@ def _fuse_all_prompt_features(
     N, C, H, W = p_feature.shape
     if N != B * Z:
         raise ValueError(f"Visual batch={N} != B*Z={B*Z}")
-    if gate.ndim != 3 or gate.shape[0] != B or gate.shape[2] != 1:
-        raise ValueError(f"gate must be [B,P,1], got {gate.shape}")
+    if gate.ndim != 2 or gate.shape[0] != B:
+        raise ValueError(f"scale gate must be [B,P], got {gate.shape}")
     P = gate.shape[1]
     p_bz = p_feature.reshape(B, Z, C, H, W)[:, :, None]
     s_bz = s_feature.reshape(B, Z, C, H, W)[:, :, None]
-    gate_bzp = gate[:, None, :, :, None, None]
+    gate_bzp = gate[:, None, :, None, None, None]
     fused = gate_bzp * p_bz + (1.0 - gate_bzp) * s_bz
     return fused.reshape(B * Z * P, C, H, W).contiguous()
 
@@ -210,20 +211,29 @@ def _predict_all_prompt_logits(
     output_shape: Tuple[int, int, int],
 ) -> torch.Tensor:
     """Run one predictor call for all aligned visual-prompt pairs."""
-    if gate.shape != (B, P, 1):
-        raise ValueError(f"gate must be [B,P,1]=[{B},{P},1], got {gate.shape}")
+    mask_gate, multi_scale_gates = gates_for_biomedparse_predictor(
+        gate, B=B, P=P
+    )
     if len(ms_p) != len(ms_s):
         raise ValueError(
             "P/S multi-scale feature counts must match, got "
             f"{len(ms_p)} and {len(ms_s)}"
         )
 
+    if len(ms_p) != 3:
+        raise ValueError(
+            "BiomedParse predictor must expose three multi-scale features "
+            f"(res5,res4,res3), got {len(ms_p)}"
+        )
+
+    # Router order is [res2,res3,res4,res5]. BiomedParse predictor order is
+    # coarse-to-fine [res5,res4,res3], while mask_features represents res2.
     fused_mask = _fuse_all_prompt_features(
-        mask_features_p, mask_features_s, gate, B=B, Z=Z
+        mask_features_p, mask_features_s, mask_gate, B=B, Z=Z
     )
     fused_multi_scale = [
-        _fuse_all_prompt_features(mp, ms, gate, B=B, Z=Z)
-        for mp, ms in zip(ms_p, ms_s)
+        _fuse_all_prompt_features(mp, ms, scale_gate, B=B, Z=Z)
+        for mp, ms, scale_gate in zip(ms_p, ms_s, multi_scale_gates)
     ]
     expanded_prompts = expand_prompt_features_for_blocks(
         prompt_features,
@@ -497,7 +507,7 @@ def forward_one_batch(
     loss_ae_pd = (loss_ae_pd_mask + sum(loss_ae_pd_ms)) / (1 + len(loss_ae_pd_ms))
     loss_ae = (loss_ae_z + loss_ae_pd) / 9.0  # 8 Z-layer terms + 1 PD term in loss_ae_z
 
-    # Prompt-only scalar P/S routing. Expert features never enter this path.
+    # Prompt-only, scale-specific P/S routing. Expert features never enter this path.
     text_embedding = prompt_features.get("class_emb")
     if not torch.is_tensor(text_embedding):
         raise ValueError("prompt_features['class_emb'] is required by PromptBetaRouter")
@@ -569,8 +579,13 @@ def forward_one_batch(
         + w_s_ot * loss_s_ot
     )
 
+    level_names = ("res2", "res3", "res4", "res5")
     gate_per_class_mean = {
-        i: float(route["mean"][i].detach().item()) for i in range(P)
+        i: {
+            level: float(route["mean"][i, level_index].detach().item())
+            for level_index, level in enumerate(level_names)
+        }
+        for i in range(P)
     }
 
     logs = {
@@ -586,6 +601,10 @@ def forward_one_batch(
         "gate_mean": float(gate.detach().mean().item()),
         "gate_std": float(gate.detach().std().item()),
         "gate_per_class_mean": gate_per_class_mean,
+        "gate_per_level_mean": {
+            level: float(gate[:, :, level_index].detach().mean().item())
+            for level_index, level in enumerate(level_names)
+        },
         "alpha_mean": float(route["alpha"].detach().mean().item()),
         "beta_mean": float(route["beta"].detach().mean().item()),
         "concentration_mean": float(

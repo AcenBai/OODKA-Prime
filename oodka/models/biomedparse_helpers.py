@@ -22,6 +22,15 @@ def parse_pixel_decoder_out(pd_out) -> Tuple[torch.Tensor, List[torch.Tensor]]:
     raise RuntimeError("Unexpected pixel_decoder output type")
 
 
+def gates_for_biomedparse_predictor(
+    gate: torch.Tensor, *, B: int, P: int
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    """Map [res2,res3,res4,res5] gates to mask and coarse-to-fine inputs."""
+    if gate.shape != (B, P, 4):
+        raise ValueError(f"gate must be [B,P,4]=[{B},{P},4], got {gate.shape}")
+    return gate[:, :, 0], [gate[:, :, i] for i in (3, 2, 1)]
+
+
 def expand_prompt_features_for_blocks(
     prompt_features: dict,
     *,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Sequence
 
 import torch
 import torch.nn as nn
@@ -11,7 +11,7 @@ from torch.distributions import Beta, kl_divergence
 
 
 class PromptBetaRouter(nn.Module):
-    """Map frozen text embeddings to a continuous scalar P/S gate.
+    """Map frozen text embeddings to scale-specific continuous P/S gates.
 
     The distribution parameters depend only on prompt semantics. During
     training, independent reparameterized samples are drawn for each block;
@@ -23,28 +23,43 @@ class PromptBetaRouter(nn.Module):
         self,
         text_dim: int,
         hidden_dim: int = 256,
-        prior_alpha: float = 2.0,
-        prior_beta: float = 2.0,
+        prior_p_means: Sequence[float] = (0.5, 0.6, 0.7, 0.8),
+        prior_concentration: float = 10.0,
     ) -> None:
         super().__init__()
         if text_dim <= 0 or hidden_dim <= 0:
             raise ValueError("text_dim and hidden_dim must be positive")
-        if prior_alpha <= 0 or prior_beta <= 0:
-            raise ValueError("Beta prior parameters must be positive")
+        if len(prior_p_means) != 4:
+            raise ValueError("prior_p_means must contain res2,res3,res4,res5")
+        prior_mean = torch.tensor(tuple(float(v) for v in prior_p_means))
+        if torch.any((prior_mean <= 0) | (prior_mean >= 1)):
+            raise ValueError("Every P prior mean must be strictly between 0 and 1")
+        if prior_concentration <= 0:
+            raise ValueError("prior_concentration must be positive")
+        prior_alpha = prior_mean * float(prior_concentration)
+        prior_beta = (1.0 - prior_mean) * float(prior_concentration)
+        if torch.any(prior_alpha <= 1) or torch.any(prior_beta <= 1):
+            raise ValueError(
+                "All prior alpha/beta values must exceed 1 for this router"
+            )
 
         self.norm = nn.LayerNorm(text_dim)
         self.trunk = nn.Sequential(
             nn.Linear(text_dim, hidden_dim),
             nn.GELU(),
         )
-        self.alpha_head = nn.Linear(hidden_dim, 1)
-        self.beta_head = nn.Linear(hidden_dim, 1)
-        self.register_buffer(
-            "prior_alpha", torch.tensor(float(prior_alpha)), persistent=True
-        )
-        self.register_buffer(
-            "prior_beta", torch.tensor(float(prior_beta)), persistent=True
-        )
+        self.alpha_head = nn.Linear(hidden_dim, 4)
+        self.beta_head = nn.Linear(hidden_dim, 4)
+        self.register_buffer("prior_alpha", prior_alpha, persistent=True)
+        self.register_buffer("prior_beta", prior_beta, persistent=True)
+
+        # Begin exactly at the requested scale prior while retaining prompt-wise
+        # learnability as soon as gradients update the zero-initialized weights.
+        nn.init.zeros_(self.alpha_head.weight)
+        nn.init.zeros_(self.beta_head.weight)
+        with torch.no_grad():
+            self.alpha_head.bias.copy_(torch.log(torch.expm1(prior_alpha - 1.0)))
+            self.beta_head.bias.copy_(torch.log(torch.expm1(prior_beta - 1.0)))
 
     def forward(
         self,
@@ -53,7 +68,7 @@ class PromptBetaRouter(nn.Module):
         batch_size: int,
         sample: bool | None = None,
     ) -> Dict[str, torch.Tensor]:
-        """Return Beta parameters, scalar gates, and prior KL.
+        """Return per-scale Beta parameters, gates, and prior KL.
 
         Args:
             text_embedding: Frozen prompt embeddings shaped ``[P,D]``.
@@ -61,8 +76,9 @@ class PromptBetaRouter(nn.Module):
             sample: Override stochastic routing. Defaults to ``self.training``.
 
         Returns:
-            ``alpha`` and ``beta`` are ``[P,1]``; ``gate`` is ``[B,P,1]``;
-            ``kl`` is a scalar.
+            ``alpha`` and ``beta`` are ``[P,4]``; ``gate`` is ``[B,P,4]``;
+            the last axis is ordered ``[res2,res3,res4,res5]`` and ``kl`` is
+            a scalar.
         """
         if text_embedding.ndim != 2:
             raise ValueError(

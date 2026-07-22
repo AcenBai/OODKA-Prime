@@ -15,5 +15,6 @@ from .biomedparse_helpers import (
     select_best_mask_from_queries,
     run_biomedparse_predictor_override,
     parse_pixel_decoder_out,
+    gates_for_biomedparse_predictor,
 )
 from .prompts import build_text_prompts_for_dataset

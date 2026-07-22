@@ -41,8 +41,9 @@ features/statistics.
 The 2D backbones process `B*Z` images. Their outputs are restored to
 `[B,C,Z,Hf,Wf]` before the Conv3d fusion adapters.
 
-For `P` prompts, the text embedding produces Beta parameters and one scalar
-P/S gate per prompt. OODKA builds prompt-specific visual features in
+For `P` prompts, the text embedding produces four Beta P/S gates per prompt,
+ordered as `[res2,res3,res4,res5]`. Their default P prior means are
+`[0.5,0.6,0.7,0.8]`; S is always `1-P`. OODKA builds prompt-specific visual features in
 `[B,Z,P,C,H,W]` order and flattens them to `[B*Z*P,C,H,W]`. Prompt embeddings
 are expanded in the same `[B,Z,P]` order, so all visual-prompt pairs run in a
 single BiomedParse predictor call without sharing the wrong class gate.

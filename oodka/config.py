@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Tuple
 
 
 OODKA_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -94,8 +95,9 @@ class TrainConfig:
     w_ort: float = 0.3
     w_route: float = 1e-3
     route_warmup_epochs: int = 5
-    route_prior_alpha: float = 2.0
-    route_prior_beta: float = 2.0
+    # P prior means ordered as res2,res3,res4,res5; S always equals 1-P.
+    route_prior_p_means: Tuple[float, float, float, float] = (0.5, 0.6, 0.7, 0.8)
+    route_prior_concentration: float = 10.0
 
     w_p_ot: float = 0.1
     w_s_ot: float = 0.1

@@ -28,6 +28,8 @@ PARAPHRASED_PROMPTS = {
     "7": "main pulmonary arterial trunk in cardiac CT",
 }
 
+LEVEL_NAMES = ("res2", "res3", "res4", "res5")
+
 
 def _statistics(router, model, prompts, device):
     encoded = build_prompt_features(model, prompts, device)
@@ -39,10 +41,17 @@ def _statistics(router, model, prompts, device):
             {
                 "class_id": int(key),
                 "prompt": prompts[key],
-                "alpha": float(output["alpha"][index].item()),
-                "beta": float(output["beta"][index].item()),
-                "gate_mean": float(output["mean"][index].item()),
-                "concentration": float(output["concentration"][index].item()),
+                "levels": {
+                    level: {
+                        "alpha": float(output["alpha"][index, level_index].item()),
+                        "beta": float(output["beta"][index, level_index].item()),
+                        "gate_mean": float(output["mean"][index, level_index].item()),
+                        "concentration": float(
+                            output["concentration"][index, level_index].item()
+                        ),
+                    }
+                    for level_index, level in enumerate(LEVEL_NAMES)
+                },
             }
         )
     return rows
@@ -69,9 +78,13 @@ def main() -> None:
     seen = _statistics(router, model, WHS_CT_PROMPTS, device)
     paraphrased = _statistics(router, model, PARAPHRASED_PROMPTS, device)
     mean_abs_shift = sum(
-        abs(left["gate_mean"] - right["gate_mean"])
+        abs(
+            left["levels"][level]["gate_mean"]
+            - right["levels"][level]["gate_mean"]
+        )
         for left, right in zip(seen, paraphrased)
-    ) / len(seen)
+        for level in LEVEL_NAMES
+    ) / (len(seen) * len(LEVEL_NAMES))
     report = {
         "checkpoint": os.path.abspath(args.checkpoint),
         "seen": seen,
