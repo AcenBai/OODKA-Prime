@@ -44,6 +44,7 @@ def main():
     parser.add_argument("--p_ot_start_epoch", type=int, default=2)
     parser.add_argument("--s_ot_start_epoch", type=int, default=3)
     parser.add_argument("--ot_warmup_epochs", type=int, default=5)
+    parser.add_argument("--ot_max_grid_size", type=int, default=32)
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--resume_checkpoint", type=str, default="")
     parser.add_argument("--val_every_epochs", type=int, default=5)
@@ -77,6 +78,7 @@ def main():
         p_ot_start_epoch=args.p_ot_start_epoch,
         s_ot_start_epoch=args.s_ot_start_epoch,
         ot_warmup_epochs=args.ot_warmup_epochs,
+        ot_max_grid_size=args.ot_max_grid_size,
         amp=not args.no_amp,
         resume_checkpoint=args.resume_checkpoint,
         val_every_epochs=args.val_every_epochs,
@@ -124,6 +126,7 @@ def main():
         s_ot_rho_base=cfg.s_ot_rho_base,
         s_ot_rho_expert=cfg.s_ot_rho_expert,
         ot_sinkhorn_iterations=cfg.ot_sinkhorn_iterations,
+        ot_max_grid_size=cfg.ot_max_grid_size,
     )
     n_params = sum(p.numel() for m in fusion_modules.values() for p in m.parameters() if p.requires_grad)
     print(f"Trainable parameters: {n_params:,}")

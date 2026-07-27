@@ -1,0 +1,83 @@
+{
+  "case_id": "heart_1014",
+  "z": 191,
+  "selection": "all_classes",
+  "scale_order": [
+    "mask_features/res2",
+    "multi_scale/res3",
+    "multi_scale/res4",
+    "multi_scale/res5"
+  ],
+  "classes": {
+    "1": {
+      "name": "LV",
+      "figure": "/data4/baihexiang/SegMan/OODKA/outputs/oodka_ot_experiments/scale_gate_fold0_30ep_20260722_005035/analysis/ps_features_extended/heart_1014_z0191_class01_LV_prompt_fusion.png",
+      "gate_p": {
+        "res2": 0.2626878321170807,
+        "res3": 0.5367283821105957,
+        "res4": 0.8692940473556519,
+        "res5": 0.850589394569397
+      }
+    },
+    "2": {
+      "name": "RV",
+      "figure": "/data4/baihexiang/SegMan/OODKA/outputs/oodka_ot_experiments/scale_gate_fold0_30ep_20260722_005035/analysis/ps_features_extended/heart_1014_z0191_class02_RV_prompt_fusion.png",
+      "gate_p": {
+        "res2": 0.46301978826522827,
+        "res3": 0.6327441930770874,
+        "res4": 0.8367758989334106,
+        "res5": 0.841347873210907
+      }
+    },
+    "3": {
+      "name": "LA",
+      "figure": "/data4/baihexiang/SegMan/OODKA/outputs/oodka_ot_experiments/scale_gate_fold0_30ep_20260722_005035/analysis/ps_features_extended/heart_1014_z0191_class03_LA_prompt_fusion.png",
+      "gate_p": {
+        "res2": 0.42613738775253296,
+        "res3": 0.6393454074859619,
+        "res4": 0.840559184551239,
+        "res5": 0.852302074432373
+      }
+    },
+    "4": {
+      "name": "RA",
+      "figure": "/data4/baihexiang/SegMan/OODKA/outputs/oodka_ot_experiments/scale_gate_fold0_30ep_20260722_005035/analysis/ps_features_extended/heart_1014_z0191_class04_RA_prompt_fusion.png",
+      "gate_p": {
+        "res2": 0.47030532360076904,
+        "res3": 0.6516451239585876,
+        "res4": 0.8246352672576904,
+        "res5": 0.8273981213569641
+      }
+    },
+    "5": {
+      "name": "MYO",
+      "figure": "/data4/baihexiang/SegMan/OODKA/outputs/oodka_ot_experiments/scale_gate_fold0_30ep_20260722_005035/analysis/ps_features_extended/heart_1014_z0191_class05_MYO_prompt_fusion.png",
+      "gate_p": {
+        "res2": 0.26378825306892395,
+        "res3": 0.5315362811088562,
+        "res4": 0.8669577240943909,
+        "res5": 0.8533653020858765
+      }
+    },
+    "6": {
+      "name": "AO",
+      "figure": "/data4/baihexiang/SegMan/OODKA/outputs/oodka_ot_experiments/scale_gate_fold0_30ep_20260722_005035/analysis/ps_features_extended/heart_1014_z0191_class06_AO_prompt_fusion.png",
+      "gate_p": {
+        "res2": 0.26753485202789307,
+        "res3": 0.6456069946289062,
+        "res4": 0.8184962868690491,
+        "res5": 0.8474686741828918
+      }
+    },
+    "7": {
+      "name": "PA",
+      "figure": "/data4/baihexiang/SegMan/OODKA/outputs/oodka_ot_experiments/scale_gate_fold0_30ep_20260722_005035/analysis/ps_features_extended/heart_1014_z0191_class07_PA_prompt_fusion.png",
+      "gate_p": {
+        "res2": 0.19360868632793427,
+        "res3": 0.5686119198799133,
+        "res4": 0.8384723663330078,
+        "res5": 0.8354760408401489
+      }
+    }
+  }
+}

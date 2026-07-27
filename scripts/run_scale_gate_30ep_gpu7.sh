@@ -37,6 +37,7 @@ nvidia-smi -i 7
   --p_ot_start_epoch 2 \
   --s_ot_start_epoch 3 \
   --ot_warmup_epochs 5 \
+  --ot_max_grid_size 32 \
   --val_every_epochs 1 \
   2>&1 | tee "${EXP_DIR}/logs/train_console.log"
 
@@ -88,17 +89,29 @@ test -f "${STUDENT_CKPT}"
 
 # ============================================================
 # 5. P/S特征热图与定量指标
-# heart_1004可以替换成其他val case
+# 第一例：最大前景切片
 # ============================================================
 
 "${PYTHON}" scripts/analyze_ps_features.py \
-  --checkpoint "${STUDENT_CKPT}" \
+  --checkpoint "${FULL_CKPT}" \
   --case_id heart_1004 \
   --split val \
+  --selection largest_foreground \
   --block_z 6 \
   --device cuda:0 \
   --output_dir "${ANALYSIS_DIR}/ps_features" \
   2>&1 | tee "${EXP_DIR}/logs/analyze_ps_features.log"
+
+# 第二例：自动选择七个前景类别同时存在且前景面积最大的切片
+"${PYTHON}" scripts/analyze_ps_features.py \
+  --checkpoint "${FULL_CKPT}" \
+  --case_id heart_1014 \
+  --split val \
+  --selection all_classes \
+  --block_z 6 \
+  --device cuda:0 \
+  --output_dir "${ANALYSIS_DIR}/ps_features" \
+  2>&1 | tee "${EXP_DIR}/logs/analyze_ps_features_all_classes.log"
 
 # ============================================================
 # 6. UOT拒绝机制压力测试

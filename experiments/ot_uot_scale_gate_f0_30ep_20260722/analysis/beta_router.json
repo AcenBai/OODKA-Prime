@@ -1,0 +1,428 @@
+{
+  "checkpoint": "/data4/baihexiang/SegMan/OODKA/outputs/oodka_ot_experiments/scale_gate_fold0_30ep_20260722_005035/student_deploy_best.pth",
+  "seen": [
+    {
+      "class_id": 1,
+      "prompt": "CT imaging of the left ventricular blood cavity of the heart",
+      "levels": {
+        "res2": {
+          "alpha": 30.17494773864746,
+          "beta": 84.69503784179688,
+          "gate_mean": 0.2626878321170807,
+          "concentration": 114.86998748779297
+        },
+        "res3": {
+          "alpha": 43.219478607177734,
+          "beta": 37.30445098876953,
+          "gate_mean": 0.5367283821105957,
+          "concentration": 80.52392578125
+        },
+        "res4": {
+          "alpha": 48.42536163330078,
+          "beta": 7.281177520751953,
+          "gate_mean": 0.8692940473556519,
+          "concentration": 55.706539154052734
+        },
+        "res5": {
+          "alpha": 23.80313491821289,
+          "beta": 4.181149005889893,
+          "gate_mean": 0.850589394569397,
+          "concentration": 27.984283447265625
+        }
+      }
+    },
+    {
+      "class_id": 2,
+      "prompt": "CT imaging of the right ventricular blood cavity of the heart",
+      "levels": {
+        "res2": {
+          "alpha": 53.16172409057617,
+          "beta": 61.65351104736328,
+          "gate_mean": 0.46301978826522827,
+          "concentration": 114.81523132324219
+        },
+        "res3": {
+          "alpha": 50.24463653564453,
+          "beta": 29.162866592407227,
+          "gate_mean": 0.6327441930770874,
+          "concentration": 79.40750122070312
+        },
+        "res4": {
+          "alpha": 42.597991943359375,
+          "beta": 8.309293746948242,
+          "gate_mean": 0.8367758989334106,
+          "concentration": 50.90728759765625
+        },
+        "res5": {
+          "alpha": 21.107980728149414,
+          "beta": 3.98030948638916,
+          "gate_mean": 0.841347873210907,
+          "concentration": 25.08829116821289
+        }
+      }
+    },
+    {
+      "class_id": 3,
+      "prompt": "CT imaging of the left atrial blood cavity of the heart",
+      "levels": {
+        "res2": {
+          "alpha": 47.157989501953125,
+          "beta": 63.50583267211914,
+          "gate_mean": 0.42613738775253296,
+          "concentration": 110.663818359375
+        },
+        "res3": {
+          "alpha": 49.36259841918945,
+          "beta": 27.845434188842773,
+          "gate_mean": 0.6393454074859619,
+          "concentration": 77.2080307006836
+        },
+        "res4": {
+          "alpha": 41.64317321777344,
+          "beta": 7.899052143096924,
+          "gate_mean": 0.840559184551239,
+          "concentration": 49.5422248840332
+        },
+        "res5": {
+          "alpha": 21.188474655151367,
+          "beta": 3.6718127727508545,
+          "gate_mean": 0.852302074432373,
+          "concentration": 24.860286712646484
+        }
+      }
+    },
+    {
+      "class_id": 4,
+      "prompt": "CT imaging of the right atrial blood cavity of the heart",
+      "levels": {
+        "res2": {
+          "alpha": 60.50889587402344,
+          "beta": 68.14985656738281,
+          "gate_mean": 0.47030532360076904,
+          "concentration": 128.65875244140625
+        },
+        "res3": {
+          "alpha": 57.72945022583008,
+          "beta": 30.860862731933594,
+          "gate_mean": 0.6516451239585876,
+          "concentration": 88.59031677246094
+        },
+        "res4": {
+          "alpha": 45.776611328125,
+          "beta": 9.734731674194336,
+          "gate_mean": 0.8246352672576904,
+          "concentration": 55.51134490966797
+        },
+        "res5": {
+          "alpha": 22.25950813293457,
+          "beta": 4.64351224899292,
+          "gate_mean": 0.8273981213569641,
+          "concentration": 26.90302085876465
+        }
+      }
+    },
+    {
+      "class_id": 5,
+      "prompt": "CT imaging of the myocardium of the left ventricle",
+      "levels": {
+        "res2": {
+          "alpha": 29.881696701049805,
+          "beta": 83.39739990234375,
+          "gate_mean": 0.26378825306892395,
+          "concentration": 113.27909851074219
+        },
+        "res3": {
+          "alpha": 42.19144821166992,
+          "beta": 37.184974670410156,
+          "gate_mean": 0.5315362811088562,
+          "concentration": 79.37641906738281
+        },
+        "res4": {
+          "alpha": 47.807899475097656,
+          "beta": 7.336542129516602,
+          "gate_mean": 0.8669577240943909,
+          "concentration": 55.144439697265625
+        },
+        "res5": {
+          "alpha": 23.646469116210938,
+          "beta": 4.063197135925293,
+          "gate_mean": 0.8533653020858765,
+          "concentration": 27.709667205810547
+        }
+      }
+    },
+    {
+      "class_id": 6,
+      "prompt": "CT imaging of the ascending aorta in the thorax",
+      "levels": {
+        "res2": {
+          "alpha": 21.968616485595703,
+          "beta": 60.1463623046875,
+          "gate_mean": 0.26753485202789307,
+          "concentration": 82.11497497558594
+        },
+        "res3": {
+          "alpha": 37.69363021850586,
+          "beta": 20.691162109375,
+          "gate_mean": 0.6456069946289062,
+          "concentration": 58.38479232788086
+        },
+        "res4": {
+          "alpha": 31.614307403564453,
+          "beta": 7.010553359985352,
+          "gate_mean": 0.8184962868690491,
+          "concentration": 38.62486267089844
+        },
+        "res5": {
+          "alpha": 18.312847137451172,
+          "beta": 3.296029567718506,
+          "gate_mean": 0.8474686741828918,
+          "concentration": 21.608877182006836
+        }
+      }
+    },
+    {
+      "class_id": 7,
+      "prompt": "CT imaging of the pulmonary artery trunk in the thorax",
+      "levels": {
+        "res2": {
+          "alpha": 22.217491149902344,
+          "beta": 92.53712463378906,
+          "gate_mean": 0.19360868632793427,
+          "concentration": 114.7546157836914
+        },
+        "res3": {
+          "alpha": 45.70986557006836,
+          "beta": 34.678646087646484,
+          "gate_mean": 0.5686119198799133,
+          "concentration": 80.38851165771484
+        },
+        "res4": {
+          "alpha": 45.633113861083984,
+          "beta": 8.790996551513672,
+          "gate_mean": 0.8384723663330078,
+          "concentration": 54.424110412597656
+        },
+        "res5": {
+          "alpha": 23.69243812561035,
+          "beta": 4.6655731201171875,
+          "gate_mean": 0.8354760408401489,
+          "concentration": 28.35801124572754
+        }
+      }
+    }
+  ],
+  "paraphrased": [
+    {
+      "class_id": 1,
+      "prompt": "left ventricular blood pool on a cardiac CT scan",
+      "levels": {
+        "res2": {
+          "alpha": 28.29556655883789,
+          "beta": 82.36833190917969,
+          "gate_mean": 0.25568923354148865,
+          "concentration": 110.66389465332031
+        },
+        "res3": {
+          "alpha": 41.307987213134766,
+          "beta": 36.35744857788086,
+          "gate_mean": 0.5318709015846252,
+          "concentration": 77.66543579101562
+        },
+        "res4": {
+          "alpha": 46.922576904296875,
+          "beta": 7.1122331619262695,
+          "gate_mean": 0.8683768510818481,
+          "concentration": 54.03480911254883
+        },
+        "res5": {
+          "alpha": 23.243797302246094,
+          "beta": 4.094272613525391,
+          "gate_mean": 0.8502354621887207,
+          "concentration": 27.338069915771484
+        }
+      }
+    },
+    {
+      "class_id": 2,
+      "prompt": "right ventricle cavity visible in CT imaging",
+      "levels": {
+        "res2": {
+          "alpha": 42.75972366333008,
+          "beta": 45.050750732421875,
+          "gate_mean": 0.4869547188282013,
+          "concentration": 87.81047058105469
+        },
+        "res3": {
+          "alpha": 39.78244400024414,
+          "beta": 21.455991744995117,
+          "gate_mean": 0.6496319770812988,
+          "concentration": 61.238433837890625
+        },
+        "res4": {
+          "alpha": 32.2398681640625,
+          "beta": 7.343520164489746,
+          "gate_mean": 0.8144797086715698,
+          "concentration": 39.58338928222656
+        },
+        "res5": {
+          "alpha": 17.14040756225586,
+          "beta": 3.6291775703430176,
+          "gate_mean": 0.8252648115158081,
+          "concentration": 20.76958465576172
+        }
+      }
+    },
+    {
+      "class_id": 3,
+      "prompt": "left atrial chamber on contrast-enhanced cardiac CT",
+      "levels": {
+        "res2": {
+          "alpha": 37.27129364013672,
+          "beta": 51.863590240478516,
+          "gate_mean": 0.4181448519229889,
+          "concentration": 89.1348876953125
+        },
+        "res3": {
+          "alpha": 40.20863723754883,
+          "beta": 22.729473114013672,
+          "gate_mean": 0.6388599276542664,
+          "concentration": 62.9381103515625
+        },
+        "res4": {
+          "alpha": 34.40565872192383,
+          "beta": 6.736783027648926,
+          "gate_mean": 0.8362571001052856,
+          "concentration": 41.14244079589844
+        },
+        "res5": {
+          "alpha": 18.54051399230957,
+          "beta": 3.1834819316864014,
+          "gate_mean": 0.8534578680992126,
+          "concentration": 21.723995208740234
+        }
+      }
+    },
+    {
+      "class_id": 4,
+      "prompt": "right atrial blood cavity in a CT volume",
+      "levels": {
+        "res2": {
+          "alpha": 55.45028305053711,
+          "beta": 60.93033218383789,
+          "gate_mean": 0.47645634412765503,
+          "concentration": 116.380615234375
+        },
+        "res3": {
+          "alpha": 52.62359619140625,
+          "beta": 27.745399475097656,
+          "gate_mean": 0.6547748446464539,
+          "concentration": 80.3689956665039
+        },
+        "res4": {
+          "alpha": 41.41661071777344,
+          "beta": 9.159002304077148,
+          "gate_mean": 0.8189047574996948,
+          "concentration": 50.57561492919922
+        },
+        "res5": {
+          "alpha": 20.604299545288086,
+          "beta": 4.405644416809082,
+          "gate_mean": 0.8238442540168762,
+          "concentration": 25.009944915771484
+        }
+      }
+    },
+    {
+      "class_id": 5,
+      "prompt": "muscular wall of the left ventricle on CT",
+      "levels": {
+        "res2": {
+          "alpha": 28.86264991760254,
+          "beta": 82.54096221923828,
+          "gate_mean": 0.25908181071281433,
+          "concentration": 111.40361022949219
+        },
+        "res3": {
+          "alpha": 41.6729850769043,
+          "beta": 36.49553298950195,
+          "gate_mean": 0.5331172347068787,
+          "concentration": 78.16851806640625
+        },
+        "res4": {
+          "alpha": 47.168479919433594,
+          "beta": 7.1449432373046875,
+          "gate_mean": 0.8684497475624084,
+          "concentration": 54.31342315673828
+        },
+        "res5": {
+          "alpha": 23.335773468017578,
+          "beta": 4.0983195304870605,
+          "gate_mean": 0.8506121635437012,
+          "concentration": 27.434093475341797
+        }
+      }
+    },
+    {
+      "class_id": 6,
+      "prompt": "the proximal ascending aorta on thoracic CT",
+      "levels": {
+        "res2": {
+          "alpha": 22.254024505615234,
+          "beta": 60.177616119384766,
+          "gate_mean": 0.2699694335460663,
+          "concentration": 82.431640625
+        },
+        "res3": {
+          "alpha": 37.86068344116211,
+          "beta": 20.735319137573242,
+          "gate_mean": 0.6461308598518372,
+          "concentration": 58.59600067138672
+        },
+        "res4": {
+          "alpha": 31.707130432128906,
+          "beta": 7.024649620056152,
+          "gate_mean": 0.8186334371566772,
+          "concentration": 38.731781005859375
+        },
+        "res5": {
+          "alpha": 18.339332580566406,
+          "beta": 3.3011507987976074,
+          "gate_mean": 0.847454845905304,
+          "concentration": 21.640483856201172
+        }
+      }
+    },
+    {
+      "class_id": 7,
+      "prompt": "main pulmonary arterial trunk in cardiac CT",
+      "levels": {
+        "res2": {
+          "alpha": 22.41733741760254,
+          "beta": 92.67320251464844,
+          "gate_mean": 0.19478002190589905,
+          "concentration": 115.09053802490234
+        },
+        "res3": {
+          "alpha": 45.84331512451172,
+          "beta": 34.7759895324707,
+          "gate_mean": 0.5686393976211548,
+          "concentration": 80.61930847167969
+        },
+        "res4": {
+          "alpha": 45.765525817871094,
+          "beta": 8.8019437789917,
+          "gate_mean": 0.8386961221694946,
+          "concentration": 54.56747055053711
+        },
+        "res5": {
+          "alpha": 23.738279342651367,
+          "beta": 4.6715874671936035,
+          "gate_mean": 0.8355646133422852,
+          "concentration": 28.409866333007812
+        }
+      }
+    }
+  ],
+  "mean_absolute_gate_shift": 0.004999403974839619
+}

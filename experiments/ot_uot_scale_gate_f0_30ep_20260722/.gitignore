@@ -1,0 +1,7 @@
+# Large or regenerable artifacts stay beside the experiment record locally,
+# but are not stored in ordinary Git history.
+models/
+logs/
+predictions/
+analysis/**/*.npz
+analysis/**/*.png

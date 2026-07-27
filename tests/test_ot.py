@@ -137,7 +137,7 @@ def test_multiscale_objective_filters_invalid_z_and_backpropagates_student_only(
     error_base = torch.rand(1, 2, 16, 16)
     error_expert = error_base * 0.5
     objective = MultiScaleOTDistillation(
-        grids={2: (4, 4), 3: (4, 4), 4: (4, 4), 5: (4, 4)},
+        max_grid_size=4,
         sinkhorn_iterations=20,
     )
     output = objective(
@@ -155,3 +155,10 @@ def test_multiscale_objective_filters_invalid_z_and_backpropagates_student_only(
     assert features["Zb2_s"].grad is not None
     assert features["Zn2_p"].grad is None
     assert features["Zn2_s"].grad is None
+
+
+def test_multiscale_grid_caps_native_size_without_upsampling():
+    objective = MultiScaleOTDistillation(max_grid_size=32)
+    assert objective._target_size(torch.empty(1, 1, 128, 96)) == (32, 32)
+    assert objective._target_size(torch.empty(1, 1, 32, 24)) == (32, 24)
+    assert objective._target_size(torch.empty(1, 1, 16, 16)) == (16, 16)

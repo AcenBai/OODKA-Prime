@@ -1,0 +1,39 @@
+{
+  "case_id": "heart_1004",
+  "z": 79,
+  "checkpoint": "/data4/baihexiang/SegMan/OODKA/outputs/oodka_ot_experiments/scale_gate_fold0_30ep_20260722_005035/student_deploy_best.pth",
+  "metrics": {
+    "res2": {
+      "p_foreground_enrichment": 0.5115376503332272,
+      "s_boundary_specificity_enrichment": 0.9067915154692624,
+      "p_foreground_mean": 5.518792152404785,
+      "p_background_mean": 10.788633346557617,
+      "s_boundary_specificity_mean": 0.5373116731643677,
+      "s_interior_specificity_mean": 0.5925415754318237
+    },
+    "res3": {
+      "p_foreground_enrichment": 1.2251089501474761,
+      "s_boundary_specificity_enrichment": 1.0441619587624176,
+      "p_foreground_mean": 11.27308177947998,
+      "p_background_mean": 9.20169734954834,
+      "s_boundary_specificity_mean": 0.49925705790519714,
+      "s_interior_specificity_mean": 0.4781413972377777
+    },
+    "res4": {
+      "p_foreground_enrichment": 0.8588337563329549,
+      "s_boundary_specificity_enrichment": 1.01212737410146,
+      "p_foreground_mean": 21.429508209228516,
+      "p_background_mean": 24.95186996459961,
+      "s_boundary_specificity_mean": 0.5420253276824951,
+      "s_interior_specificity_mean": 0.5355307459831238
+    },
+    "res5": {
+      "p_foreground_enrichment": 0.992829326395444,
+      "s_boundary_specificity_enrichment": 1.0404291502066112,
+      "p_foreground_mean": 33.249961853027344,
+      "p_background_mean": 33.490108489990234,
+      "s_boundary_specificity_mean": 0.4990224838256836,
+      "s_interior_specificity_mean": 0.4796313941478729
+    }
+  }
+}

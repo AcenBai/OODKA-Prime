@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Mapping, Sequence, Tuple
+from typing import Dict, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -19,8 +19,9 @@ class MultiScaleOTDistillation(nn.Module):
 
     def __init__(
         self,
-        grids: Mapping[int, Tuple[int, int]] | None = None,
         *,
+        levels: Sequence[int] = (2, 3, 4, 5),
+        max_grid_size: int = 32,
         feature_weight: float = 1.0,
         coordinate_weight: float = 0.1,
         p_semantic_weight: float = 0.25,
@@ -32,15 +33,14 @@ class MultiScaleOTDistillation(nn.Module):
         min_received_mass: float = 1e-6,
     ) -> None:
         super().__init__()
-        self.grids = dict(
-            grids
-            or {
-                2: (16, 16),
-                3: (16, 16),
-                4: (32, 32),
-                5: (16, 16),
-            }
-        )
+        self.levels = tuple(int(level) for level in levels)
+        if not self.levels:
+            raise ValueError("levels cannot be empty")
+        if len(set(self.levels)) != len(self.levels):
+            raise ValueError(f"levels must be unique, got {self.levels}")
+        self.max_grid_size = int(max_grid_size)
+        if self.max_grid_size <= 0:
+            raise ValueError("max_grid_size must be positive")
         self.structure_mass = StructureMassBuilder()
         self.residual_mass = ResidualMassBuilder()
         self.p_cost = OTCostBuilder(
@@ -83,6 +83,13 @@ class MultiScaleOTDistillation(nn.Module):
             .contiguous()
         )
         return flat[valid_flat]
+
+    def _target_size(self, feature: torch.Tensor) -> Tuple[int, int]:
+        """Cap each native spatial dimension without ever upsampling it."""
+        return (
+            min(int(feature.shape[-2]), self.max_grid_size),
+            min(int(feature.shape[-1]), self.max_grid_size),
+        )
 
     def forward(
         self,
@@ -127,8 +134,7 @@ class MultiScaleOTDistillation(nn.Module):
         p_losses = []
         s_losses = []
         level_logs = {}
-        for level in sorted(self.grids):
-            target_size = self.grids[level]
+        for level in sorted(self.levels):
             controlled_s_cost_offsets = {
                 "s_cost_offset_0p25": 0.25,
                 "s_cost_offset_0p5": 0.5,
@@ -150,6 +156,7 @@ class MultiScaleOTDistillation(nn.Module):
             s_expert = self._valid_feature_slices(
                 features[f"Zn{level}_s"], valid_flat
             )
+            target_size = self._target_size(p_base)
             if expert_perturbation == "spatial_shift":
                 shift = (
                     max(1, p_expert.shape[-2] // 4),
@@ -167,7 +174,10 @@ class MultiScaleOTDistillation(nn.Module):
                 raise ValueError(
                     f"Unknown expert_perturbation={expert_perturbation!r}"
                 )
-            logs = {}
+            logs = {
+                "grid_h": torch.as_tensor(target_size[0], device=p_base.device),
+                "grid_w": torch.as_tensor(target_size[1], device=p_base.device),
+            }
 
             if enable_p:
                 p_mass = self.structure_mass(

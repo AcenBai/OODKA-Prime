@@ -1,0 +1,5 @@
+models/
+logs/
+predictions/
+analysis/**/*.npz
+analysis/**/*.png

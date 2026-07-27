@@ -146,6 +146,7 @@ def build_fusion_modules(
     s_ot_rho_base: float = 1.0,
     s_ot_rho_expert: float = 0.2,
     ot_sinkhorn_iterations: int = 30,
+    ot_max_grid_size: int = 32,
 ) -> Dict[str, nn.Module]:
     """
     Build all trainable fusion modules.
@@ -187,6 +188,7 @@ def build_fusion_modules(
     ).to(device)
     if model_nnunet is not None:
         modules["ot_distillation"] = MultiScaleOTDistillation(
+            max_grid_size=ot_max_grid_size,
             feature_weight=ot_feature_weight,
             coordinate_weight=ot_coordinate_weight,
             p_semantic_weight=p_ot_semantic_weight,

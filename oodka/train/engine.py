@@ -282,6 +282,10 @@ class OODKATrainer:
             f"{val_dataset.total_real_slices} real slices")
         log(f"Batch contract: B={cfg.batch_size}, Z={cfg.block_z}, "
             f"C_nn=dataset, C_bp=3, H=W={cfg.image_size}")
+        log(
+            f"OT grid rule: each native feature dimension is capped at "
+            f"{cfg.ot_max_grid_size}"
+        )
         log(f"Output: {cfg.output_dir}")
 
         for epoch in range(self.start_epoch, cfg.n_epochs + 1):

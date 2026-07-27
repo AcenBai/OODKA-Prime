@@ -105,6 +105,7 @@ class TrainConfig:
     s_ot_start_epoch: int = 3
     ot_warmup_epochs: int = 5
     ot_sinkhorn_iterations: int = 30
+    ot_max_grid_size: int = 32
     ot_feature_weight: float = 1.0
     ot_coordinate_weight: float = 0.1
     p_ot_semantic_weight: float = 0.25

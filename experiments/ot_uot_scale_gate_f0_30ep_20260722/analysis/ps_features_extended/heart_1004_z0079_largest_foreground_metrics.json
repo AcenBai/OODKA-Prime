@@ -1,0 +1,42 @@
+{
+  "case_id": "heart_1004",
+  "z": 79,
+  "selection": "largest_foreground",
+  "labels_present": [
+    1,
+    2,
+    4,
+    5
+  ],
+  "checkpoint": "/data4/baihexiang/SegMan/OODKA/outputs/oodka_ot_experiments/scale_gate_fold0_30ep_20260722_005035/fusion_disentangle_best.pth",
+  "metrics": {
+    "res2": {
+      "expert_student_raw_energy_correlation": -0.6467927098274231,
+      "expert_student_p_energy_correlation": -0.3806281089782715,
+      "expert_student_s_energy_correlation": 0.16486196219921112,
+      "student_p_foreground_enrichment": 0.5115376503332272,
+      "student_s_boundary_share_enrichment": 0.9066298860067177
+    },
+    "res3": {
+      "expert_student_raw_energy_correlation": 0.40631890296936035,
+      "expert_student_p_energy_correlation": 0.03138110414147377,
+      "expert_student_s_energy_correlation": -0.09267918765544891,
+      "student_p_foreground_enrichment": 1.2251089501474761,
+      "student_s_boundary_share_enrichment": 1.0400062663485226
+    },
+    "res4": {
+      "expert_student_raw_energy_correlation": 0.455867737531662,
+      "expert_student_p_energy_correlation": -0.10009200125932693,
+      "expert_student_s_energy_correlation": 0.1868056356906891,
+      "student_p_foreground_enrichment": 0.8588337563329549,
+      "student_s_boundary_share_enrichment": 1.0119314651832567
+    },
+    "res5": {
+      "expert_student_raw_energy_correlation": 0.7763901352882385,
+      "expert_student_p_energy_correlation": -0.29215702414512634,
+      "expert_student_s_energy_correlation": 0.023811498656868935,
+      "student_p_foreground_enrichment": 0.992829326395444,
+      "student_s_boundary_share_enrichment": 1.040166396863801
+    }
+  }
+}
