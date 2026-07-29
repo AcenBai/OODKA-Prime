@@ -1,0 +1,190 @@
+{
+  "scale_order": [
+    "res2",
+    "res3",
+    "res4",
+    "res5"
+  ],
+  "class_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "class_names": [
+    "LV",
+    "RV",
+    "LA",
+    "RA",
+    "MYO",
+    "AO",
+    "PA"
+  ],
+  "gate_mean": [
+    [
+      0.2626878321170807,
+      0.5367283821105957,
+      0.8692940473556519,
+      0.850589394569397
+    ],
+    [
+      0.46301978826522827,
+      0.6327441930770874,
+      0.8367758989334106,
+      0.841347873210907
+    ],
+    [
+      0.42613738775253296,
+      0.6393454074859619,
+      0.840559184551239,
+      0.852302074432373
+    ],
+    [
+      0.47030532360076904,
+      0.6516451239585876,
+      0.8246352672576904,
+      0.8273981213569641
+    ],
+    [
+      0.26378825306892395,
+      0.5315362811088562,
+      0.8669577240943909,
+      0.8533653020858765
+    ],
+    [
+      0.26753485202789307,
+      0.6456069946289062,
+      0.8184962868690491,
+      0.8474686741828918
+    ],
+    [
+      0.19360868632793427,
+      0.5686119198799133,
+      0.8384723663330078,
+      0.8354760408401489
+    ]
+  ],
+  "gate_concentration": [
+    [
+      114.86998748779297,
+      80.52392578125,
+      55.706539154052734,
+      27.984283447265625
+    ],
+    [
+      114.81523132324219,
+      79.40750122070312,
+      50.90728759765625,
+      25.08829116821289
+    ],
+    [
+      110.663818359375,
+      77.2080307006836,
+      49.5422248840332,
+      24.860286712646484
+    ],
+    [
+      128.65875244140625,
+      88.59031677246094,
+      55.51134490966797,
+      26.90302085876465
+    ],
+    [
+      113.27909851074219,
+      79.37641906738281,
+      55.144439697265625,
+      27.709667205810547
+    ],
+    [
+      82.11497497558594,
+      58.38479232788086,
+      38.62486267089844,
+      21.608877182006836
+    ],
+    [
+      114.7546157836914,
+      80.38851165771484,
+      54.424110412597656,
+      28.35801124572754
+    ]
+  ],
+  "gate_uncertainty": [
+    [
+      0.04088464006781578,
+      0.05522714555263519,
+      0.044762518256902695,
+      0.06621699035167694
+    ],
+    [
+      0.04633360356092453,
+      0.05375887081027031,
+      0.05129588022828102,
+      0.07152993977069855
+    ],
+    [
+      0.0467974878847599,
+      0.05429850146174431,
+      0.05149400979280472,
+      0.06976976990699768
+    ],
+    [
+      0.043833062052726746,
+      0.050336841493844986,
+      0.050586454570293427,
+      0.07154090702533722
+    ],
+    [
+      0.04122358188033104,
+      0.05565960705280304,
+      0.045325275510549545,
+      0.06601942330598831
+    ],
+    [
+      0.0485561266541481,
+      0.062071043998003006,
+      0.061230409890413284,
+      0.07561392337083817
+    ],
+    [
+      0.03672536835074425,
+      0.05489850044250488,
+      0.049433160573244095,
+      0.06842555105686188
+    ]
+  ],
+  "decoder_shared_vmax": 7.898581504821777,
+  "router_effect_symmetric_limit": 1.8238048553466797,
+  "per_class_files": {
+    "class01_LV": {
+      "fusion": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1014_z0191/decision/per_class/class01_LV_fusion.png",
+      "output": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1014_z0191/decision/per_class/class01_LV_output.png"
+    },
+    "class02_RV": {
+      "fusion": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1014_z0191/decision/per_class/class02_RV_fusion.png",
+      "output": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1014_z0191/decision/per_class/class02_RV_output.png"
+    },
+    "class03_LA": {
+      "fusion": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1014_z0191/decision/per_class/class03_LA_fusion.png",
+      "output": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1014_z0191/decision/per_class/class03_LA_output.png"
+    },
+    "class04_RA": {
+      "fusion": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1014_z0191/decision/per_class/class04_RA_fusion.png",
+      "output": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1014_z0191/decision/per_class/class04_RA_output.png"
+    },
+    "class05_MYO": {
+      "fusion": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1014_z0191/decision/per_class/class05_MYO_fusion.png",
+      "output": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1014_z0191/decision/per_class/class05_MYO_output.png"
+    },
+    "class06_AO": {
+      "fusion": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1014_z0191/decision/per_class/class06_AO_fusion.png",
+      "output": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1014_z0191/decision/per_class/class06_AO_output.png"
+    },
+    "class07_PA": {
+      "fusion": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1014_z0191/decision/per_class/class07_PA_fusion.png",
+      "output": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1014_z0191/decision/per_class/class07_PA_output.png"
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "energy_definition": "sqrt(mean(channel^2))",
+  "percentile_clip": 99.5,
+  "raw": {
+    "vmin": 0.0,
+    "vmax": 0.9132041335105896
+  },
+  "decomposed": {
+    "vmin": 0.0,
+    "vmax": 3.9991683959960938
+  },
+  "pixel_decoder": {
+    "vmin": 0.0,
+    "vmax": 7.898581504821777
+  },
+  "share": {
+    "vmin": 0.0,
+    "vmax": 1.0
+  },
+  "student_relative": {
+    "res2": {
+      "p1": 0.866245,
+      "p99": 0.917332,
+      "normalization": "clip((RMS - P1) / (P99 - P1), 0, 1)",
+      "scope": "same level jointly across both selected cases"
+    },
+    "res3": {
+      "p1": 0.873168,
+      "p99": 0.882633,
+      "normalization": "clip((RMS - P1) / (P99 - P1), 0, 1)",
+      "scope": "same level jointly across both selected cases"
+    },
+    "res4": {
+      "p1": 0.840263,
+      "p99": 0.873686,
+      "normalization": "clip((RMS - P1) / (P99 - P1), 0, 1)",
+      "scope": "same level jointly across both selected cases"
+    },
+    "res5": {
+      "p1": 0.61933,
+      "p99": 0.838076,
+      "normalization": "clip((RMS - P1) / (P99 - P1), 0, 1)",
+      "scope": "same level jointly across both selected cases"
+    }
+  }
+}

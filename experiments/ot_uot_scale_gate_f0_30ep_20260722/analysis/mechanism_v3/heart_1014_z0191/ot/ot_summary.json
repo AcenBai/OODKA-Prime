@@ -1,0 +1,132 @@
+{
+  "case_id": "heart_1014",
+  "z": 191,
+  "energy_definition": "sqrt(mean(channel^2))",
+  "transport_matrix_display": "block-summed to at most 16x16 spatial grids; matrix values shown relative to a uniform plan",
+  "levels": {
+    "res2": {
+      "grid": [
+        32,
+        32
+      ],
+      "p": {
+        "transport_total": 1.0000077486038208,
+        "row_l1_error": 8.215740308514796e-06,
+        "col_l1_error": 8.025906936381944e-06,
+        "transport_cost": 0.9296450614929199,
+        "mean_student_teacher_residual": 0.855538010597229
+      },
+      "s": {
+        "transport_total": 1.840198278427124,
+        "accept_ratio": 0.6161245703697205,
+        "rejected_total": 0.3838754892349243,
+        "transport_cost": 0.3375329077243805,
+        "mean_student_teacher_residual": 0.08618256449699402,
+        "received_signal_definition": "U_i = sum_j pi_ij E_j",
+        "token_layout": {
+          "method": "received-mass-weighted shared PCA",
+          "visibility_transform": "log1p(9 * received_mass / positive_P99), clipped to [0, 1]",
+          "received_positive_p99": 0.02147223800420761,
+          "explained_variance_ratio": [
+            0.9891263246536255,
+            0.0033551540691405535,
+            0.0014987792819738388
+          ]
+        }
+      }
+    },
+    "res3": {
+      "grid": [
+        32,
+        32
+      ],
+      "p": {
+        "transport_total": 1.0000076293945312,
+        "row_l1_error": 0.030478136613965034,
+        "col_l1_error": 7.91124693932943e-06,
+        "transport_cost": 0.5769541263580322,
+        "mean_student_teacher_residual": 0.44872647523880005
+      },
+      "s": {
+        "transport_total": 1.7606152296066284,
+        "accept_ratio": 0.6310325860977173,
+        "rejected_total": 0.3689674735069275,
+        "transport_cost": 0.4729321002960205,
+        "mean_student_teacher_residual": 0.2701221704483032,
+        "received_signal_definition": "U_i = sum_j pi_ij E_j",
+        "token_layout": {
+          "method": "received-mass-weighted shared PCA",
+          "visibility_transform": "log1p(9 * received_mass / positive_P99), clipped to [0, 1]",
+          "received_positive_p99": 0.015256774611771107,
+          "explained_variance_ratio": [
+            0.9775516390800476,
+            0.013818934559822083,
+            0.0008252164116129279
+          ]
+        }
+      }
+    },
+    "res4": {
+      "grid": [
+        32,
+        32
+      ],
+      "p": {
+        "transport_total": 1.0000076293945312,
+        "row_l1_error": 0.007807460613548756,
+        "col_l1_error": 7.918770279502496e-06,
+        "transport_cost": 0.7439888119697571,
+        "mean_student_teacher_residual": 0.8341251611709595
+      },
+      "s": {
+        "transport_total": 1.690457820892334,
+        "accept_ratio": 0.5234021544456482,
+        "rejected_total": 0.4765978455543518,
+        "transport_cost": 0.4535864591598511,
+        "mean_student_teacher_residual": 0.23921068012714386,
+        "received_signal_definition": "U_i = sum_j pi_ij E_j",
+        "token_layout": {
+          "method": "received-mass-weighted shared PCA",
+          "visibility_transform": "log1p(9 * received_mass / positive_P99), clipped to [0, 1]",
+          "received_positive_p99": 0.018401864916086197,
+          "explained_variance_ratio": [
+            0.8978556394577026,
+            0.07220436632633209,
+            0.007588298059999943
+          ]
+        }
+      }
+    },
+    "res5": {
+      "grid": [
+        16,
+        16
+      ],
+      "p": {
+        "transport_total": 1.0000016689300537,
+        "row_l1_error": 9.47588159760926e-06,
+        "col_l1_error": 1.9987378436781e-06,
+        "transport_cost": 0.544883668422699,
+        "mean_student_teacher_residual": 0.753136396408081
+      },
+      "s": {
+        "transport_total": 1.3568449020385742,
+        "accept_ratio": 0.6435931921005249,
+        "rejected_total": 0.3564068078994751,
+        "transport_cost": 0.4538877010345459,
+        "mean_student_teacher_residual": 0.28616994619369507,
+        "received_signal_definition": "U_i = sum_j pi_ij E_j",
+        "token_layout": {
+          "method": "received-mass-weighted shared PCA",
+          "visibility_transform": "log1p(9 * received_mass / positive_P99), clipped to [0, 1]",
+          "received_positive_p99": 0.037962302565574646,
+          "explained_variance_ratio": [
+            0.9619821906089783,
+            0.011301943100988865,
+            0.003943535499274731
+          ]
+        }
+      }
+    }
+  }
+}

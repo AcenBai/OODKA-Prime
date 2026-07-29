@@ -1,0 +1,78 @@
+{
+  "schema": "oodka-mechanism-visualization-v3",
+  "case_id": "heart_1004",
+  "split": "val",
+  "z": 79,
+  "selection": "all_classes",
+  "shared_color_scales": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/shared_color_scales.json",
+  "labels_present": [
+    1,
+    2,
+    4,
+    5
+  ],
+  "git_commit": "33b3a2327195b4594bcd681d5f4e1f12d51d3042",
+  "generator": "/data4/baihexiang/SegMan/OODKA/scripts/visualize_mechanism_v3.py",
+  "checkpoint": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/models/fusion_disentangle_best.pth",
+  "checkpoint_sha256": "0c322c7b924eabd434e587d17effe871014f963095c7d32795d27f07ad056867",
+  "checkpoint_epoch": 28,
+  "block_z": 6,
+  "block_z_start": 78,
+  "center_local": 1,
+  "color_scales": {
+    "energy_definition": "sqrt(mean(channel^2))",
+    "percentile_clip": 99.5,
+    "raw": {
+      "vmin": 0.0,
+      "vmax": 0.9132041335105896
+    },
+    "decomposed": {
+      "vmin": 0.0,
+      "vmax": 3.9991683959960938
+    },
+    "pixel_decoder": {
+      "vmin": 0.0,
+      "vmax": 7.898581504821777
+    },
+    "share": {
+      "vmin": 0.0,
+      "vmax": 1.0
+    },
+    "student_relative": {
+      "res2": {
+        "p1": 0.866245,
+        "p99": 0.917332,
+        "normalization": "clip((RMS - P1) / (P99 - P1), 0, 1)",
+        "scope": "same level jointly across both selected cases"
+      },
+      "res3": {
+        "p1": 0.873168,
+        "p99": 0.882633,
+        "normalization": "clip((RMS - P1) / (P99 - P1), 0, 1)",
+        "scope": "same level jointly across both selected cases"
+      },
+      "res4": {
+        "p1": 0.840263,
+        "p99": 0.873686,
+        "normalization": "clip((RMS - P1) / (P99 - P1), 0, 1)",
+        "scope": "same level jointly across both selected cases"
+      },
+      "res5": {
+        "p1": 0.61933,
+        "p99": 0.838076,
+        "normalization": "clip((RMS - P1) / (P99 - P1), 0, 1)",
+        "scope": "same level jointly across both selected cases"
+      }
+    }
+  },
+  "refinements": [
+    "Student raw RMS relative contrast with per-level cross-case P1/P99",
+    "S-UOT displays true received expert signal U_i = sum_j pi_ij E_j",
+    "S token layout uses received-mass-weighted PCA and visibility"
+  ],
+  "directories": {
+    "representation": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1004_z0079/representation",
+    "ot": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1004_z0079/ot",
+    "decision": "/data4/baihexiang/SegMan/OODKA/experiments/ot_uot_scale_gate_f0_30ep_20260722/analysis/mechanism_v3/heart_1004_z0079/decision"
+  }
+}
