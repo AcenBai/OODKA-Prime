@@ -52,6 +52,34 @@ def main():
     )
     cfg.resolve_paths()
     device = torch.device(cfg.device)
+    print(f"Loading checkpoint metadata: {cfg.distangler_ckpt}")
+    ckpt = torch.load(cfg.distangler_ckpt, map_location=device)
+    checkpoint_cfg = ckpt.get("config", {})
+    cfg.norm_mode = str(checkpoint_cfg.get("norm_mode", cfg.norm_mode))
+    cfg.low_percentile = float(
+        checkpoint_cfg.get("low_percentile", cfg.low_percentile)
+    )
+    cfg.high_percentile = float(
+        checkpoint_cfg.get("high_percentile", cfg.high_percentile)
+    )
+    cfg.biomedparse_modality = int(
+        checkpoint_cfg.get(
+            "biomedparse_modality", cfg.biomedparse_modality
+        )
+    )
+    cfg.use_aligned_biomedparse_preprocessing = bool(
+        checkpoint_cfg.get(
+            "use_aligned_biomedparse_preprocessing",
+            bool(checkpoint_cfg.get("biomedparse_preproc_dir", "")),
+        )
+    )
+    cfg.block_z = int(checkpoint_cfg.get("block_z", cfg.block_z))
+    cfg.image_size = int(checkpoint_cfg.get("image_size", cfg.image_size))
+    if "route_prior_p_mean" not in checkpoint_cfg:
+        raise ValueError(
+            "Checkpoint uses the legacy scalar Beta router; this evaluator "
+            "expects a spatial-router checkpoint."
+        )
 
     print("Loading frozen BiomedParse student backbone...")
     model_biomedparse = load_frozen_biomedparse(device)
@@ -69,11 +97,22 @@ def main():
         P,
         device,
         text_dim=int(prompt_features["class_emb"].shape[-1]),
+        route_prior_p_mean=float(
+            checkpoint_cfg.get("route_prior_p_mean", 0.7)
+        ),
+        route_prior_concentration=float(
+            checkpoint_cfg.get("route_prior_concentration", 10.0)
+        ),
+        route_spatial_basis_grid_size=int(
+            checkpoint_cfg.get("route_spatial_basis_grid_size", 8)
+        ),
+        route_spatial_basis_sigma=float(
+            checkpoint_cfg.get("route_spatial_basis_sigma", 0.0)
+        ),
     )
 
     # Load checkpoint
     print(f"Loading checkpoint: {cfg.distangler_ckpt}")
-    ckpt = torch.load(cfg.distangler_ckpt, map_location=device)
     for name, m in fusion_modules.items():
         if name in ckpt:
             m.load_state_dict(ckpt[name])

@@ -136,8 +136,10 @@ def build_fusion_modules(
     device: torch.device,
     text_dim: int = 512,
     route_hidden_dim: int = 256,
-    route_prior_p_means: Tuple[float, float, float, float] = (0.5, 0.6, 0.7, 0.8),
+    route_prior_p_mean: float = 0.7,
     route_prior_concentration: float = 10.0,
+    route_spatial_basis_grid_size: int = 8,
+    route_spatial_basis_sigma: float = 0.0,
     ot_feature_weight: float = 1.0,
     ot_coordinate_weight: float = 0.25,
     ot_coordinate_radius: float = 0.25,
@@ -192,8 +194,10 @@ def build_fusion_modules(
     modules["beta_router"] = PromptBetaRouter(
         text_dim=text_dim,
         hidden_dim=route_hidden_dim,
-        prior_p_means=route_prior_p_means,
+        prior_p_mean=route_prior_p_mean,
         prior_concentration=route_prior_concentration,
+        basis_grid_size=route_spatial_basis_grid_size,
+        basis_sigma=route_spatial_basis_sigma,
     ).to(device)
     if model_nnunet is not None:
         modules["ot_distillation"] = MultiScaleOTDistillation(

@@ -77,6 +77,9 @@ class TrainConfig:
     raw_cache_cases: int = 2
     require_no_crop: bool = True
     biomedparse_modality: int = 0
+    # Optional offline BiomedParse store with nnUNet-identical geometry.
+    biomedparse_preproc_dir: str = ""
+    use_aligned_biomedparse_preprocessing: bool = False
 
     norm_mode: str = "ct"
     window_level: float = 40.0
@@ -87,6 +90,9 @@ class TrainConfig:
     n_epochs: int = 100
     batch_size: int = 1
     lr: float = 1e-4
+    lr_schedule: str = "constant"
+    lr_warmup_epochs: int = 0
+    min_lr_ratio: float = 0.05
     weight_decay: float = 1e-4
     seed: int = 42
 
@@ -95,9 +101,11 @@ class TrainConfig:
     w_ort: float = 0.3
     w_route: float = 1e-3
     route_warmup_epochs: int = 5
-    # P prior means ordered as res2,res3,res4,res5; S always equals 1-P.
-    route_prior_p_means: Tuple[float, float, float, float] = (0.5, 0.6, 0.7, 0.8)
+    # One finest prompt-specific spatial gate is downsampled to every level.
+    route_prior_p_mean: float = 0.7
     route_prior_concentration: float = 10.0
+    route_spatial_basis_grid_size: int = 8
+    route_spatial_basis_sigma: float = 0.0
 
     w_p_ot: float = 0.1
     w_s_ot: float = 0.1
@@ -135,6 +143,9 @@ class TrainConfig:
 
     # Resolved at runtime
     output_dir: str = ""
+    source_commit: str = ""
+    source_branch: str = ""
+    source_tracked_dirty: bool = False
 
     def resolve_paths(self):
         """Fill in derived paths from dataset_name / trainer_tag."""
@@ -175,6 +186,7 @@ class EvalConfig:
     image_size: int = 512
     require_no_crop: bool = True
     biomedparse_modality: int = 0
+    use_aligned_biomedparse_preprocessing: bool = False
 
     norm_mode: str = "ct"
     window_level: float = 40.0

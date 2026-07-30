@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 from contextlib import nullcontext
@@ -36,6 +37,34 @@ def load_fold_cases(splits_path: str, fold: int) -> Tuple[List[str], List[str]]:
     if not isinstance(splits, list) or not 0 <= fold < len(splits):
         raise ValueError(f"Invalid fold={fold} for {splits_path}")
     return list(splits[fold]["train"]), list(splits[fold]["val"])
+
+
+def learning_rate_scale(
+    epoch: int,
+    *,
+    n_epochs: int,
+    schedule: str,
+    warmup_epochs: int,
+    min_lr_ratio: float,
+) -> float:
+    """Return an epoch-level linear-warmup/constant-or-cosine LR scale."""
+    if epoch <= 0 or n_epochs <= 0:
+        raise ValueError("epoch and n_epochs must be positive")
+    if not 0.0 <= min_lr_ratio <= 1.0:
+        raise ValueError("min_lr_ratio must be in [0,1]")
+    warmup_epochs = max(0, int(warmup_epochs))
+    if warmup_epochs > 0 and epoch <= warmup_epochs:
+        return float(epoch) / float(warmup_epochs)
+    if schedule == "constant":
+        return 1.0
+    if schedule != "cosine":
+        raise ValueError(f"Unknown lr schedule: {schedule!r}")
+
+    decay_epochs = max(1, n_epochs - warmup_epochs)
+    decay_index = max(0, epoch - warmup_epochs - 1)
+    progress = min(1.0, decay_index / max(1, decay_epochs - 1))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
 
 class OODKATrainer:
@@ -119,6 +148,7 @@ class OODKATrainer:
             raw_cache_cases=cfg.raw_cache_cases,
             require_no_crop=cfg.require_no_crop,
             biomedparse_modality=cfg.biomedparse_modality,
+            biomedparse_preproc_dir=cfg.biomedparse_preproc_dir,
         )
 
     def _make_loader(
@@ -291,6 +321,16 @@ class OODKATrainer:
         for epoch in range(self.start_epoch, cfg.n_epochs + 1):
             train_sampler.set_epoch(epoch)
             val_sampler.set_epoch(epoch)
+            lr_scale = learning_rate_scale(
+                epoch,
+                n_epochs=cfg.n_epochs,
+                schedule=cfg.lr_schedule,
+                warmup_epochs=cfg.lr_warmup_epochs,
+                min_lr_ratio=cfg.min_lr_ratio,
+            )
+            current_lr = cfg.lr * lr_scale
+            for parameter_group in self.optimizer.param_groups:
+                parameter_group["lr"] = current_lr
             if cfg.route_warmup_epochs > 0 and epoch <= cfg.route_warmup_epochs:
                 w_route = cfg.w_route * (epoch / cfg.route_warmup_epochs)
             else:
@@ -319,7 +359,7 @@ class OODKATrainer:
             )
             log(f"[Epoch {epoch:03d}] Train: "
                 f"loss={train_meter['loss_total']:.4f} dice={train_dice:.4f} "
-                f"wP={w_p_ot:.4g} wS={w_s_ot:.4g}")
+                f"lr={current_lr:.3g} wP={w_p_ot:.4g} wS={w_s_ot:.4g}")
 
             val_meter = {key: 0.0 for key in train_meter}
             val_dice = 0.0

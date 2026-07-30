@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 
 
 def parse_pixel_decoder_out(pd_out) -> Tuple[torch.Tensor, List[torch.Tensor]]:
@@ -23,12 +24,29 @@ def parse_pixel_decoder_out(pd_out) -> Tuple[torch.Tensor, List[torch.Tensor]]:
 
 
 def gates_for_biomedparse_predictor(
-    gate: torch.Tensor, *, B: int, P: int
+    gate: torch.Tensor,
+    *,
+    B: int,
+    P: int,
+    mask_size: Tuple[int, int],
+    multi_scale_sizes: Sequence[Tuple[int, int]],
 ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-    """Map [res2,res3,res4,res5] gates to mask and coarse-to-fine inputs."""
-    if gate.shape != (B, P, 4):
-        raise ValueError(f"gate must be [B,P,4]=[{B},{P},4], got {gate.shape}")
-    return gate[:, :, 0], [gate[:, :, i] for i in (3, 2, 1)]
+    """Resize one finest ``[B,P,H,W]`` gate to every Predictor input."""
+    if gate.ndim != 4 or gate.shape[:2] != (B, P):
+        raise ValueError(
+            f"gate must be [B,P,H,W] with B={B}, P={P}, got {gate.shape}"
+        )
+
+    def resize(target: Tuple[int, int]) -> torch.Tensor:
+        target = tuple(int(value) for value in target)
+        if min(target) <= 0:
+            raise ValueError(f"gate target size must be positive, got {target}")
+        if gate.shape[-2:] == target:
+            return gate
+        return F.interpolate(gate, size=target, mode="area")
+
+    mask_gate = resize(mask_size)
+    return mask_gate, [resize(size) for size in multi_scale_sizes]
 
 
 def expand_prompt_features_for_blocks(

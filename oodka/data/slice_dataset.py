@@ -1,8 +1,10 @@
 """Contiguous full-slice-block dual-input data path for OODKA.
 
-BiomedParse reads adjacent slices from the raw NIfTI volume, while nnUNet
-reads the corresponding center slice directly from its existing .b2nd store.
-Both inputs are resized to a fixed square without spatial patch sampling.
+For uncropped datasets, BiomedParse can read raw NIfTI slices while nnUNet
+reads its existing .b2nd store. For cropped/resampled datasets (notably LGE
+MRI), BiomedParse instead reads an offline store generated with exactly the
+same nnUNet geometry. Both branches are then resized to a fixed square without
+spatial patch sampling.
 """
 
 from __future__ import annotations
@@ -114,6 +116,7 @@ class FullSliceBlockDataset(Dataset):
         raw_cache_cases: int = 2,
         require_no_crop: bool = True,
         biomedparse_modality: int = 0,
+        biomedparse_preproc_dir: str = "",
     ):
         self.case_ids = [str(x) for x in case_ids]
         self.nnunet_preproc_dir = str(nnunet_preproc_dir)
@@ -130,6 +133,10 @@ class FullSliceBlockDataset(Dataset):
         self.raw_cache_cases = max(1, int(raw_cache_cases))
         self.require_no_crop = bool(require_no_crop)
         self.biomedparse_modality = int(biomedparse_modality)
+        self.biomedparse_preproc_dir = str(biomedparse_preproc_dir)
+        self.use_aligned_biomedparse_preprocessing = bool(
+            self.biomedparse_preproc_dir
+        )
 
         if self.image_size <= 0:
             raise ValueError(f"image_size must be positive, got {self.image_size}")
@@ -165,7 +172,9 @@ class FullSliceBlockDataset(Dataset):
                 if not os.path.isfile(path):
                     raise FileNotFoundError(path)
 
-            raw_size_xyz = sitk.ReadImage(image_files[self.biomedparse_modality]).GetSize()
+            raw_size_xyz = sitk.ReadImage(
+                image_files[self.biomedparse_modality]
+            ).GetSize()
             label_size_xyz = sitk.ReadImage(label_path).GetSize()
             raw_shape = tuple(int(x) for x in reversed(raw_size_xyz))
             label_shape = tuple(int(x) for x in reversed(label_size_xyz))
@@ -177,7 +186,11 @@ class FullSliceBlockDataset(Dataset):
             shape_before_crop = tuple(int(x) for x in props.get("shape_before_cropping", raw_shape))
             bbox = props.get("bbox_used_for_cropping")
             expected_bbox = [[0, int(x)] for x in shape_before_crop]
-            if self.require_no_crop and bbox != expected_bbox:
+            if (
+                self.require_no_crop
+                and not self.use_aligned_biomedparse_preprocessing
+                and bbox != expected_bbox
+            ):
                 raise ValueError(
                     f"{case_id}: nnUNet crop {bbox} does not cover full shape "
                     f"{shape_before_crop}; full-slice index alignment is unsafe"
@@ -196,10 +209,67 @@ class FullSliceBlockDataset(Dataset):
             nn_shape = tuple(int(x) for x in nn_array.shape)
             if len(nn_shape) != 4:
                 raise ValueError(f"{case_id}: expected .b2nd [C,Z,H,W], got {nn_shape}")
-            if nn_shape[1] != raw_shape[0]:
-                raise ValueError(
-                    f"{case_id}: raw Z={raw_shape[0]} != nnUNet Z={nn_shape[1]}"
+
+            aligned_bp_path = ""
+            bp_shape = None
+            if self.use_aligned_biomedparse_preprocessing:
+                aligned_bp_path = os.path.join(
+                    self.biomedparse_preproc_dir, case_id + ".npz"
                 )
+                aligned_props_path = os.path.join(
+                    self.biomedparse_preproc_dir, case_id + ".pkl"
+                )
+                for path in (aligned_bp_path, aligned_props_path):
+                    if not os.path.isfile(path):
+                        raise FileNotFoundError(path)
+                with np.load(aligned_bp_path) as bp_file:
+                    if "data" not in bp_file or "seg" not in bp_file:
+                        raise KeyError(
+                            f"{aligned_bp_path}: expected data and seg arrays"
+                        )
+                    bp_shape = tuple(int(x) for x in bp_file["data"].shape)
+                    bp_seg_shape = tuple(int(x) for x in bp_file["seg"].shape)
+                if len(bp_shape) != 4:
+                    raise ValueError(
+                        f"{case_id}: aligned BiomedParse data must be "
+                        f"[C,Z,H,W], got {bp_shape}"
+                    )
+                if not 0 <= self.biomedparse_modality < bp_shape[0]:
+                    raise IndexError(
+                        f"{case_id}: biomedparse_modality="
+                        f"{self.biomedparse_modality}, aligned store has "
+                        f"{bp_shape[0]} channels"
+                    )
+                if bp_seg_shape != (1, *bp_shape[1:]):
+                    raise ValueError(
+                        f"{case_id}: aligned seg shape {bp_seg_shape} does "
+                        f"not match data shape {bp_shape}"
+                    )
+                if bp_shape[1:] != nn_shape[1:]:
+                    raise ValueError(
+                        f"{case_id}: aligned BiomedParse spatial shape "
+                        f"{bp_shape[1:]} != nnUNet shape {nn_shape[1:]}"
+                    )
+                with open(aligned_props_path, "rb") as file_handle:
+                    aligned_props = pickle.load(file_handle)
+                for key in (
+                    "shape_before_cropping",
+                    "shape_after_cropping_and_before_resampling",
+                    "bbox_used_for_cropping",
+                ):
+                    if aligned_props.get(key) != props.get(key):
+                        raise ValueError(
+                            f"{case_id}: aligned BiomedParse property {key} "
+                            "does not match nnUNet preprocessing"
+                        )
+                indexed_shape = nn_shape[1:]
+            else:
+                if nn_shape[1] != raw_shape[0]:
+                    raise ValueError(
+                        f"{case_id}: raw Z={raw_shape[0]} != "
+                        f"nnUNet Z={nn_shape[1]}"
+                    )
+                indexed_shape = raw_shape
 
             self._case_info[case_id] = {
                 "image_path": image_files[self.biomedparse_modality],
@@ -207,10 +277,12 @@ class FullSliceBlockDataset(Dataset):
                 "b2nd_path": b2nd_path,
                 "raw_shape": raw_shape,
                 "nn_shape": nn_shape,
+                "bp_shape": bp_shape,
+                "aligned_bp_path": aligned_bp_path,
             }
             indices = []
-            for z_start in range(0, raw_shape[0], self.block_z):
-                valid_count = min(self.block_z, raw_shape[0] - z_start)
+            for z_start in range(0, indexed_shape[0], self.block_z):
+                valid_count = min(self.block_z, indexed_shape[0] - z_start)
                 indices.append(len(self.records))
                 self.records.append((case_id, z_start, valid_count))
                 self.total_real_slices += valid_count
@@ -240,15 +312,36 @@ class FullSliceBlockDataset(Dataset):
             return cached
 
         info = self._case_info[case_id]
-        image = sitk.GetArrayFromImage(sitk.ReadImage(info["image_path"]))
-        label = sitk.GetArrayFromImage(sitk.ReadImage(info["label_path"]))
-        if tuple(image.shape) != info["raw_shape"] or image.shape != label.shape:
-            raise ValueError(
-                f"{case_id}: volume geometry changed after indexing: "
-                f"image={image.shape}, label={label.shape}"
-            )
-        bp_u8 = self._normalize_to_u8(image)
-        cached = (bp_u8, np.asarray(label, dtype=np.int16))
+        if self.use_aligned_biomedparse_preprocessing:
+            with np.load(info["aligned_bp_path"]) as bp_file:
+                bp_u8 = np.asarray(
+                    bp_file["data"][self.biomedparse_modality],
+                    dtype=np.uint8,
+                )
+                label = np.asarray(bp_file["seg"][0], dtype=np.int16)
+            if tuple(bp_u8.shape) != tuple(info["bp_shape"][1:]):
+                raise ValueError(
+                    f"{case_id}: aligned data geometry changed after indexing"
+                )
+            if label.shape != bp_u8.shape:
+                raise ValueError(
+                    f"{case_id}: aligned label shape {label.shape} != "
+                    f"data shape {bp_u8.shape}"
+                )
+            cached = (bp_u8, label)
+        else:
+            image = sitk.GetArrayFromImage(sitk.ReadImage(info["image_path"]))
+            label = sitk.GetArrayFromImage(sitk.ReadImage(info["label_path"]))
+            if (
+                tuple(image.shape) != info["raw_shape"]
+                or image.shape != label.shape
+            ):
+                raise ValueError(
+                    f"{case_id}: volume geometry changed after indexing: "
+                    f"image={image.shape}, label={label.shape}"
+                )
+            bp_u8 = self._normalize_to_u8(image)
+            cached = (bp_u8, np.asarray(label, dtype=np.int16))
         self._raw_cache[case_id] = cached
         while len(self._raw_cache) > self.raw_cache_cases:
             self._raw_cache.popitem(last=False)

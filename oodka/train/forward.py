@@ -177,7 +177,7 @@ def _fuse_all_prompt_features(
     B: int,
     Z: int,
 ) -> torch.Tensor:
-    """Create prompt-specific visual features and flatten in ``[B,Z,P]`` order."""
+    """Spatially fuse P/S and flatten prompt pairs in ``[B,Z,P]`` order."""
     if p_feature.shape != s_feature.shape or p_feature.ndim != 4:
         raise ValueError(
             f"P/S features must have equal [B*Z,C,H,W] shapes, "
@@ -186,12 +186,18 @@ def _fuse_all_prompt_features(
     N, C, H, W = p_feature.shape
     if N != B * Z:
         raise ValueError(f"Visual batch={N} != B*Z={B*Z}")
-    if gate.ndim != 2 or gate.shape[0] != B:
-        raise ValueError(f"scale gate must be [B,P], got {gate.shape}")
+    if (
+        gate.ndim != 4
+        or gate.shape[0] != B
+        or gate.shape[-2:] != (H, W)
+    ):
+        raise ValueError(
+            f"spatial gate must be [B,P,{H},{W}], got {gate.shape}"
+        )
     P = gate.shape[1]
     p_bz = p_feature.reshape(B, Z, C, H, W)[:, :, None]
     s_bz = s_feature.reshape(B, Z, C, H, W)[:, :, None]
-    gate_bzp = gate[:, None, :, None, None, None]
+    gate_bzp = gate[:, None, :, None]
     fused = gate_bzp * p_bz + (1.0 - gate_bzp) * s_bz
     return fused.reshape(B * Z * P, C, H, W).contiguous()
 
@@ -212,7 +218,11 @@ def _predict_all_prompt_logits(
 ) -> torch.Tensor:
     """Run one predictor call for all aligned visual-prompt pairs."""
     mask_gate, multi_scale_gates = gates_for_biomedparse_predictor(
-        gate, B=B, P=P
+        gate,
+        B=B,
+        P=P,
+        mask_size=mask_features_p.shape[-2:],
+        multi_scale_sizes=[feature.shape[-2:] for feature in ms_p],
     )
     if len(ms_p) != len(ms_s):
         raise ValueError(
@@ -226,8 +236,8 @@ def _predict_all_prompt_logits(
             f"(res5,res4,res3), got {len(ms_p)}"
         )
 
-    # Router order is [res2,res3,res4,res5]. BiomedParse predictor order is
-    # coarse-to-fine [res5,res4,res3], while mask_features represents res2.
+    # One finest prompt gate is shared by mask features and all coarse-to-fine
+    # Predictor inputs through area downsampling.
     fused_mask = _fuse_all_prompt_features(
         mask_features_p, mask_features_s, mask_gate, B=B, Z=Z
     )
@@ -507,12 +517,16 @@ def forward_one_batch(
     loss_ae_pd = (loss_ae_pd_mask + sum(loss_ae_pd_ms)) / (1 + len(loss_ae_pd_ms))
     loss_ae = (loss_ae_z + loss_ae_pd) / 9.0  # 8 Z-layer terms + 1 PD term in loss_ae_z
 
-    # Prompt-only, scale-specific P/S routing. Expert features never enter this path.
+    # Prompt-only spatial P/S routing. One finest gate is shared across
+    # Predictor levels through downsampling; expert features never enter.
     text_embedding = prompt_features.get("class_emb")
     if not torch.is_tensor(text_embedding):
         raise ValueError("prompt_features['class_emb'] is required by PromptBetaRouter")
     route = beta_router(
-        text_embedding.detach(), batch_size=B, sample=route_sample
+        text_embedding.detach(),
+        spatial_size=mask_features_p.shape[-2:],
+        batch_size=B,
+        sample=route_sample,
     )
     gate = route["gate"]
 
@@ -579,11 +593,41 @@ def forward_one_batch(
         + w_s_ot * loss_s_ot
     )
 
+    mean_mask_gate, mean_multi_scale_gates = gates_for_biomedparse_predictor(
+        route["mean"].unsqueeze(0),
+        B=1,
+        P=P,
+        mask_size=mask_features_p.shape[-2:],
+        multi_scale_sizes=[feature.shape[-2:] for feature in ms_p],
+    )
+    mean_gates_by_level = {
+        "res2": mean_mask_gate[0],
+        "res5": mean_multi_scale_gates[0][0],
+        "res4": mean_multi_scale_gates[1][0],
+        "res3": mean_multi_scale_gates[2][0],
+    }
+    sampled_mask_gate, sampled_multi_scale_gates = (
+        gates_for_biomedparse_predictor(
+            gate,
+            B=B,
+            P=P,
+            mask_size=mask_features_p.shape[-2:],
+            multi_scale_sizes=[feature.shape[-2:] for feature in ms_p],
+        )
+    )
+    sampled_gates_by_level = {
+        "res2": sampled_mask_gate,
+        "res5": sampled_multi_scale_gates[0],
+        "res4": sampled_multi_scale_gates[1],
+        "res3": sampled_multi_scale_gates[2],
+    }
     level_names = ("res2", "res3", "res4", "res5")
     gate_per_class_mean = {
         i: {
-            level: float(route["mean"][i, level_index].detach().item())
-            for level_index, level in enumerate(level_names)
+            level: float(
+                mean_gates_by_level[level][i].detach().mean().item()
+            )
+            for level in level_names
         }
         for i in range(P)
     }
@@ -602,8 +646,10 @@ def forward_one_batch(
         "gate_std": float(gate.detach().std().item()),
         "gate_per_class_mean": gate_per_class_mean,
         "gate_per_level_mean": {
-            level: float(gate[:, :, level_index].detach().mean().item())
-            for level_index, level in enumerate(level_names)
+            level: float(
+                sampled_gates_by_level[level].detach().mean().item()
+            )
+            for level in level_names
         },
         "alpha_mean": float(route["alpha"].detach().mean().item()),
         "beta_mean": float(route["beta"].detach().mean().item()),
@@ -675,11 +721,6 @@ def predict_block_logits_per_class(
         disentangled[f"Zb{i}_s"] = Zb_s
         disentangled[f"Zb_res{i}"] = Zb
 
-    text_embedding = prompt_features.get("class_emb")
-    if not torch.is_tensor(text_embedding):
-        raise ValueError("prompt_features['class_emb'] is required by PromptBetaRouter")
-    route = beta_router(text_embedding.detach(), batch_size=B, sample=False)
-
     if res3d["res3"].shape[2] != Dm:
         raise RuntimeError(
             f"BiomedParse feature Z={res3d['res3'].shape[2]} != input Z={Dm}"
@@ -698,6 +739,17 @@ def predict_block_logits_per_class(
 
     mask_features_p, ms_p = _inject_and_decode("p")
     mask_features_s, ms_s = _inject_and_decode("s")
+    text_embedding = prompt_features.get("class_emb")
+    if not torch.is_tensor(text_embedding):
+        raise ValueError(
+            "prompt_features['class_emb'] is required by PromptBetaRouter"
+        )
+    route = beta_router(
+        text_embedding.detach(),
+        spatial_size=mask_features_p.shape[-2:],
+        batch_size=B,
+        sample=False,
+    )
 
     return _predict_all_prompt_logits(
         sem_seg_head=model_biomedparse.sem_seg_head,

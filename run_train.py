@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -29,8 +30,35 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1,
                         help="Number B of independent contiguous-Z blocks")
     parser.add_argument("--image_size", type=int, default=512)
+    parser.add_argument(
+        "--biomedparse_preproc_dir",
+        type=str,
+        default="",
+        help=(
+            "Offline BiomedParse npz/pkl store aligned to nnUNet geometry; "
+            "required for cropped/resampled MRI datasets"
+        ),
+    )
+    parser.add_argument("--low_percentile", type=float, default=1.0)
+    parser.add_argument("--high_percentile", type=float, default=99.0)
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument(
+        "--raw_cache_cases",
+        type=int,
+        default=2,
+        help=(
+            "Cases kept per worker and shuffled together; use 4 for "
+            "shallow Dataset011 volumes with batch_size 8"
+        ),
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--lr_schedule",
+        choices=("constant", "cosine"),
+        default="constant",
+    )
+    parser.add_argument("--lr_warmup_epochs", type=int, default=0)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.05)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--output_dir", type=str, default="")
     parser.add_argument("--seed", type=int, default=42)
@@ -63,8 +91,18 @@ def main():
         n_epochs=args.n_epochs,
         batch_size=args.batch_size,
         image_size=args.image_size,
+        biomedparse_preproc_dir=args.biomedparse_preproc_dir,
+        use_aligned_biomedparse_preprocessing=bool(
+            args.biomedparse_preproc_dir
+        ),
+        low_percentile=args.low_percentile,
+        high_percentile=args.high_percentile,
         num_workers=args.num_workers,
+        raw_cache_cases=args.raw_cache_cases,
         lr=args.lr,
+        lr_schedule=args.lr_schedule,
+        lr_warmup_epochs=args.lr_warmup_epochs,
+        min_lr_ratio=args.min_lr_ratio,
         device=args.device,
         output_dir=args.output_dir,
         seed=args.seed,
@@ -88,6 +126,28 @@ def main():
         max_val_batches=args.max_val_batches,
     )
     cfg.resolve_paths()
+    try:
+        cfg.source_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            text=True,
+        ).strip()
+        cfg.source_branch = subprocess.check_output(
+            ["git", "branch", "--show-current"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            text=True,
+        ).strip()
+        cfg.source_tracked_dirty = (
+            subprocess.run(
+                ["git", "diff", "--quiet"],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                check=False,
+            ).returncode
+            != 0
+        )
+    except (OSError, subprocess.CalledProcessError):
+        # Training remains usable from a source archive without .git.
+        pass
     if cfg.resume_checkpoint:
         # Resume means exact continuation. Checkpoints before this refinement
         # used the original coordinate cost, hard-positive gain, and res5
@@ -111,6 +171,46 @@ def main():
         cfg.remove_res5_expert_branch_norm = bool(
             resume_cfg.get("remove_res5_expert_branch_norm", False)
         )
+        if "route_prior_p_mean" not in resume_cfg:
+            raise ValueError(
+                "This branch uses a spatial Beta router and cannot resume a "
+                "legacy scalar-router checkpoint. Start a new experiment."
+            )
+        cfg.route_prior_p_mean = float(
+            resume_cfg.get("route_prior_p_mean", cfg.route_prior_p_mean)
+        )
+        cfg.route_prior_concentration = float(
+            resume_cfg.get(
+                "route_prior_concentration",
+                cfg.route_prior_concentration,
+            )
+        )
+        cfg.route_spatial_basis_grid_size = int(
+            resume_cfg.get(
+                "route_spatial_basis_grid_size",
+                cfg.route_spatial_basis_grid_size,
+            )
+        )
+        cfg.route_spatial_basis_sigma = float(
+            resume_cfg.get(
+                "route_spatial_basis_sigma",
+                cfg.route_spatial_basis_sigma,
+            )
+        )
+    if cfg.dataset_name == "Dataset011_MYO_LGE_BC_OOD":
+        if cfg.norm_mode != "mri":
+            raise ValueError(
+                "Dataset011_MYO_LGE_BC_OOD requires --norm_mode mri"
+            )
+        if not cfg.use_aligned_biomedparse_preprocessing:
+            raise ValueError(
+                "Dataset011_MYO_LGE_BC_OOD is cropped by nnUNet and requires "
+                "--biomedparse_preproc_dir with aligned npz/pkl files"
+            )
+    if cfg.lr_warmup_epochs < 0:
+        raise ValueError("--lr_warmup_epochs must be non-negative")
+    if not 0.0 <= cfg.min_lr_ratio <= 1.0:
+        raise ValueError("--min_lr_ratio must be in [0,1]")
     device = torch.device(cfg.device)
 
     print("=" * 60)
@@ -139,8 +239,10 @@ def main():
         P,
         device,
         text_dim=text_dim,
-        route_prior_p_means=cfg.route_prior_p_means,
+        route_prior_p_mean=cfg.route_prior_p_mean,
         route_prior_concentration=cfg.route_prior_concentration,
+        route_spatial_basis_grid_size=cfg.route_spatial_basis_grid_size,
+        route_spatial_basis_sigma=cfg.route_spatial_basis_sigma,
         ot_feature_weight=cfg.ot_feature_weight,
         ot_coordinate_weight=cfg.ot_coordinate_weight,
         ot_coordinate_radius=cfg.ot_coordinate_radius,

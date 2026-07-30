@@ -24,10 +24,23 @@ def main() -> None:
     parser.add_argument("--case_id", default="")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--block_z", type=int, default=4)
+    parser.add_argument("--image_size", type=int, default=512)
+    parser.add_argument("--norm_mode", choices=("ct", "mri"), default="ct")
+    parser.add_argument("--biomedparse_preproc_dir", default="")
+    parser.add_argument("--raw_cache_cases", type=int, default=2)
     parser.add_argument("--all_train", action="store_true")
     args = parser.parse_args()
 
-    cfg = TrainConfig(dataset_name=args.dataset_name)
+    cfg = TrainConfig(
+        dataset_name=args.dataset_name,
+        image_size=args.image_size,
+        norm_mode=args.norm_mode,
+        biomedparse_preproc_dir=args.biomedparse_preproc_dir,
+        use_aligned_biomedparse_preprocessing=bool(
+            args.biomedparse_preproc_dir
+        ),
+        raw_cache_cases=args.raw_cache_cases,
+    )
     cfg.resolve_paths()
     with open(cfg.dataset_json_path, encoding="utf-8") as f:
         dataset_json = json.load(f)
@@ -52,6 +65,7 @@ def main() -> None:
         raw_cache_cases=cfg.raw_cache_cases,
         require_no_crop=cfg.require_no_crop,
         biomedparse_modality=cfg.biomedparse_modality,
+        biomedparse_preproc_dir=cfg.biomedparse_preproc_dir,
     )
     sampler = CaseBlockBatchSampler(
         dataset, args.batch_size, shuffle=False, drop_last=False
@@ -64,7 +78,7 @@ def main() -> None:
     batch = next(loader_iter)
     first_seconds = time.perf_counter() - start
     start = time.perf_counter()
-    cached_batch = next(loader_iter)
+    cached_batch = next(loader_iter, None)
     cached_seconds = time.perf_counter() - start
     print(f"cases={len(case_ids)} first_case={case_id} blocks={len(dataset)} "
           f"real_slices={dataset.total_real_slices}")
@@ -76,7 +90,14 @@ def main() -> None:
     print(f"first_batch_seconds={first_seconds:.3f}")
     print(f"cached_batch_seconds={cached_seconds:.3f}")
     print(f"valid_z={batch['valid_z'].tolist()}")
-    print(f"cached_z_starts={cached_batch['z_start'].tolist()}")
+    print(
+        "cached_z_starts="
+        + (
+            str(cached_batch["z_start"].tolist())
+            if cached_batch is not None
+            else "N/A (single-batch case)"
+        )
+    )
     print(f"epoch_blocks={len(epoch_indices)}/{len(dataset)} unique={len(set(epoch_indices))}")
     valid_slices = sum(dataset.records[i][2] for i in epoch_indices)
     print(f"epoch_real_slice_coverage={valid_slices}/{dataset.total_real_slices}")

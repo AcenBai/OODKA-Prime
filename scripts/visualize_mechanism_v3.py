@@ -1270,30 +1270,45 @@ def _plot_decision(
     plt.close(figure)
 
     class_names = [label_names.get(cid, str(cid)) for cid in class_ids]
-    figure, axes = plt.subplots(1, 3, figsize=(14, 5), constrained_layout=True)
-    panels = (
-        (mean, "P gate mean", 0.0, 1.0, "viridis"),
-        (concentration, "Beta concentration", None, None, "magma"),
-        (uncertainty, "Gate standard deviation", None, None, "magma"),
+    figure, axes = plt.subplots(
+        len(class_names),
+        3,
+        figsize=(12, 3.6 * len(class_names)),
+        constrained_layout=True,
+        squeeze=False,
     )
-    for axis, (value, title, vmin, vmax, cmap) in zip(axes, panels):
-        plot = axis.imshow(value, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
-        axis.set_xticks(range(4), [f"res{level}" for level in LEVELS])
-        axis.set_yticks(range(len(class_names)), class_names)
-        axis.set_title(title)
-        for row in range(value.shape[0]):
-            for column in range(value.shape[1]):
-                axis.text(
-                    column,
-                    row,
-                    f"{value[row, column]:.3f}",
-                    ha="center",
-                    va="center",
-                    fontsize=7,
-                    color="white" if value[row, column] < np.nanmean(value) else "black",
-                )
-        figure.colorbar(plot, ax=axis, shrink=0.75)
-    figure.suptitle("Prompt-conditioned Beta router", fontsize=15)
+    for row, class_name in enumerate(class_names):
+        panels = (
+            (mean[row], "P gate mean", 0.0, 1.0, "viridis"),
+            (
+                concentration[row],
+                "Beta concentration",
+                None,
+                None,
+                "magma",
+            ),
+            (
+                uncertainty[row],
+                "Gate standard deviation",
+                None,
+                None,
+                "magma",
+            ),
+        )
+        for column, (value, title, vmin, vmax, cmap) in enumerate(panels):
+            plot = axes[row, column].imshow(
+                value,
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                interpolation="nearest",
+            )
+            axes[row, column].set_title(f"{class_name}: {title}", fontsize=9)
+            axes[row, column].axis("off")
+            figure.colorbar(plot, ax=axes[row, column], shrink=0.72)
+    figure.suptitle(
+        "Prompt-conditioned finest spatial Beta router", fontsize=15
+    )
     figure.savefig(output_dir / "02_router_heatmaps.png", dpi=190)
     plt.close(figure)
 
@@ -1303,10 +1318,14 @@ def _plot_decision(
     for prompt_index, class_id in enumerate(class_ids):
         fused_maps[class_id] = {}
         fixed_maps[class_id] = {}
-        for level_index, level in enumerate(LEVELS):
+        for level in LEVELS:
             p = decoder_features[level]["p"]
             s = decoder_features[level]["s"]
-            gate_value = route["mean"][prompt_index, level_index]
+            gate_value = F.interpolate(
+                route["mean"][prompt_index][None, None],
+                size=p.shape[-2:],
+                mode="area",
+            )
             fused = gate_value * p + (1.0 - gate_value) * s
             fixed = 0.5 * p + 0.5 * s
             fused_map = _rms_4d(fused, z_index, output_hw)
@@ -1600,8 +1619,10 @@ def main() -> None:
         len(prompts),
         device,
         text_dim=int(prompt_features["class_emb"].shape[-1]),
-        route_prior_p_means=cfg.route_prior_p_means,
+        route_prior_p_mean=cfg.route_prior_p_mean,
         route_prior_concentration=cfg.route_prior_concentration,
+        route_spatial_basis_grid_size=cfg.route_spatial_basis_grid_size,
+        route_spatial_basis_sigma=cfg.route_spatial_basis_sigma,
         ot_feature_weight=cfg.ot_feature_weight,
         ot_coordinate_weight=coordinate_weight,
         ot_coordinate_radius=coordinate_radius,
@@ -1727,6 +1748,7 @@ def main() -> None:
             }
         route = modules["beta_router"](
             prompt_features["class_emb"].detach(),
+            spatial_size=mask_p.shape[-2:],
             batch_size=1,
             sample=False,
         )
