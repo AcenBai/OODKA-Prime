@@ -7,7 +7,7 @@ from typing import Dict, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from .cost import OTCostBuilder
+from .cost import OTCostBuilder, _coordinates
 from .losses import WeightedCosineDistillation
 from .mass import ResidualMassBuilder, StructureMassBuilder
 from .sinkhorn import BalancedSinkhorn, UnbalancedSinkhorn
@@ -23,8 +23,11 @@ class MultiScaleOTDistillation(nn.Module):
         levels: Sequence[int] = (2, 3, 4, 5),
         max_grid_size: int = 32,
         feature_weight: float = 1.0,
-        coordinate_weight: float = 0.1,
+        coordinate_weight: float = 0.25,
+        coordinate_radius: float = 0.25,
         p_semantic_weight: float = 0.25,
+        s_gain_mode: str = "smooth_advantage",
+        s_gain_temperature: float = 0.5,
         p_epsilon: float = 0.1,
         s_epsilon: float = 0.1,
         rho_base: float = 1.0,
@@ -41,16 +44,22 @@ class MultiScaleOTDistillation(nn.Module):
         self.max_grid_size = int(max_grid_size)
         if self.max_grid_size <= 0:
             raise ValueError("max_grid_size must be positive")
+        self.coordinate_radius = float(coordinate_radius)
         self.structure_mass = StructureMassBuilder()
-        self.residual_mass = ResidualMassBuilder()
+        self.residual_mass = ResidualMassBuilder(
+            gain_mode=s_gain_mode,
+            gain_temperature=s_gain_temperature,
+        )
         self.p_cost = OTCostBuilder(
             feature_weight=feature_weight,
             coordinate_weight=coordinate_weight,
+            coordinate_radius=coordinate_radius,
             semantic_weight=p_semantic_weight,
         )
         self.s_cost = OTCostBuilder(
             feature_weight=feature_weight,
             coordinate_weight=coordinate_weight,
+            coordinate_radius=coordinate_radius,
             semantic_weight=0.0,
         )
         self.balanced = BalancedSinkhorn(
@@ -90,6 +99,38 @@ class MultiScaleOTDistillation(nn.Module):
             min(int(feature.shape[-2]), self.max_grid_size),
             min(int(feature.shape[-1]), self.max_grid_size),
         )
+
+    def _transport_geometry(
+        self,
+        transport: torch.Tensor,
+        base_grid: Tuple[int, int],
+        expert_grid: Tuple[int, int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return mass-weighted distance and mass outside the free radius."""
+        with torch.no_grad():
+            base_coords = _coordinates(
+                *base_grid,
+                device=transport.device,
+                dtype=transport.dtype,
+            )
+            expert_coords = _coordinates(
+                *expert_grid,
+                device=transport.device,
+                dtype=transport.dtype,
+            )
+            distance = torch.cdist(base_coords, expert_coords).unsqueeze(0)
+            total = transport.sum(dim=(-2, -1)).clamp_min(1e-8)
+            mean_distance = (
+                (transport * distance).sum(dim=(-2, -1)) / total
+            ).mean()
+            outside_ratio = (
+                (
+                    transport
+                    * (distance > self.coordinate_radius).to(transport)
+                ).sum(dim=(-2, -1))
+                / total
+            ).mean()
+        return mean_distance, outside_ratio
 
     def forward(
         self,
@@ -200,6 +241,11 @@ class MultiScaleOTDistillation(nn.Module):
                 p_teacher = self.projector(
                     p_transport["transport"], p_cost["expert_tokens"]
                 )
+                p_mean_distance, p_outside_radius = self._transport_geometry(
+                    p_transport["transport"],
+                    p_cost["base_grid"],
+                    p_cost["expert_grid"],
+                )
                 p_loss = self.distillation(
                     p_cost["base_tokens"], p_teacher["teacher"], p_mass["a"]
                 )
@@ -210,6 +256,8 @@ class MultiScaleOTDistillation(nn.Module):
                     p_row_error=p_transport["row_error"].mean(),
                     p_col_error=p_transport["col_error"].mean(),
                     p_entropy=p_transport["entropy"].mean(),
+                    p_mean_distance=p_mean_distance,
+                    p_outside_radius=p_outside_radius,
                 )
 
             if enable_s:
@@ -232,6 +280,11 @@ class MultiScaleOTDistillation(nn.Module):
                 s_teacher = self.projector(
                     s_transport["transport"], s_cost["expert_tokens"]
                 )
+                s_mean_distance, s_outside_radius = self._transport_geometry(
+                    s_transport["transport"],
+                    s_cost["base_grid"],
+                    s_cost["expert_grid"],
+                )
                 received_total = s_transport["received"].sum()
                 if received_total.detach().item() > self.min_received_mass:
                     s_loss = self.distillation(
@@ -251,6 +304,11 @@ class MultiScaleOTDistillation(nn.Module):
                     s_accept_ratio=s_transport["accept_ratio"].mean(),
                     s_entropy=s_transport["entropy"].mean(),
                     s_gain=s_mass["gain"].mean(),
+                    s_expert_better_ratio=(
+                        s_mass["advantage"] > 0.0
+                    ).float().mean(),
+                    s_mean_distance=s_mean_distance,
+                    s_outside_radius=s_outside_radius,
                     s_cost_offset=torch.as_tensor(
                         s_cost_offset, device=s_cost_value.device
                     ),

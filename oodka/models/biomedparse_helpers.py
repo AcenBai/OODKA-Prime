@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import List, Tuple
 
 import torch
+import torch.nn.functional as F
 
 
 def parse_pixel_decoder_out(pd_out) -> Tuple[torch.Tensor, List[torch.Tensor]]:
@@ -131,3 +132,249 @@ def run_biomedparse_predictor_override(
     if hasattr(sem_seg_head, "predictor"):
         return sem_seg_head.predictor(multi_scale_features, mask_features, mask=None, extra=pf)
     raise RuntimeError("Could not call BiomedParse predictor")
+
+
+def aggregate_initial_query_masks(
+    initial_masks: torch.Tensor,
+    *,
+    topk: int,
+) -> torch.Tensor:
+    """Create one detached soft spatial proposal from query-wise mask logits.
+
+    The strongest ``topk`` query probabilities are averaged independently at
+    every spatial position. This preserves a soft union of complementary query
+    hypotheses without letting a single query dominate everywhere.
+    """
+    if initial_masks.ndim != 4:
+        raise ValueError(
+            f"initial_masks must be [N,Q,H,W], got {initial_masks.shape}"
+        )
+    query_count = int(initial_masks.shape[1])
+    if query_count <= 0:
+        raise ValueError("initial_masks must contain at least one query")
+    k = min(max(int(topk), 1), query_count)
+    probabilities = initial_masks.detach().float().sigmoid()
+    return probabilities.topk(k, dim=1).values.mean(dim=1, keepdim=True)
+
+
+def inject_query_guided_residual(
+    p_feature: torch.Tensor,
+    s_feature: torch.Tensor,
+    proposal: torch.Tensor,
+    *,
+    s_floor: float,
+) -> torch.Tensor:
+    """Return ``P + [floor + (1-floor) R] * S`` at one feature scale."""
+    if p_feature.shape != s_feature.shape or p_feature.ndim != 4:
+        raise ValueError(
+            "P/S features must share [N,C,H,W], got "
+            f"{p_feature.shape} and {s_feature.shape}"
+        )
+    if proposal.ndim != 4 or proposal.shape[:2] != (
+        p_feature.shape[0],
+        1,
+    ):
+        raise ValueError(
+            f"proposal must be [N,1,H,W] with N={p_feature.shape[0]}, "
+            f"got {proposal.shape}"
+        )
+    floor = float(s_floor)
+    if not 0.0 <= floor <= 1.0:
+        raise ValueError(f"s_floor must be in [0,1], got {floor}")
+    resized = F.interpolate(
+        proposal.to(dtype=p_feature.dtype),
+        size=p_feature.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    )
+    residual_gate = floor + (1.0 - floor) * resized
+    return p_feature + residual_gate * s_feature
+
+
+def run_query_guided_s_predictor(
+    sem_seg_head,
+    multi_scale_p: List[torch.Tensor],
+    multi_scale_s: List[torch.Tensor],
+    mask_features_p: torch.Tensor,
+    mask_features_s: torch.Tensor,
+    prompt_features: dict,
+    *,
+    proposal_topk: int = 4,
+    s_floor: float = 0.2,
+    run_object_existence: bool = False,
+) -> dict:
+    """Run frozen BoltzFormer once with P-controlled S residual injection.
+
+    This reproduces the official decoder loop without modifying BiomedParse
+    source code. The official prompt-query pre-attention and initial mask head
+    first query ``mask_features_p``. Their detached initial masks form a single
+    proposal that gates every S feature scale. The original decoder layers then
+    refine queries using ``P + gated S`` memories.
+    """
+    if not hasattr(sem_seg_head, "predictor"):
+        raise RuntimeError("sem_seg_head does not expose a predictor")
+    predictor = sem_seg_head.predictor
+    if len(multi_scale_p) != predictor.num_feature_levels:
+        raise ValueError(
+            f"Expected {predictor.num_feature_levels} P scales, "
+            f"got {len(multi_scale_p)}"
+        )
+    if len(multi_scale_s) != len(multi_scale_p):
+        raise ValueError("P/S multi-scale feature counts must match")
+    if mask_features_p.shape != mask_features_s.shape:
+        raise ValueError("P/S mask features must share shape")
+    visual_batch = int(mask_features_p.shape[0])
+    for p_feature, s_feature in zip(multi_scale_p, multi_scale_s):
+        if p_feature.shape != s_feature.shape:
+            raise ValueError("P/S features must share every scale shape")
+        if p_feature.shape[0] != visual_batch:
+            raise ValueError("All visual features must share batch size")
+
+    grounding_tokens = prompt_features.get("grounding_tokens")
+    if (
+        not torch.is_tensor(grounding_tokens)
+        or grounding_tokens.ndim != 3
+        or grounding_tokens.shape[1] != visual_batch
+    ):
+        raise ValueError(
+            "grounding_tokens must be [L,N,D] aligned with the visual batch"
+        )
+
+    query_embed = predictor.query_embed_.weight.unsqueeze(1).repeat(
+        1, visual_batch, 1
+    )
+    output = predictor.query_feat_.weight.unsqueeze(1).repeat(
+        1, visual_batch, 1
+    )
+    text_output = grounding_tokens
+    text_embed = text_output.detach().clone()
+
+    if predictor.pre_self_attention:
+        combined_output = torch.cat([output, text_output], dim=0)
+        combined_embed = torch.cat([query_embed, text_embed], dim=0)
+        combined_output, _ = predictor.initial_self_attention_layer(
+            combined_output,
+            tgt_mask=None,
+            tgt_key_padding_mask=None,
+            query_pos=combined_embed,
+        )
+        output = combined_output[: predictor.num_queries]
+        text_output = combined_output[predictor.num_queries :]
+        output = predictor.initial_ffn_layer(output)
+
+    initial_masks, attention_mask = predictor.forward_prediction_heads(
+        output,
+        mask_features_p,
+        attn_mask_target_size=multi_scale_p[0].shape[-2:],
+    )
+    proposal = aggregate_initial_query_masks(
+        initial_masks,
+        topk=proposal_topk,
+    )
+    fused_mask_features = inject_query_guided_residual(
+        mask_features_p,
+        mask_features_s,
+        proposal,
+        s_floor=s_floor,
+    )
+    fused_multi_scale = [
+        inject_query_guided_residual(
+            p_feature,
+            s_feature,
+            proposal,
+            s_floor=s_floor,
+        )
+        for p_feature, s_feature in zip(multi_scale_p, multi_scale_s)
+    ]
+
+    src = []
+    pos = []
+    size_list = []
+    for level_index, feature in enumerate(fused_multi_scale):
+        size_list.append(feature.shape[-2:])
+        pos_embed = (
+            predictor.pe_layer(feature, None)
+            .flatten(2)
+            .permute(2, 0, 1)
+        )
+        projected = (
+            predictor.input_proj[level_index](feature).flatten(2)
+            + predictor.level_embed.weight[level_index][None, :, None]
+        )
+        pos.append(pos_embed)
+        src.append(projected.permute(2, 0, 1))
+
+    # OODKA deliberately does not use the domain-mismatched official
+    # object-existence classifier. It can still be enabled for controlled
+    # compatibility checks without affecting the mask-query path.
+    output_classifier = bool(
+        run_object_existence
+        and getattr(predictor, "output_classifier", False)
+    )
+    cls_output = None
+    if output_classifier:
+        cls_output = predictor.classifier_query.weight.unsqueeze(1).repeat(
+            1, visual_batch, 1
+        )
+
+    predictions_mask = [initial_masks]
+    for layer_index in range(predictor.num_layers):
+        level_index = layer_index % predictor.num_feature_levels
+        fully_masked = attention_mask.sum(-1) == attention_mask.shape[-1]
+        attention_mask[fully_masked] = False
+        output, _ = predictor.transformer_cross_attention_layers[layer_index](
+            output,
+            src[level_index],
+            memory_mask=attention_mask,
+            memory_key_padding_mask=None,
+            pos=pos[level_index],
+            query_pos=query_embed,
+        )
+
+        combined_output = torch.cat([output, text_output], dim=0)
+        combined_embed = torch.cat([query_embed, text_embed], dim=0)
+        combined_output, _ = predictor.transformer_self_attention_layers[
+            layer_index
+        ](
+            combined_output,
+            tgt_mask=None,
+            tgt_key_padding_mask=None,
+            query_pos=combined_embed,
+        )
+        output = combined_output[: predictor.num_queries]
+        text_output = combined_output[predictor.num_queries :]
+        output = predictor.transformer_ffn_layers[layer_index](output)
+
+        outputs_mask, attention_mask = predictor.forward_prediction_heads(
+            output,
+            fused_mask_features,
+            attn_mask_target_size=size_list[
+                (layer_index + 1) % predictor.num_feature_levels
+            ],
+            layer_id=layer_index,
+        )
+        predictions_mask.append(outputs_mask)
+
+        if output_classifier:
+            cls_output, _ = predictor.classifier_cross_attention_layers[
+                layer_index
+            ](
+                cls_output,
+                combined_output.detach(),
+                memory_mask=None,
+                memory_key_padding_mask=None,
+                pos=combined_embed.detach(),
+                query_pos=None,
+            )
+            cls_output = predictor.classifier_ffn_layers[layer_index](
+                cls_output
+            )
+
+    result = {
+        "pred_gmasks": predictions_mask[-1],
+        "initial_p_gmasks": initial_masks,
+        "proposal_map": proposal,
+    }
+    if output_classifier:
+        result["object_existence"] = predictor.classifier(cls_output[0])
+    return result

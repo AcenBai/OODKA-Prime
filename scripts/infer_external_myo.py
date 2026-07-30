@@ -31,6 +31,7 @@ from oodka.utils.postprocessing import keep_largest_component_per_class
 
 
 OUTPUT_SUFFIX = "_OODKA_OT30_MYO.nii.gz"
+CASE_MYO_SUFFIX = "_myo.nii.gz"
 MYO_CLASS_ID = 5
 
 
@@ -39,13 +40,34 @@ def _discover_inputs(input_root: Path) -> list[Path]:
         path
         for path in input_root.rglob("*.nii.gz")
         if not path.name.endswith(OUTPUT_SUFFIX)
+        and not path.name.lower().endswith(CASE_MYO_SUFFIX)
     ]
     return sorted(path for path in files if path.is_file())
 
 
-def _output_path(input_path: Path) -> Path:
-    stem = input_path.name[:-7] if input_path.name.endswith(".nii.gz") else input_path.stem
-    return input_path.with_name(stem + OUTPUT_SUFFIX)
+def _output_path(
+    input_path: Path,
+    *,
+    input_root: Path,
+    output_root: Path | None,
+    name_mode: str,
+) -> Path:
+    case_id = input_path.parent.name
+    if name_mode == "case_myo":
+        filename = f"{case_id}{CASE_MYO_SUFFIX}"
+    elif name_mode == "suffix":
+        stem = input_path.name[:-7] if input_path.name.endswith(".nii.gz") else input_path.stem
+        filename = stem + OUTPUT_SUFFIX
+    else:
+        raise ValueError(f"Unsupported name_mode={name_mode!r}")
+
+    if output_root is None:
+        return input_path.with_name(filename)
+
+    rel_parent = input_path.parent.relative_to(input_root)
+    out_dir = output_root / rel_parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / filename
 
 
 def _predict_case(
@@ -94,6 +116,10 @@ def _predict_case(
             model_biomedparse=model_biomedparse,
             fusion_modules=fusion_modules,
             device=torch.device(cfg.device),
+            use_query_guided_injection=cfg.use_query_guided_injection,
+            query_guided_s_floor=cfg.query_guided_s_floor,
+            query_guided_topk=cfg.query_guided_topk,
+            use_beta_router=cfg.use_beta_router,
         )
         for block_index, (z_start, valid_count) in enumerate(
             zip(batch_starts, valid_counts)
@@ -121,6 +147,18 @@ def main() -> None:
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
+        "--output_root",
+        default="",
+        help="If set, write masks under this root mirroring input_root case folders "
+        "(does not modify the original CCTA tree).",
+    )
+    parser.add_argument(
+        "--name_mode",
+        choices=("case_myo", "suffix"),
+        default="case_myo",
+        help="case_myo -> <CASE>_myo.nii.gz; suffix -> <CTA>_OODKA_OT30_MYO.nii.gz",
+    )
+    parser.add_argument(
         "--report",
         default="outputs/oodka_ot_experiments/external_CCTA0722_myo_report.json",
     )
@@ -128,6 +166,9 @@ def main() -> None:
 
     input_root = Path(args.input_root).resolve()
     checkpoint_path = Path(args.checkpoint).resolve()
+    output_root = Path(args.output_root).resolve() if args.output_root else None
+    if output_root is not None:
+        output_root.mkdir(parents=True, exist_ok=True)
     inputs = _discover_inputs(input_root)
     if not inputs:
         raise FileNotFoundError(f"No input NIfTI files under {input_root}")
@@ -142,6 +183,25 @@ def main() -> None:
     )
     cfg.resolve_paths()
     device = torch.device(cfg.device)
+    checkpoint = torch.load(str(checkpoint_path), map_location=device)
+    checkpoint_cfg = checkpoint.get("config", {})
+    cfg.use_query_guided_injection = bool(
+        checkpoint_cfg.get("use_query_guided_injection", False)
+    )
+    cfg.query_guided_s_floor = float(
+        checkpoint_cfg.get(
+            "query_guided_s_floor", cfg.query_guided_s_floor
+        )
+    )
+    cfg.query_guided_topk = int(
+        checkpoint_cfg.get("query_guided_topk", cfg.query_guided_topk)
+    )
+    cfg.use_beta_router = bool(
+        checkpoint_cfg.get(
+            "use_beta_router",
+            not cfg.use_query_guided_injection,
+        )
+    )
 
     model_biomedparse = load_frozen_biomedparse(device)
     prompts, prompt_to_class_id = build_text_prompts_for_dataset(
@@ -154,8 +214,8 @@ def main() -> None:
         len(prompts),
         device,
         text_dim=int(prompt_features["class_emb"].shape[-1]),
+        use_beta_router=cfg.use_beta_router,
     )
-    checkpoint = torch.load(str(checkpoint_path), map_location=device)
     for name, module in fusion_modules.items():
         if name not in checkpoint:
             raise KeyError(f"{checkpoint_path}: missing module {name}")
@@ -164,14 +224,21 @@ def main() -> None:
 
     report = {
         "input_root": str(input_root),
+        "output_root": str(output_root) if output_root is not None else None,
+        "name_mode": args.name_mode,
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": int(checkpoint.get("epoch", -1)),
         "myo_class_id": MYO_CLASS_ID,
-        "output_suffix": OUTPUT_SUFFIX,
+        "output_suffix": OUTPUT_SUFFIX if args.name_mode == "suffix" else CASE_MYO_SUFFIX,
         "cases": [],
     }
     for image_path in inputs:
-        output_path = _output_path(image_path)
+        output_path = _output_path(
+            image_path,
+            input_root=input_root,
+            output_root=output_root,
+            name_mode=args.name_mode,
+        )
         if output_path.exists() and not args.overwrite:
             raise FileExistsError(
                 f"{output_path} already exists; pass --overwrite to replace it"

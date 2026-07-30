@@ -181,6 +181,12 @@ def evaluate_oodka_blocks(
                 model_biomedparse=model_biomedparse,
                 fusion_modules=fusion_modules,
                 device=device,
+                use_query_guided_injection=(
+                    cfg.use_query_guided_injection
+                ),
+                query_guided_s_floor=cfg.query_guided_s_floor,
+                query_guided_topk=cfg.query_guided_topk,
+                use_beta_router=cfg.use_beta_router,
             )
             for block_index, (z_start, valid_count) in enumerate(
                 zip(starts, valid_counts)

@@ -93,7 +93,12 @@ class TrainConfig:
     w_seg: float = 3.0
     w_ae: float = 0.2
     w_ort: float = 0.3
-    w_route: float = 1e-3
+    # OT/30 default: P-only initial proposal gates an additive S residual.
+    use_query_guided_injection: bool = True
+    query_guided_s_floor: float = 0.2
+    query_guided_topk: int = 4
+    use_beta_router: bool = False
+    w_route: float = 0.0
     route_warmup_epochs: int = 5
     # P prior means ordered as res2,res3,res4,res5; S always equals 1-P.
     route_prior_p_means: Tuple[float, float, float, float] = (0.5, 0.6, 0.7, 0.8)
@@ -107,12 +112,18 @@ class TrainConfig:
     ot_sinkhorn_iterations: int = 30
     ot_max_grid_size: int = 32
     ot_feature_weight: float = 1.0
-    ot_coordinate_weight: float = 0.1
+    # Tokens within this normalized-coordinate radius move without spatial cost.
+    ot_coordinate_weight: float = 0.25
+    ot_coordinate_radius: float = 0.25
     p_ot_semantic_weight: float = 0.25
+    s_gain_mode: str = "smooth_advantage"
+    s_gain_temperature: float = 0.5
     p_ot_epsilon: float = 0.1
     s_ot_epsilon: float = 0.1
     s_ot_rho_base: float = 1.0
     s_ot_rho_expert: float = 0.2
+    # Targeted res5 mitigation: retain all other expert-side normalizers.
+    remove_res5_expert_branch_norm: bool = True
 
     amp: bool = True
     amp_dtype: str = "float16"
@@ -180,6 +191,11 @@ class EvalConfig:
     device: str = "cuda:0"
     case_limit: int = 0
     split: str = "test"
+
+    use_query_guided_injection: bool = True
+    query_guided_s_floor: float = 0.2
+    query_guided_topk: int = 4
+    use_beta_router: bool = False
 
     distangler_ckpt: str = ""
     out_dir: str = ""

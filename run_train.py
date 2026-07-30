@@ -37,8 +37,15 @@ def main():
     parser.add_argument("--w_seg", type=float, default=3.0)
     parser.add_argument("--w_ae", type=float, default=0.2)
     parser.add_argument("--w_ort", type=float, default=0.3)
-    parser.add_argument("--w_route", type=float, default=1e-3)
+    parser.add_argument("--w_route", type=float, default=0.0)
     parser.add_argument("--route_warmup_epochs", type=int, default=5)
+    parser.add_argument(
+        "--legacy_beta_router",
+        action="store_true",
+        help="Use the pre-OT/30 convex PromptBetaRouter fusion",
+    )
+    parser.add_argument("--query_guided_s_floor", type=float, default=0.2)
+    parser.add_argument("--query_guided_topk", type=int, default=4)
     parser.add_argument("--w_p_ot", type=float, default=0.1)
     parser.add_argument("--w_s_ot", type=float, default=0.1)
     parser.add_argument("--p_ot_start_epoch", type=int, default=2)
@@ -73,6 +80,10 @@ def main():
         w_ort=args.w_ort,
         w_route=args.w_route,
         route_warmup_epochs=args.route_warmup_epochs,
+        use_query_guided_injection=not args.legacy_beta_router,
+        query_guided_s_floor=args.query_guided_s_floor,
+        query_guided_topk=args.query_guided_topk,
+        use_beta_router=args.legacy_beta_router,
         w_p_ot=args.w_p_ot,
         w_s_ot=args.w_s_ot,
         p_ot_start_epoch=args.p_ot_start_epoch,
@@ -88,6 +99,59 @@ def main():
         max_val_batches=args.max_val_batches,
     )
     cfg.resolve_paths()
+    if cfg.resume_checkpoint:
+        # Resume means exact continuation. Legacy checkpoints predate the
+        # radius cost, smooth advantage, and targeted res5 norm removal.
+        resume_state = torch.load(cfg.resume_checkpoint, map_location="cpu")
+        resume_cfg = resume_state.get("config", {})
+        cfg.ot_coordinate_weight = float(
+            resume_cfg.get("ot_coordinate_weight", cfg.ot_coordinate_weight)
+        )
+        cfg.ot_coordinate_radius = float(
+            resume_cfg.get("ot_coordinate_radius", 0.0)
+        )
+        cfg.s_gain_mode = str(
+            resume_cfg.get("s_gain_mode", "hard_positive")
+        )
+        cfg.s_gain_temperature = float(
+            resume_cfg.get(
+                "s_gain_temperature", cfg.s_gain_temperature
+            )
+        )
+        cfg.remove_res5_expert_branch_norm = bool(
+            resume_cfg.get("remove_res5_expert_branch_norm", False)
+        )
+        # Checkpoints before OT/30 used only PromptBetaRouter. Missing
+        # architecture fields therefore mean legacy fusion, not the new
+        # query-guided default.
+        cfg.use_query_guided_injection = bool(
+            resume_cfg.get("use_query_guided_injection", False)
+        )
+        cfg.query_guided_s_floor = float(
+            resume_cfg.get(
+                "query_guided_s_floor", cfg.query_guided_s_floor
+            )
+        )
+        cfg.query_guided_topk = int(
+            resume_cfg.get(
+                "query_guided_topk", cfg.query_guided_topk
+            )
+        )
+        cfg.use_beta_router = bool(
+            resume_cfg.get(
+                "use_beta_router",
+                not cfg.use_query_guided_injection,
+            )
+        )
+        cfg.w_route = float(resume_cfg.get("w_route", cfg.w_route))
+    if cfg.use_query_guided_injection == cfg.use_beta_router:
+        raise ValueError(
+            "Select exactly one predictor fusion mode: query-guided or Beta"
+        )
+    if not 0.0 <= cfg.query_guided_s_floor <= 1.0:
+        raise ValueError("--query_guided_s_floor must be in [0,1]")
+    if cfg.query_guided_topk <= 0:
+        raise ValueError("--query_guided_topk must be positive")
     device = torch.device(cfg.device)
 
     print("=" * 60)
@@ -120,13 +184,18 @@ def main():
         route_prior_concentration=cfg.route_prior_concentration,
         ot_feature_weight=cfg.ot_feature_weight,
         ot_coordinate_weight=cfg.ot_coordinate_weight,
+        ot_coordinate_radius=cfg.ot_coordinate_radius,
         p_ot_semantic_weight=cfg.p_ot_semantic_weight,
+        s_gain_mode=cfg.s_gain_mode,
+        s_gain_temperature=cfg.s_gain_temperature,
         p_ot_epsilon=cfg.p_ot_epsilon,
         s_ot_epsilon=cfg.s_ot_epsilon,
         s_ot_rho_base=cfg.s_ot_rho_base,
         s_ot_rho_expert=cfg.s_ot_rho_expert,
         ot_sinkhorn_iterations=cfg.ot_sinkhorn_iterations,
         ot_max_grid_size=cfg.ot_max_grid_size,
+        remove_res5_expert_branch_norm=cfg.remove_res5_expert_branch_norm,
+        use_beta_router=cfg.use_beta_router,
     )
     n_params = sum(p.numel() for m in fusion_modules.values() for p in m.parameters() if p.requires_grad)
     print(f"Trainable parameters: {n_params:,}")

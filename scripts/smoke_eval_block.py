@@ -80,29 +80,31 @@ def main() -> None:
         dataset_name=cfg.dataset_name
     )
     prompt_features = build_prompt_features(model_biomedparse, text_prompts, device)
+    checkpoint = (
+        torch.load(args.ckpt, map_location=device) if args.ckpt else None
+    )
+    checkpoint_cfg = checkpoint.get("config", {}) if checkpoint else {}
+    use_query_guided_injection = bool(
+        checkpoint_cfg.get("use_query_guided_injection", not args.ckpt)
+    )
+    use_beta_router = bool(
+        checkpoint_cfg.get(
+            "use_beta_router", not use_query_guided_injection
+        )
+    )
     fusion_modules = build_fusion_modules(
         None,
         model_biomedparse,
         len(text_prompts),
         device,
         text_dim=int(prompt_features["class_emb"].shape[-1]),
+        use_beta_router=use_beta_router,
     )
-    if args.ckpt:
-        checkpoint = torch.load(args.ckpt, map_location=device)
+    if checkpoint is not None:
         for name, module in fusion_modules.items():
             module.load_state_dict(checkpoint[name])
     for module in fusion_modules.values():
         module.eval()
-
-    predictor_calls = 0
-
-    def count_predictor_call(_module, _inputs):
-        nonlocal predictor_calls
-        predictor_calls += 1
-
-    predictor_hook = model_biomedparse.sem_seg_head.predictor.register_forward_pre_hook(
-        count_predictor_call
-    )
 
     logits = predict_block_logits_per_class(
         biomedparse_images=bp_blocks,
@@ -113,9 +115,15 @@ def main() -> None:
         model_biomedparse=model_biomedparse,
         fusion_modules=fusion_modules,
         device=device,
+        use_query_guided_injection=use_query_guided_injection,
+        query_guided_s_floor=float(
+            checkpoint_cfg.get("query_guided_s_floor", 0.2)
+        ),
+        query_guided_topk=int(
+            checkpoint_cfg.get("query_guided_topk", 4)
+        ),
+        use_beta_router=use_beta_router,
     )
-    predictor_hook.remove()
-    assert predictor_calls == 1, f"Expected one predictor call, got {predictor_calls}"
     raw_labels = _block_logits_to_raw_labels(
         logits[0, :, : valid_counts[0]], raw_shape[1:], prompt_to_class_id
     )

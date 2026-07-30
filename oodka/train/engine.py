@@ -163,6 +163,7 @@ class OODKATrainer:
                 "loss_total", "loss_seg", "loss_ae", "loss_ortho",
                 "loss_route",
                 "loss_p_ot", "loss_s_ot",
+                "proposal_mean", "proposal_std",
             ]
         }
         ot_keys = [
@@ -170,8 +171,11 @@ class OODKATrainer:
             for level in [2, 3, 4, 5]
             for name in [
                 "p_cost", "p_row_error", "p_col_error", "p_entropy",
+                "p_mean_distance", "p_outside_radius",
                 "s_cost", "s_received", "s_transported", "s_rejected",
                 "s_accept_ratio", "s_entropy", "s_gain",
+                "s_expert_better_ratio", "s_mean_distance",
+                "s_outside_radius",
             ]
         ]
         meter.update({key: 0.0 for key in ot_keys})
@@ -209,6 +213,12 @@ class OODKATrainer:
                         w_route=w_route,
                         w_p_ot=w_p_ot,
                         w_s_ot=w_s_ot,
+                        use_query_guided_injection=(
+                            cfg.use_query_guided_injection
+                        ),
+                        query_guided_s_floor=cfg.query_guided_s_floor,
+                        query_guided_topk=cfg.query_guided_topk,
+                        use_beta_router=cfg.use_beta_router,
                     )
                 if train:
                     self.optimizer.zero_grad(set_to_none=True)
@@ -286,6 +296,16 @@ class OODKATrainer:
             f"OT grid rule: each native feature dimension is capped at "
             f"{cfg.ot_max_grid_size}"
         )
+        log(
+            "Predictor fusion: "
+            + (
+                "P-initial-proposal guided S residual "
+                f"(topk={cfg.query_guided_topk}, "
+                f"S floor={cfg.query_guided_s_floor})"
+                if cfg.use_query_guided_injection
+                else "legacy PromptBetaRouter"
+            )
+        )
         log(f"Output: {cfg.output_dir}")
 
         for epoch in range(self.start_epoch, cfg.n_epochs + 1):
@@ -319,7 +339,13 @@ class OODKATrainer:
             )
             log(f"[Epoch {epoch:03d}] Train: "
                 f"loss={train_meter['loss_total']:.4f} dice={train_dice:.4f} "
-                f"wP={w_p_ot:.4g} wS={w_s_ot:.4g}")
+                f"wP={w_p_ot:.4g} wS={w_s_ot:.4g}"
+                + (
+                    f" R={train_meter['proposal_mean']:.3f}"
+                    f"±{train_meter['proposal_std']:.3f}"
+                    if cfg.use_query_guided_injection
+                    else ""
+                ))
 
             val_meter = {key: 0.0 for key in train_meter}
             val_dice = 0.0
@@ -384,7 +410,8 @@ class OODKATrainer:
         deploy_state = {
             "epoch": epoch,
             "best_val_dice": self.best_val_dice,
-            "format": "oodka_student_v1",
+            "format": "oodka_student_v2_query_guided",
+            "config": asdict(self.cfg),
         }
         for name, module in self.fusion_modules.items():
             if name.startswith("dis_b_") or name == "beta_router":

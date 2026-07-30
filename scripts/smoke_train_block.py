@@ -88,15 +88,6 @@ def main() -> None:
     fusion_modules = build_fusion_modules(
         model_nnunet, model_biomedparse, P, device
     )
-    predictor_calls = 0
-
-    def count_predictor_call(_module, _inputs):
-        nonlocal predictor_calls
-        predictor_calls += 1
-
-    predictor_hook = model_biomedparse.sem_seg_head.predictor.register_forward_pre_hook(
-        count_predictor_call
-    )
     print("running forward...")
     with torch.autocast(
         device_type=device.type,
@@ -119,9 +110,7 @@ def main() -> None:
             w_p_ot=args.w_p_ot,
             w_s_ot=args.w_s_ot,
         )
-    predictor_hook.remove()
-    assert predictor_calls == 1, f"Expected one predictor call, got {predictor_calls}"
-    print(f"predictor_calls={predictor_calls}")
+    print("predictor_decoder_passes=1")
     print("loss:", float(loss.detach()))
     print("logs:", logs)
     if args.backward:

@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 
 from oodka.models.ot import (
     BalancedSinkhorn,
@@ -10,6 +11,7 @@ from oodka.models.ot import (
     UnbalancedSinkhorn,
     WeightedCosineDistillation,
 )
+from oodka.models.disentangle import DualBranchAutoEncoder
 
 
 def test_balanced_sinkhorn_nonnegative_and_marginals():
@@ -91,6 +93,68 @@ def test_cost_barycentric_and_weighted_distillation_shapes():
     assert base.grad is not None
 
 
+def test_coordinate_cost_has_a_zero_cost_radius():
+    feature = torch.zeros(1, 2, 3, 3)
+    output = OTCostBuilder(
+        feature_weight=0.0,
+        coordinate_weight=1.0,
+        coordinate_radius=0.5,
+    )(feature, feature, target_size=(3, 3))
+    cost = output["cost"][0]
+
+    # Same position and positions inside the radius are unpenalized.
+    assert cost[0, 0] == 0.0
+    # Adjacent normalized grid points are distance 1, hence (1 - .5)^2.
+    torch.testing.assert_close(cost[0, 1], torch.tensor(0.25))
+    # A diagonal move is farther and therefore costs more.
+    assert cost[0, 4] > cost[0, 1]
+
+
+def test_smooth_expert_advantage_is_dense_bounded_and_signed():
+    feature = torch.ones(1, 4, 2, 2)
+    base_error = torch.tensor([[[0.8, 0.8], [0.2, 0.5]]])
+    expert_error = torch.tensor([[[0.2, 0.8], [0.8, 0.5]]])
+    output = ResidualMassBuilder(
+        gain_mode="smooth_advantage",
+        gain_temperature=0.5,
+    )(
+        feature,
+        feature,
+        feature,
+        feature,
+        base_error=base_error,
+        expert_error=expert_error,
+        target_size=(2, 2),
+    )
+    score = output["gain"].reshape(2, 2)
+
+    assert torch.all((score > 0.0) & (score < 2.0))
+    assert score[0, 0] > 1.0  # expert has lower BCE
+    assert score[1, 0] < 1.0  # expert has higher BCE
+    torch.testing.assert_close(score[0, 1], torch.tensor(1.0))
+    torch.testing.assert_close(score[1, 1], torch.tensor(1.0))
+
+
+def test_expert_branch_output_norm_can_be_removed_selectively():
+    module = DualBranchAutoEncoder(
+        c_in=4,
+        c_mid=6,
+        c_out=8,
+        branch_output_norm=False,
+    )
+    assert isinstance(module.enc_p[1], nn.Identity)
+    assert isinstance(module.enc_s[1], nn.Identity)
+    assert any(isinstance(layer, nn.InstanceNorm3d) for layer in module.enc)
+    assert any(isinstance(layer, nn.InstanceNorm3d) for layer in module.dec_p)
+    outputs = module(torch.randn(1, 4, 2, 4, 4))
+    assert [tuple(value.shape) for value in outputs] == [
+        (1, 8, 2, 4, 4),
+        (1, 8, 2, 4, 4),
+        (1, 4, 2, 4, 4),
+        (1, 4, 2, 4, 4),
+    ]
+
+
 def test_mass_builders_handle_empty_structure_and_zero_residual():
     gt = torch.zeros(2, 32, 32, dtype=torch.long)
     feature = torch.zeros(2, 8, 8, 8, dtype=torch.float16)
@@ -150,6 +214,15 @@ def test_multiscale_objective_filters_invalid_z_and_backpropagates_student_only(
     )
     loss = output["loss_p"] + output["loss_s"]
     assert torch.isfinite(loss)
+    for level_log in output["levels"].values():
+        for key in [
+            "p_mean_distance",
+            "p_outside_radius",
+            "s_mean_distance",
+            "s_outside_radius",
+            "s_expert_better_ratio",
+        ]:
+            assert torch.isfinite(level_log[key])
     loss.backward()
     assert features["Zb2_p"].grad is not None
     assert features["Zb2_s"].grad is not None

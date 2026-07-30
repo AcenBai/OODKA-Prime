@@ -65,6 +65,16 @@ def main() -> None:
     batch = default_collate([selected])
 
     device = torch.device(args.device)
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint_cfg = checkpoint.get("config", {})
+    use_query_guided_injection = bool(
+        checkpoint_cfg.get("use_query_guided_injection", False)
+    )
+    use_beta_router = bool(
+        checkpoint_cfg.get(
+            "use_beta_router", not use_query_guided_injection
+        )
+    )
     model_nnunet, model_biomedparse = load_frozen_backbones(
         cfg.nnunet_model_dir, cfg.fold, device
     )
@@ -76,8 +86,23 @@ def main() -> None:
         len(prompts),
         device,
         text_dim=int(prompt_features["class_emb"].shape[-1]),
+        ot_coordinate_weight=float(
+            checkpoint_cfg.get("ot_coordinate_weight", cfg.ot_coordinate_weight)
+        ),
+        ot_coordinate_radius=float(
+            checkpoint_cfg.get("ot_coordinate_radius", 0.0)
+        ),
+        s_gain_mode=str(
+            checkpoint_cfg.get("s_gain_mode", "hard_positive")
+        ),
+        s_gain_temperature=float(
+            checkpoint_cfg.get("s_gain_temperature", cfg.s_gain_temperature)
+        ),
+        remove_res5_expert_branch_norm=bool(
+            checkpoint_cfg.get("remove_res5_expert_branch_norm", False)
+        ),
+        use_beta_router=use_beta_router,
     )
-    checkpoint = torch.load(args.checkpoint, map_location=device)
     for name, module in modules.items():
         if name in checkpoint:
             module.load_state_dict(checkpoint[name])
@@ -114,6 +139,14 @@ def main() -> None:
                     device=device,
                     route_sample=False,
                     ot_expert_perturbation=mode,
+                    use_query_guided_injection=use_query_guided_injection,
+                    query_guided_s_floor=float(
+                        checkpoint_cfg.get("query_guided_s_floor", 0.2)
+                    ),
+                    query_guided_topk=int(
+                        checkpoint_cfg.get("query_guided_topk", 4)
+                    ),
+                    use_beta_router=use_beta_router,
                 )
             name = mode or "clean"
             results[name] = {

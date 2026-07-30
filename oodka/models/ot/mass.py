@@ -127,10 +127,23 @@ class StructureMassBuilder(nn.Module):
 class ResidualMassBuilder(nn.Module):
     """Build task-aware base demand and expert supply for S-UOT."""
 
-    def __init__(self, lambda0: float = 0.1, clip_value: float = 3.0, eps: float = 1e-8):
+    def __init__(
+        self,
+        lambda0: float = 0.1,
+        clip_value: float = 3.0,
+        gain_mode: str = "smooth_advantage",
+        gain_temperature: float = 0.5,
+        eps: float = 1e-8,
+    ):
         super().__init__()
         self.lambda0 = float(lambda0)
         self.clip_value = float(clip_value)
+        if gain_mode not in {"hard_positive", "smooth_advantage"}:
+            raise ValueError(f"Unknown gain_mode={gain_mode!r}")
+        if gain_temperature <= 0.0:
+            raise ValueError("gain_temperature must be positive")
+        self.gain_mode = gain_mode
+        self.gain_temperature = float(gain_temperature)
         self.eps = float(eps)
 
     def _energy_specificity(
@@ -180,13 +193,27 @@ class ResidualMassBuilder(nn.Module):
             expert_error_pooled = F.adaptive_avg_pool2d(
                 expert_error.detach().float().unsqueeze(1), target_size
             ).flatten(1)
-            gain = (difficulty - expert_error_pooled).clamp_min(0.0)
+            advantage = difficulty - expert_error_pooled
             difficulty_hat = _normalized_by_mean(difficulty, self.eps).clamp(
                 0.0, self.clip_value
             )
-            gain_hat = _normalized_by_mean(gain, self.eps).clamp(
-                0.0, self.clip_value
-            )
+            if self.gain_mode == "hard_positive":
+                gain = advantage.clamp_min(0.0)
+                gain_hat = _normalized_by_mean(gain, self.eps).clamp(
+                    0.0, self.clip_value
+                )
+                gain_scale = torch.zeros_like(advantage[:, :1])
+            else:
+                # A bounded, dense score: 1 is neutral, >1 means the expert
+                # has lower BCE, and <1 means the expert is worse. Scaling by
+                # each slice's mean absolute advantage avoids assuming that
+                # student and expert logits are calibrated to the same range.
+                gain_scale = advantage.abs().mean(
+                    dim=-1, keepdim=True
+                ).clamp_min(self.eps)
+                temperature = self.gain_temperature * gain_scale
+                gain = 2.0 * torch.sigmoid(advantage / temperature)
+                gain_hat = gain.clamp(0.0, self.clip_value)
             q_base = e_base * r_base * (self.lambda0 + difficulty_hat)
             q_expert = e_expert * r_expert * (self.lambda0 + gain_hat)
             a = normalize_mass(q_base, self.eps)
@@ -200,5 +227,9 @@ class ResidualMassBuilder(nn.Module):
             "base_specificity": r_base,
             "expert_specificity": r_expert,
             "difficulty": difficulty,
+            "expert_error": expert_error_pooled,
+            "advantage": advantage,
             "gain": gain,
+            "gain_scale": gain_scale,
+            "gain_mode": self.gain_mode,
         }

@@ -53,6 +53,32 @@ def main():
     cfg.resolve_paths()
     device = torch.device(cfg.device)
 
+    print(f"Loading checkpoint metadata: {cfg.distangler_ckpt}")
+    ckpt = torch.load(cfg.distangler_ckpt, map_location=device)
+    checkpoint_cfg = ckpt.get("config", {})
+    # A checkpoint without OT/30 architecture metadata is a legacy Beta model.
+    cfg.use_query_guided_injection = bool(
+        checkpoint_cfg.get("use_query_guided_injection", False)
+    )
+    cfg.query_guided_s_floor = float(
+        checkpoint_cfg.get(
+            "query_guided_s_floor", cfg.query_guided_s_floor
+        )
+    )
+    cfg.query_guided_topk = int(
+        checkpoint_cfg.get("query_guided_topk", cfg.query_guided_topk)
+    )
+    cfg.use_beta_router = bool(
+        checkpoint_cfg.get(
+            "use_beta_router",
+            not cfg.use_query_guided_injection,
+        )
+    )
+    if cfg.use_query_guided_injection == cfg.use_beta_router:
+        raise ValueError(
+            "Checkpoint must select exactly one predictor fusion mode"
+        )
+
     print("Loading frozen BiomedParse student backbone...")
     model_biomedparse = load_frozen_biomedparse(device)
 
@@ -69,11 +95,11 @@ def main():
         P,
         device,
         text_dim=int(prompt_features["class_emb"].shape[-1]),
+        use_beta_router=cfg.use_beta_router,
     )
 
     # Load checkpoint
-    print(f"Loading checkpoint: {cfg.distangler_ckpt}")
-    ckpt = torch.load(cfg.distangler_ckpt, map_location=device)
+    print(f"Loading checkpoint weights: {cfg.distangler_ckpt}")
     for name, m in fusion_modules.items():
         if name in ckpt:
             m.load_state_dict(ckpt[name])

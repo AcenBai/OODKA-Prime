@@ -19,6 +19,7 @@ from ..models.biomedparse_helpers import (
     gates_for_biomedparse_predictor,
     select_best_mask_from_queries,
     run_biomedparse_predictor_override,
+    run_query_guided_s_predictor,
 )
 from ..models.losses import (
     ortho_corr_loss,
@@ -196,6 +197,58 @@ def _fuse_all_prompt_features(
     return fused.reshape(B * Z * P, C, H, W).contiguous()
 
 
+def _expand_all_prompt_features(
+    feature: torch.Tensor,
+    *,
+    B: int,
+    Z: int,
+    P: int,
+) -> torch.Tensor:
+    """Repeat one visual feature in aligned ``[B,Z,P]`` pair order."""
+    if feature.ndim != 4 or feature.shape[0] != B * Z:
+        raise ValueError(
+            f"feature must be [B*Z,C,H,W] with B*Z={B*Z}, got {feature.shape}"
+        )
+    _, channels, height, width = feature.shape
+    return (
+        feature.reshape(B, Z, channels, height, width)[:, :, None]
+        .expand(-1, -1, P, -1, -1, -1)
+        .reshape(B * Z * P, channels, height, width)
+        .contiguous()
+    )
+
+
+def _resize_pair_mask_logits(
+    mask_logits: torch.Tensor,
+    *,
+    B: int,
+    Z: int,
+    P: int,
+    output_shape: Tuple[int, int, int],
+) -> torch.Tensor:
+    """Convert aligned ``[B*Z*P,H,W]`` masks to ``[B,P,Z,H,W]``."""
+    expected_pairs = B * Z * P
+    if mask_logits.ndim != 3 or mask_logits.shape[0] != expected_pairs:
+        raise RuntimeError(
+            "Predictor masks must be [B*Z*P,H,W] with "
+            f"B*Z*P={expected_pairs}, got {mask_logits.shape}"
+        )
+    height, width = mask_logits.shape[-2:]
+    logits_bpzhw = (
+        mask_logits.reshape(B, Z, P, height, width)
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+    )
+    out_z, out_h, out_w = (int(value) for value in output_shape)
+    resized = F.interpolate(
+        logits_bpzhw.reshape(B * P, 1, Z, height, width),
+        size=(out_z, out_h, out_w),
+        mode="trilinear",
+        align_corners=False,
+    )
+    return resized.reshape(B, P, out_z, out_h, out_w)
+
+
 def _predict_all_prompt_logits(
     *,
     sem_seg_head: nn.Module,
@@ -250,26 +303,70 @@ def _predict_all_prompt_logits(
     mask_logits = select_best_mask_from_queries(
         pred_out["pred_gmasks"], pred_out.get("object_existence")
     )
-    expected_pairs = B * Z * P
-    if mask_logits.shape[0] != expected_pairs:
-        raise RuntimeError(
-            f"Predictor output batch={mask_logits.shape[0]} != B*Z*P={expected_pairs}"
-        )
+    return _resize_pair_mask_logits(
+        mask_logits,
+        B=B,
+        Z=Z,
+        P=P,
+        output_shape=output_shape,
+    )
 
-    height, width = mask_logits.shape[-2:]
-    logits_bpzhw = (
-        mask_logits.reshape(B, Z, P, height, width)
-        .permute(0, 2, 1, 3, 4)
-        .contiguous()
+
+def _predict_all_prompt_logits_query_guided(
+    *,
+    sem_seg_head: nn.Module,
+    mask_features_p: torch.Tensor,
+    mask_features_s: torch.Tensor,
+    ms_p: List[torch.Tensor],
+    ms_s: List[torch.Tensor],
+    prompt_features: dict,
+    B: int,
+    Z: int,
+    P: int,
+    output_shape: Tuple[int, int, int],
+    proposal_topk: int,
+    s_floor: float,
+) -> Tuple[torch.Tensor, dict]:
+    """Predict with a detached P proposal controlling S residual injection."""
+    if len(ms_p) != 3 or len(ms_s) != 3:
+        raise ValueError(
+            "BiomedParse predictor must expose three P/S multi-scale features"
+        )
+    expanded_prompts = expand_prompt_features_for_blocks(
+        prompt_features,
+        B=B,
+        Z=Z,
+        P=P,
     )
-    out_z, out_h, out_w = (int(value) for value in output_shape)
-    resized = F.interpolate(
-        logits_bpzhw.reshape(B * P, 1, Z, height, width),
-        size=(out_z, out_h, out_w),
-        mode="trilinear",
-        align_corners=False,
+    pred_out = run_query_guided_s_predictor(
+        sem_seg_head,
+        [
+            _expand_all_prompt_features(feature, B=B, Z=Z, P=P)
+            for feature in ms_p
+        ],
+        [
+            _expand_all_prompt_features(feature, B=B, Z=Z, P=P)
+            for feature in ms_s
+        ],
+        _expand_all_prompt_features(
+            mask_features_p, B=B, Z=Z, P=P
+        ),
+        _expand_all_prompt_features(
+            mask_features_s, B=B, Z=Z, P=P
+        ),
+        expanded_prompts,
+        proposal_topk=proposal_topk,
+        s_floor=s_floor,
     )
-    return resized.reshape(B, P, out_z, out_h, out_w)
+    mask_logits = select_best_mask_from_queries(pred_out["pred_gmasks"])
+    logits = _resize_pair_mask_logits(
+        mask_logits,
+        B=B,
+        Z=Z,
+        P=P,
+        output_shape=output_shape,
+    )
+    return logits, pred_out
 
 
 def _compute_segmentation_loss_and_metrics(
@@ -415,6 +512,10 @@ def forward_one_batch(
     w_s_ot: float = 0.0,
     route_sample: bool | None = None,
     ot_expert_perturbation: str | None = None,
+    use_query_guided_injection: bool = True,
+    query_guided_s_floor: float = 0.2,
+    query_guided_topk: int = 4,
+    use_beta_router: bool = False,
 ) -> Tuple[torch.Tensor, Dict]:
     """
     Single training/validation forward pass on a batch.
@@ -452,7 +553,11 @@ def forward_one_batch(
 
     ae_mods = {k: fusion_modules[k] for k in fusion_modules if k.startswith("ae_")}
     dis_mods = {k: fusion_modules[k] for k in fusion_modules if k.startswith("dis_")}
-    beta_router = fusion_modules["beta_router"]
+    if use_query_guided_injection == use_beta_router:
+        raise ValueError(
+            "Enable exactly one fusion mode: query-guided injection or "
+            "the legacy Beta router"
+        )
 
     # Feature extraction
     nnunet_blocks = nnunet_images.permute(0, 2, 1, 3, 4).contiguous()
@@ -507,29 +612,50 @@ def forward_one_batch(
     loss_ae_pd = (loss_ae_pd_mask + sum(loss_ae_pd_ms)) / (1 + len(loss_ae_pd_ms))
     loss_ae = (loss_ae_z + loss_ae_pd) / 9.0  # 8 Z-layer terms + 1 PD term in loss_ae_z
 
-    # Prompt-only, scale-specific P/S routing. Expert features never enter this path.
-    text_embedding = prompt_features.get("class_emb")
-    if not torch.is_tensor(text_embedding):
-        raise ValueError("prompt_features['class_emb'] is required by PromptBetaRouter")
-    route = beta_router(
-        text_embedding.detach(), batch_size=B, sample=route_sample
-    )
-    gate = route["gate"]
-
-    # All prompts run through one predictor batch in [B,Z,P] pair order.
-    all_prompt_logits = _predict_all_prompt_logits(
-        sem_seg_head=model_biomedparse.sem_seg_head,
-        mask_features_p=mask_features_p,
-        mask_features_s=mask_features_s,
-        ms_p=ms_p,
-        ms_s=ms_s,
-        gate=gate,
-        prompt_features=prompt_features,
-        B=B,
-        Z=Dm,
-        P=P,
-        output_shape=(pd, ph, pw),
-    )
+    route = None
+    predictor_diagnostics = None
+    if use_query_guided_injection:
+        # The official prompt-query initial proposal is computed on P only.
+        # Its detached soft union controls how much S enters every scale.
+        all_prompt_logits, predictor_diagnostics = (
+            _predict_all_prompt_logits_query_guided(
+                sem_seg_head=model_biomedparse.sem_seg_head,
+                mask_features_p=mask_features_p,
+                mask_features_s=mask_features_s,
+                ms_p=ms_p,
+                ms_s=ms_s,
+                prompt_features=prompt_features,
+                B=B,
+                Z=Dm,
+                P=P,
+                output_shape=(pd, ph, pw),
+                proposal_topk=query_guided_topk,
+                s_floor=query_guided_s_floor,
+            )
+        )
+    else:
+        # Legacy prompt-only, scale-specific convex P/S routing.
+        text_embedding = prompt_features.get("class_emb")
+        if not torch.is_tensor(text_embedding):
+            raise ValueError(
+                "prompt_features['class_emb'] is required by PromptBetaRouter"
+            )
+        route = fusion_modules["beta_router"](
+            text_embedding.detach(), batch_size=B, sample=route_sample
+        )
+        all_prompt_logits = _predict_all_prompt_logits(
+            sem_seg_head=model_biomedparse.sem_seg_head,
+            mask_features_p=mask_features_p,
+            mask_features_s=mask_features_s,
+            ms_p=ms_p,
+            ms_s=ms_s,
+            gate=route["gate"],
+            prompt_features=prompt_features,
+            B=B,
+            Z=Dm,
+            P=P,
+            output_shape=(pd, ph, pw),
+        )
     class_ids = torch.tensor(
         [prompt_to_class_id[prompt_index] for prompt_index in range(P)],
         device=device,
@@ -569,7 +695,9 @@ def forward_one_batch(
         loss_s_ot = all_prompt_logits.sum() * 0.0
         ot_output = {"levels": {}}
 
-    loss_route = route["kl"]
+    loss_route = (
+        route["kl"] if route is not None else all_prompt_logits.sum() * 0.0
+    )
     total_loss = (
         w_seg * loss_seg
         + w_ae * loss_ae
@@ -578,15 +706,6 @@ def forward_one_batch(
         + w_p_ot * loss_p_ot
         + w_s_ot * loss_s_ot
     )
-
-    level_names = ("res2", "res3", "res4", "res5")
-    gate_per_class_mean = {
-        i: {
-            level: float(route["mean"][i, level_index].detach().item())
-            for level_index, level in enumerate(level_names)
-        }
-        for i in range(P)
-    }
 
     logs = {
         "loss_total": float(total_loss.detach().item()),
@@ -598,17 +717,10 @@ def forward_one_batch(
         "loss_s_ot": float(loss_s_ot.detach().item()),
         "dice_mean": dice_mean,
         "dice_per_class": dice_per_class,
-        "gate_mean": float(gate.detach().mean().item()),
-        "gate_std": float(gate.detach().std().item()),
-        "gate_per_class_mean": gate_per_class_mean,
-        "gate_per_level_mean": {
-            level: float(gate[:, :, level_index].detach().mean().item())
-            for level_index, level in enumerate(level_names)
-        },
-        "alpha_mean": float(route["alpha"].detach().mean().item()),
-        "beta_mean": float(route["beta"].detach().mean().item()),
-        "concentration_mean": float(
-            route["concentration"].detach().mean().item()
+        "fusion_mode": (
+            "query_guided_s_injection"
+            if use_query_guided_injection
+            else "legacy_beta_router"
         ),
         "ot_levels": {
             int(level): {
@@ -618,6 +730,54 @@ def forward_one_batch(
             for level, values in ot_output["levels"].items()
         },
     }
+    if predictor_diagnostics is not None:
+        proposal = predictor_diagnostics["proposal_map"].detach()
+        proposal_bzp = proposal.reshape(B, Dm, P, *proposal.shape[-2:])
+        logs.update(
+            {
+                "proposal_mean": float(proposal.mean().item()),
+                "proposal_std": float(proposal.std().item()),
+                "proposal_per_class_mean": {
+                    prompt_index: float(
+                        proposal_bzp[:, :, prompt_index].mean().item()
+                    )
+                    for prompt_index in range(P)
+                },
+                "query_guided_s_floor": float(query_guided_s_floor),
+                "query_guided_topk": int(query_guided_topk),
+            }
+        )
+    elif route is not None:
+        level_names = ("res2", "res3", "res4", "res5")
+        gate = route["gate"]
+        logs.update(
+            {
+                "gate_mean": float(gate.detach().mean().item()),
+                "gate_std": float(gate.detach().std().item()),
+                "gate_per_class_mean": {
+                    prompt_index: {
+                        level: float(
+                            route["mean"][
+                                prompt_index, level_index
+                            ].detach().item()
+                        )
+                        for level_index, level in enumerate(level_names)
+                    }
+                    for prompt_index in range(P)
+                },
+                "gate_per_level_mean": {
+                    level: float(
+                        gate[:, :, level_index].detach().mean().item()
+                    )
+                    for level_index, level in enumerate(level_names)
+                },
+                "alpha_mean": float(route["alpha"].detach().mean().item()),
+                "beta_mean": float(route["beta"].detach().mean().item()),
+                "concentration_mean": float(
+                    route["concentration"].detach().mean().item()
+                ),
+            }
+        )
     for level, values in logs["ot_levels"].items():
         for name, value in values.items():
             logs[f"ot_res{level}_{name}"] = value
@@ -634,6 +794,10 @@ def predict_block_logits_per_class(
     model_biomedparse: nn.Module,
     fusion_modules: Dict[str, nn.Module],
     device: torch.device,
+    use_query_guided_injection: bool = True,
+    query_guided_s_floor: float = 0.2,
+    query_guided_topk: int = 4,
+    use_beta_router: bool = False,
 ) -> torch.Tensor:
     """Pure-student inference on independent contiguous blocks.
 
@@ -652,7 +816,11 @@ def predict_block_logits_per_class(
     ph, pw = (int(output_size[0]), int(output_size[1]))
 
     dis_mods = {k: fusion_modules[k] for k in fusion_modules if k.startswith("dis_")}
-    beta_router = fusion_modules["beta_router"]
+    if use_query_guided_injection == use_beta_router:
+        raise ValueError(
+            "Enable exactly one fusion mode: query-guided injection or "
+            "the legacy Beta router"
+        )
 
     biomedparse_images = biomedparse_images.to(device)
     valid_z = valid_z.to(device)
@@ -675,11 +843,6 @@ def predict_block_logits_per_class(
         disentangled[f"Zb{i}_s"] = Zb_s
         disentangled[f"Zb_res{i}"] = Zb
 
-    text_embedding = prompt_features.get("class_emb")
-    if not torch.is_tensor(text_embedding):
-        raise ValueError("prompt_features['class_emb'] is required by PromptBetaRouter")
-    route = beta_router(text_embedding.detach(), batch_size=B, sample=False)
-
     if res3d["res3"].shape[2] != Dm:
         raise RuntimeError(
             f"BiomedParse feature Z={res3d['res3'].shape[2]} != input Z={Dm}"
@@ -699,6 +862,31 @@ def predict_block_logits_per_class(
     mask_features_p, ms_p = _inject_and_decode("p")
     mask_features_s, ms_s = _inject_and_decode("s")
 
+    if use_query_guided_injection:
+        logits, _ = _predict_all_prompt_logits_query_guided(
+            sem_seg_head=model_biomedparse.sem_seg_head,
+            mask_features_p=mask_features_p,
+            mask_features_s=mask_features_s,
+            ms_p=ms_p,
+            ms_s=ms_s,
+            prompt_features=prompt_features,
+            B=B,
+            Z=Dm,
+            P=P,
+            output_shape=(Dm, ph, pw),
+            proposal_topk=query_guided_topk,
+            s_floor=query_guided_s_floor,
+        )
+        return logits
+
+    text_embedding = prompt_features.get("class_emb")
+    if not torch.is_tensor(text_embedding):
+        raise ValueError(
+            "prompt_features['class_emb'] is required by PromptBetaRouter"
+        )
+    route = fusion_modules["beta_router"](
+        text_embedding.detach(), batch_size=B, sample=False
+    )
     return _predict_all_prompt_logits(
         sem_seg_head=model_biomedparse.sem_seg_head,
         mask_features_p=mask_features_p,
