@@ -1,0 +1,13 @@
+{
+  "best_epoch": 20,
+  "best_val_dice_mean": 0.5602825903892518,
+  "best_val_loss": 1.9989,
+  "dice_per_class": {
+    "1_scar": 0.46034244894981385,
+    "2_edema": 0.2663309335708618,
+    "3_lv_blood_pool": 0.8478187441825866,
+    "4_lv_normal_myocardium": 0.4991787612438202,
+    "5_rv_blood_pool": 0.7277420639991761
+  },
+  "epoch_30_val_dice_mean": 0.540571945309639
+}

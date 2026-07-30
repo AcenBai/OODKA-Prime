@@ -1,0 +1,3 @@
+*.pth
+*.log
+test_eval/pred_nii/
