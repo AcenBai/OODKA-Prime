@@ -42,13 +42,17 @@ class OTCostBuilder(nn.Module):
     def __init__(
         self,
         feature_weight: float = 1.0,
-        coordinate_weight: float = 0.1,
+        coordinate_weight: float = 0.25,
+        coordinate_radius: float = 0.25,
         semantic_weight: float = 0.0,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
         self.feature_weight = float(feature_weight)
         self.coordinate_weight = float(coordinate_weight)
+        self.coordinate_radius = float(coordinate_radius)
+        if self.coordinate_radius < 0.0:
+            raise ValueError("coordinate_radius must be nonnegative")
         self.semantic_weight = float(semantic_weight)
         self.eps = float(eps)
 
@@ -98,7 +102,10 @@ class OTCostBuilder(nn.Module):
                 coord_e = _coordinates(
                     he, we, device=cost.device, dtype=cost.dtype
                 )
-                coordinate_cost = torch.cdist(coord_b, coord_e).square()
+                coordinate_distance = torch.cdist(coord_b, coord_e)
+                coordinate_cost = (
+                    coordinate_distance - self.coordinate_radius
+                ).clamp_min(0.0).square()
                 cost = cost + self.coordinate_weight * coordinate_cost.unsqueeze(0)
 
             if self.semantic_weight:

@@ -107,12 +107,18 @@ class TrainConfig:
     ot_sinkhorn_iterations: int = 30
     ot_max_grid_size: int = 32
     ot_feature_weight: float = 1.0
-    ot_coordinate_weight: float = 0.1
+    # Tokens within this normalized-coordinate radius move without spatial cost.
+    ot_coordinate_weight: float = 0.25
+    ot_coordinate_radius: float = 0.25
     p_ot_semantic_weight: float = 0.25
+    s_gain_mode: str = "smooth_advantage"
+    s_gain_temperature: float = 0.5
     p_ot_epsilon: float = 0.1
     s_ot_epsilon: float = 0.1
     s_ot_rho_base: float = 1.0
     s_ot_rho_expert: float = 0.2
+    # Targeted res5 mitigation: retain all other expert-side normalizers.
+    remove_res5_expert_branch_norm: bool = True
 
     amp: bool = True
     amp_dtype: str = "float16"

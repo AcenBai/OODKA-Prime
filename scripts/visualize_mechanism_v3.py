@@ -491,6 +491,7 @@ def _feature_cost_components(
     *,
     feature_weight: float,
     coordinate_weight: float,
+    coordinate_radius: float,
     semantic_weight: float,
 ) -> dict[str, torch.Tensor]:
     base = F.normalize(base_tokens.detach().float(), dim=-1, eps=1e-6)
@@ -500,7 +501,9 @@ def _feature_cost_components(
     ).clamp_min(0.0)
     h, w = grid
     coords = _coordinates(h, w, device=base.device, dtype=base.dtype)
-    coordinate = torch.cdist(coords, coords).square().unsqueeze(0)
+    coordinate = (
+        torch.cdist(coords, coords) - coordinate_radius
+    ).clamp_min(0.0).square().unsqueeze(0)
     components = {
         "feature": feature_weight * feature,
         "coordinate": coordinate_weight * coordinate,
@@ -1001,6 +1004,7 @@ def _plot_s_ot(
     )[0].clamp(0.0, 1.0).detach().cpu().numpy().reshape(grid)
     difficulty = mass["difficulty"][0].detach().cpu().numpy().reshape(grid)
     gain = mass["gain"][0].detach().cpu().numpy().reshape(grid)
+    gain_mode = str(mass.get("gain_mode", "hard_positive"))
     base_specificity = (
         mass["base_specificity"][0].detach().cpu().numpy().reshape(grid)
     )
@@ -1016,7 +1020,12 @@ def _plot_s_ot(
     mass_vmax = _robust_max(
         (a_map, b_map, received_map, transported_map, rejected_map)
     )
-    task_vmax = _robust_max((difficulty, gain))
+    difficulty_vmax = _robust_max((difficulty,))
+    task_vmax = (
+        _robust_max((difficulty, gain))
+        if gain_mode == "hard_positive"
+        else difficulty_vmax
+    )
     specificity_vmax = _robust_max((base_specificity, expert_specificity))
     residual_vmax = _robust_max((residual,))
 
@@ -1026,7 +1035,19 @@ def _plot_s_ot(
     task_image = _heat(
         axes[0, 1], difficulty, title="Student difficulty", vmax=task_vmax
     )
-    _heat(axes[0, 2], gain, title="Positive expert gain", vmax=task_vmax)
+    if gain_mode == "smooth_advantage":
+        gain_image = _heat(
+            axes[0, 2],
+            gain,
+            title="Smooth expert advantage (1 = neutral)",
+            vmin=0.0,
+            vmax=2.0,
+            cmap="coolwarm",
+        )
+    else:
+        gain_image = _heat(
+            axes[0, 2], gain, title="Positive expert gain", vmax=task_vmax
+        )
     specificity_image = _heat(
         axes[0, 3],
         base_specificity,
@@ -1115,7 +1136,26 @@ def _plot_s_ot(
         fontsize=12,
         transform=axes[3, 3].transAxes,
     )
-    figure.colorbar(task_image, ax=axes[0, 1:3], shrink=0.65, label="BCE-derived score")
+    if gain_mode == "smooth_advantage":
+        figure.colorbar(
+            task_image,
+            ax=axes[0, 1],
+            shrink=0.65,
+            label="Prompt-mean BCE",
+        )
+        figure.colorbar(
+            gain_image,
+            ax=axes[0, 2],
+            shrink=0.65,
+            label="<1 expert worse | >1 expert better",
+        )
+    else:
+        figure.colorbar(
+            task_image,
+            ax=axes[0, 1:3],
+            shrink=0.65,
+            label="BCE-derived score",
+        )
     figure.colorbar(
         specificity_image,
         ax=axes[0, 3],
@@ -1477,6 +1517,24 @@ def main() -> None:
 
     cfg = TrainConfig(device=args.device, block_z=args.block_z, num_workers=0)
     cfg.resolve_paths()
+    device = torch.device(args.device)
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint_cfg = checkpoint.get("config", {})
+    coordinate_weight = float(
+        checkpoint_cfg.get("ot_coordinate_weight", cfg.ot_coordinate_weight)
+    )
+    coordinate_radius = float(
+        checkpoint_cfg.get("ot_coordinate_radius", 0.0)
+    )
+    s_gain_mode = str(
+        checkpoint_cfg.get("s_gain_mode", "hard_positive")
+    )
+    s_gain_temperature = float(
+        checkpoint_cfg.get("s_gain_temperature", cfg.s_gain_temperature)
+    )
+    remove_res5_expert_branch_norm = bool(
+        checkpoint_cfg.get("remove_res5_expert_branch_norm", False)
+    )
     images_dir = cfg.imagesTr_dir if args.split == "val" else cfg.imagesTs_dir
     labels_dir = cfg.labelsTr_dir if args.split == "val" else cfg.labelsTs_dir
     with open(cfg.dataset_json_path, encoding="utf-8") as handle:
@@ -1529,7 +1587,6 @@ def main() -> None:
     gt_block = item["gt"].unsqueeze(0)
     valid_z = item["valid_z"].unsqueeze(0)
 
-    device = torch.device(args.device)
     model_nnunet, model_biomedparse = load_frozen_backbones(
         cfg.nnunet_model_dir, cfg.fold, device
     )
@@ -1546,16 +1603,19 @@ def main() -> None:
         route_prior_p_means=cfg.route_prior_p_means,
         route_prior_concentration=cfg.route_prior_concentration,
         ot_feature_weight=cfg.ot_feature_weight,
-        ot_coordinate_weight=cfg.ot_coordinate_weight,
+        ot_coordinate_weight=coordinate_weight,
+        ot_coordinate_radius=coordinate_radius,
         p_ot_semantic_weight=cfg.p_ot_semantic_weight,
+        s_gain_mode=s_gain_mode,
+        s_gain_temperature=s_gain_temperature,
         p_ot_epsilon=cfg.p_ot_epsilon,
         s_ot_epsilon=cfg.s_ot_epsilon,
         s_ot_rho_base=cfg.s_ot_rho_base,
         s_ot_rho_expert=cfg.s_ot_rho_expert,
         ot_sinkhorn_iterations=cfg.ot_sinkhorn_iterations,
         ot_max_grid_size=cfg.ot_max_grid_size,
+        remove_res5_expert_branch_norm=remove_res5_expert_branch_norm,
     )
-    checkpoint = torch.load(args.checkpoint, map_location=device)
     required = [
         *(f"ae_enc{level}_to_res{level}" for level in LEVELS),
         *(f"dis_b_res{level}" for level in LEVELS),
@@ -1782,7 +1842,8 @@ def main() -> None:
                 grid,
                 semantic,
                 feature_weight=cfg.ot_feature_weight,
-                coordinate_weight=cfg.ot_coordinate_weight,
+                coordinate_weight=coordinate_weight,
+                coordinate_radius=coordinate_radius,
                 semantic_weight=cfg.p_ot_semantic_weight,
             )
             p_maps = _plot_p_ot(

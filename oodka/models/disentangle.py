@@ -26,20 +26,32 @@ class DualBranchAutoEncoder(nn.Module):
     splitting into private and shared branches, each with a reconstruction path.
     """
 
-    def __init__(self, c_in: int = 32, c_mid: int = 128, c_out: int = 512):
+    def __init__(
+        self,
+        c_in: int = 32,
+        c_mid: int = 128,
+        c_out: int = 512,
+        *,
+        branch_output_norm: bool = True,
+    ):
         super().__init__()
         self.enc = nn.Sequential(
             nn.Conv3d(c_in, c_mid, 1, bias=False),
             nn.InstanceNorm3d(c_mid, affine=True),
             nn.GELU(),
         )
+        branch_norm = (
+            lambda: nn.InstanceNorm3d(c_out, affine=True)
+            if branch_output_norm
+            else nn.Identity()
+        )
         self.enc_p = nn.Sequential(
             nn.Conv3d(c_mid, c_out, 1, bias=False),
-            nn.InstanceNorm3d(c_out, affine=True),
+            branch_norm(),
         )
         self.enc_s = nn.Sequential(
             nn.Conv3d(c_mid, c_out, 1, bias=False),
-            nn.InstanceNorm3d(c_out, affine=True),
+            branch_norm(),
         )
         self.dec_p = nn.Sequential(
             nn.Conv3d(c_out, c_mid, 1, bias=False),

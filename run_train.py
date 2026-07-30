@@ -88,6 +88,29 @@ def main():
         max_val_batches=args.max_val_batches,
     )
     cfg.resolve_paths()
+    if cfg.resume_checkpoint:
+        # Resume means exact continuation. Checkpoints before this refinement
+        # used the original coordinate cost, hard-positive gain, and res5
+        # branch-output normalization.
+        resume_state = torch.load(cfg.resume_checkpoint, map_location="cpu")
+        resume_cfg = resume_state.get("config", {})
+        cfg.ot_coordinate_weight = float(
+            resume_cfg.get("ot_coordinate_weight", cfg.ot_coordinate_weight)
+        )
+        cfg.ot_coordinate_radius = float(
+            resume_cfg.get("ot_coordinate_radius", 0.0)
+        )
+        cfg.s_gain_mode = str(
+            resume_cfg.get("s_gain_mode", "hard_positive")
+        )
+        cfg.s_gain_temperature = float(
+            resume_cfg.get(
+                "s_gain_temperature", cfg.s_gain_temperature
+            )
+        )
+        cfg.remove_res5_expert_branch_norm = bool(
+            resume_cfg.get("remove_res5_expert_branch_norm", False)
+        )
     device = torch.device(cfg.device)
 
     print("=" * 60)
@@ -120,13 +143,17 @@ def main():
         route_prior_concentration=cfg.route_prior_concentration,
         ot_feature_weight=cfg.ot_feature_weight,
         ot_coordinate_weight=cfg.ot_coordinate_weight,
+        ot_coordinate_radius=cfg.ot_coordinate_radius,
         p_ot_semantic_weight=cfg.p_ot_semantic_weight,
+        s_gain_mode=cfg.s_gain_mode,
+        s_gain_temperature=cfg.s_gain_temperature,
         p_ot_epsilon=cfg.p_ot_epsilon,
         s_ot_epsilon=cfg.s_ot_epsilon,
         s_ot_rho_base=cfg.s_ot_rho_base,
         s_ot_rho_expert=cfg.s_ot_rho_expert,
         ot_sinkhorn_iterations=cfg.ot_sinkhorn_iterations,
         ot_max_grid_size=cfg.ot_max_grid_size,
+        remove_res5_expert_branch_norm=cfg.remove_res5_expert_branch_norm,
     )
     n_params = sum(p.numel() for m in fusion_modules.values() for p in m.parameters() if p.requires_grad)
     print(f"Trainable parameters: {n_params:,}")

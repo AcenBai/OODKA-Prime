@@ -171,6 +171,8 @@ def main() -> None:
     nn_input = item["nnunet_image"].unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
 
     device = torch.device(args.device)
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint_cfg = checkpoint.get("config", {})
     model_nnunet, model_biomedparse = load_frozen_backbones(
         cfg.nnunet_model_dir, cfg.fold, device
     )
@@ -182,8 +184,10 @@ def main() -> None:
         len(prompts),
         device,
         text_dim=int(prompt_features["class_emb"].shape[-1]),
+        remove_res5_expert_branch_norm=bool(
+            checkpoint_cfg.get("remove_res5_expert_branch_norm", False)
+        ),
     )
-    checkpoint = torch.load(args.checkpoint, map_location=device)
     required = [
         *(f"ae_enc{level}_to_res{level}" for level in LEVELS),
         *(f"dis_b_res{level}" for level in LEVELS),
