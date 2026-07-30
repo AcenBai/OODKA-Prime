@@ -77,6 +77,9 @@ class TrainConfig:
     raw_cache_cases: int = 2
     require_no_crop: bool = True
     biomedparse_modality: int = 0
+    # Optional offline BiomedParse store with nnUNet-identical geometry.
+    biomedparse_preproc_dir: str = ""
+    use_aligned_biomedparse_preprocessing: bool = False
 
     norm_mode: str = "ct"
     window_level: float = 40.0
@@ -180,6 +183,7 @@ class EvalConfig:
     image_size: int = 512
     require_no_crop: bool = True
     biomedparse_modality: int = 0
+    use_aligned_biomedparse_preprocessing: bool = False
 
     norm_mode: str = "ct"
     window_level: float = 40.0

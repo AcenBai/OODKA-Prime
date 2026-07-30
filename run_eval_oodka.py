@@ -74,6 +74,26 @@ def main():
             not cfg.use_query_guided_injection,
         )
     )
+    cfg.norm_mode = str(checkpoint_cfg.get("norm_mode", cfg.norm_mode))
+    cfg.low_percentile = float(
+        checkpoint_cfg.get("low_percentile", cfg.low_percentile)
+    )
+    cfg.high_percentile = float(
+        checkpoint_cfg.get("high_percentile", cfg.high_percentile)
+    )
+    cfg.biomedparse_modality = int(
+        checkpoint_cfg.get(
+            "biomedparse_modality", cfg.biomedparse_modality
+        )
+    )
+    cfg.use_aligned_biomedparse_preprocessing = bool(
+        checkpoint_cfg.get(
+            "use_aligned_biomedparse_preprocessing",
+            bool(checkpoint_cfg.get("biomedparse_preproc_dir", "")),
+        )
+    )
+    cfg.block_z = int(checkpoint_cfg.get("block_z", cfg.block_z))
+    cfg.image_size = int(checkpoint_cfg.get("image_size", cfg.image_size))
     if cfg.use_query_guided_injection == cfg.use_beta_router:
         raise ValueError(
             "Checkpoint must select exactly one predictor fusion mode"

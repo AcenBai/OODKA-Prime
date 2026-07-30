@@ -25,9 +25,33 @@ WHS_MRI_PROMPTS = {
     "7": "MRI of the pulmonary artery trunk in the thorax",
 }
 
+MYOPS_LGE_PROMPTS = {
+    "1": (
+        "LGE short-axis cardiac MRI showing scar tissue within the "
+        "left ventricular myocardium"
+    ),
+    "2": (
+        "LGE short-axis cardiac MRI showing edematous tissue within the "
+        "left ventricular myocardium"
+    ),
+    "3": (
+        "LGE short-axis cardiac MRI showing the blood pool within the "
+        "left ventricular cavity"
+    ),
+    "4": (
+        "LGE short-axis cardiac MRI showing normal left ventricular "
+        "myocardium without scar or edema"
+    ),
+    "5": (
+        "LGE short-axis cardiac MRI showing the blood pool within the "
+        "right ventricular cavity"
+    ),
+}
+
 DATASET_PROMPT_REGISTRY: Dict[str, Dict[str, str]] = {
     "Dataset009_CT_OOD": WHS_CT_PROMPTS,
     "Dataset010_WHS_MRI_OOD": WHS_MRI_PROMPTS,
+    "Dataset011_MYO_LGE_BC_OOD": MYOPS_LGE_PROMPTS,
 }
 
 
@@ -40,7 +64,12 @@ def build_text_prompts_for_dataset(
         text_prompts: {"1": "...", "2": "...", ...}
         prompt_to_class_id: {0: 1, 1: 2, ...}
     """
-    prompts = DATASET_PROMPT_REGISTRY.get(dataset_name, WHS_CT_PROMPTS)
+    if dataset_name not in DATASET_PROMPT_REGISTRY:
+        known = ", ".join(sorted(DATASET_PROMPT_REGISTRY))
+        raise KeyError(
+            f"No prompt registry entry for {dataset_name!r}. Known: {known}"
+        )
+    prompts = DATASET_PROMPT_REGISTRY[dataset_name]
     ids = sorted(int(k) for k in prompts.keys())
     prompt_to_class_id = {i: ids[i] for i in range(len(ids))}
     return prompts, prompt_to_class_id

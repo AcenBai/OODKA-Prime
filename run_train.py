@@ -29,7 +29,27 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1,
                         help="Number B of independent contiguous-Z blocks")
     parser.add_argument("--image_size", type=int, default=512)
+    parser.add_argument(
+        "--biomedparse_preproc_dir",
+        type=str,
+        default="",
+        help=(
+            "Offline BiomedParse npz/pkl store aligned to nnUNet geometry; "
+            "required for cropped/resampled MRI datasets"
+        ),
+    )
+    parser.add_argument("--low_percentile", type=float, default=1.0)
+    parser.add_argument("--high_percentile", type=float, default=99.0)
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument(
+        "--raw_cache_cases",
+        type=int,
+        default=2,
+        help=(
+            "Cases kept per worker and shuffled together; use 4 for "
+            "shallow Dataset011 volumes with batch_size 8"
+        ),
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--output_dir", type=str, default="")
@@ -70,7 +90,14 @@ def main():
         n_epochs=args.n_epochs,
         batch_size=args.batch_size,
         image_size=args.image_size,
+        biomedparse_preproc_dir=args.biomedparse_preproc_dir,
+        use_aligned_biomedparse_preprocessing=bool(
+            args.biomedparse_preproc_dir
+        ),
+        low_percentile=args.low_percentile,
+        high_percentile=args.high_percentile,
         num_workers=args.num_workers,
+        raw_cache_cases=args.raw_cache_cases,
         lr=args.lr,
         device=args.device,
         output_dir=args.output_dir,
@@ -152,6 +179,16 @@ def main():
         raise ValueError("--query_guided_s_floor must be in [0,1]")
     if cfg.query_guided_topk <= 0:
         raise ValueError("--query_guided_topk must be positive")
+    if cfg.dataset_name == "Dataset011_MYO_LGE_BC_OOD":
+        if cfg.norm_mode != "mri":
+            raise ValueError(
+                "Dataset011_MYO_LGE_BC_OOD requires --norm_mode mri"
+            )
+        if not cfg.use_aligned_biomedparse_preprocessing:
+            raise ValueError(
+                "Dataset011_MYO_LGE_BC_OOD is cropped by nnUNet and requires "
+                "--biomedparse_preproc_dir with aligned npz/pkl files"
+            )
     device = torch.device(cfg.device)
 
     print("=" * 60)

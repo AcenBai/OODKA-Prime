@@ -119,6 +119,7 @@ class OODKATrainer:
             raw_cache_cases=cfg.raw_cache_cases,
             require_no_crop=cfg.require_no_crop,
             biomedparse_modality=cfg.biomedparse_modality,
+            biomedparse_preproc_dir=cfg.biomedparse_preproc_dir,
         )
 
     def _make_loader(

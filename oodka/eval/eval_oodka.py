@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from ..config import EvalConfig
+from ..data.aligned_preprocessing import AlignedBiomedParsePreprocessor
 from ..data.slice_dataset import (
     make_biomedparse_block,
     normalize_biomedparse_volume,
@@ -84,6 +85,20 @@ def _block_logits_to_raw_labels(
     return labels
 
 
+def _resize_block_logits(
+    logits: torch.Tensor,
+    output_hw: Tuple[int, int],
+) -> np.ndarray:
+    """Resize ``[P,Z,H,W]`` logits and return ``[P,Z,outH,outW]``."""
+    logits_zp = F.interpolate(
+        logits.permute(1, 0, 2, 3),
+        size=output_hw,
+        mode="bilinear",
+        align_corners=False,
+    )
+    return logits_zp.permute(1, 0, 2, 3).float().cpu().numpy()
+
+
 def evaluate_oodka_blocks(
     cfg: EvalConfig,
     model_biomedparse,
@@ -124,6 +139,19 @@ def evaluate_oodka_blocks(
     maybe_mkdir_p(pred_dir)
     for module in fusion_modules.values():
         module.eval()
+    aligned_preprocessor = None
+    if cfg.use_aligned_biomedparse_preprocessing:
+        if cfg.norm_mode != "mri":
+            raise ValueError(
+                "Aligned BiomedParse preprocessing currently supports MRI/LGE"
+            )
+        aligned_preprocessor = AlignedBiomedParsePreprocessor(
+            plans_path=cfg.plans_path,
+            dataset_json_path=cfg.dataset_json_path,
+            configuration_name=cfg.nnunet_configuration,
+            low_percentile=cfg.low_percentile,
+            high_percentile=cfg.high_percentile,
+        )
 
     all_rows = []
     for case_id in tqdm(test_ids, desc="OODKA block eval"):
@@ -153,17 +181,30 @@ def evaluate_oodka_blocks(
                 f"{case_id}: GT shape={gt_arr.shape} != raw shape={raw_shape}"
             )
 
-        bp_u8 = normalize_biomedparse_volume(
-            raw_image,
-            norm_mode=cfg.norm_mode,
-            window_level=cfg.window_level,
-            window_width=cfg.window_width,
-            low_percentile=cfg.low_percentile,
-            high_percentile=cfg.high_percentile,
-        )
+        aligned_properties = None
+        if aligned_preprocessor is not None:
+            bp_u8, _aligned_seg, aligned_properties = (
+                aligned_preprocessor.run_case(
+                    image_files,
+                    label_path,
+                    modality=cfg.biomedparse_modality,
+                )
+            )
+            spatial_shape = tuple(int(value) for value in bp_u8.shape)
+            prompt_logits = np.zeros((P, *spatial_shape), dtype=np.float32)
+        else:
+            bp_u8 = normalize_biomedparse_volume(
+                raw_image,
+                norm_mode=cfg.norm_mode,
+                window_level=cfg.window_level,
+                window_width=cfg.window_width,
+                low_percentile=cfg.low_percentile,
+                high_percentile=cfg.high_percentile,
+            )
+            spatial_shape = raw_shape
+            pred_seg = np.zeros(raw_shape, dtype=np.int16)
 
-        pred_seg = np.zeros(raw_shape, dtype=np.int16)
-        all_starts = list(range(0, raw_shape[0], cfg.block_z))
+        all_starts = list(range(0, spatial_shape[0], cfg.block_z))
         for batch_start in range(0, len(all_starts), cfg.batch_size):
             starts = all_starts[batch_start : batch_start + cfg.batch_size]
             bp_blocks, valid_z, valid_counts = _make_block_batch(
@@ -191,12 +232,35 @@ def evaluate_oodka_blocks(
             for block_index, (z_start, valid_count) in enumerate(
                 zip(starts, valid_counts)
             ):
-                raw_labels = _block_logits_to_raw_labels(
-                    block_logits[block_index, :, :valid_count],
-                    raw_shape[1:],
-                    prompt_to_class_id,
+                valid_logits = block_logits[
+                    block_index, :, :valid_count
+                ]
+                if aligned_preprocessor is not None:
+                    prompt_logits[
+                        :, z_start : z_start + valid_count
+                    ] = _resize_block_logits(
+                        valid_logits,
+                        spatial_shape[1:],
+                    )
+                else:
+                    raw_labels = _block_logits_to_raw_labels(
+                        valid_logits,
+                        raw_shape[1:],
+                        prompt_to_class_id,
+                    )
+                    pred_seg[z_start : z_start + valid_count] = raw_labels
+
+        if aligned_preprocessor is not None:
+            pred_seg = aligned_preprocessor.prompt_logits_to_raw_segmentation(
+                prompt_logits,
+                prompt_to_class_id,
+                aligned_properties,
+            )
+            if tuple(pred_seg.shape) != raw_shape:
+                raise ValueError(
+                    f"{case_id}: restored prediction shape={pred_seg.shape} "
+                    f"!= raw shape={raw_shape}"
                 )
-                pred_seg[z_start : z_start + valid_count] = raw_labels
 
         pred_seg = keep_largest_component_per_class(pred_seg, class_ids)
         label_ref = sitk.ReadImage(label_path)
