@@ -36,6 +36,7 @@ def _make_block_batch(
     *,
     block_z: int,
     image_size: int,
+    pseudo_rgb_mode: str = "adjacent",
 ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
     """Materialize B independent blocks while keeping each block's Z contiguous."""
     bp_blocks = []
@@ -49,7 +50,14 @@ def _make_block_batch(
         centers = list(range(int(z_start), int(z_start) + valid_count))
         centers.extend([centers[-1]] * (block_z - valid_count))
 
-        bp_blocks.append(make_biomedparse_block(bp_u8, centers, image_size))
+        bp_blocks.append(
+            make_biomedparse_block(
+                bp_u8,
+                centers,
+                image_size,
+                pseudo_rgb_mode=pseudo_rgb_mode,
+            )
+        )
         valid_masks.append(torch.arange(block_z) < valid_count)
 
     return (
@@ -212,6 +220,7 @@ def evaluate_oodka_blocks(
                 starts,
                 block_z=cfg.block_z,
                 image_size=cfg.image_size,
+                pseudo_rgb_mode=cfg.pseudo_rgb_mode,
             )
             block_logits = predict_block_logits_per_class(
                 biomedparse_images=bp_blocks,

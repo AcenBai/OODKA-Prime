@@ -41,6 +41,12 @@ def main():
     )
     parser.add_argument("--low_percentile", type=float, default=1.0)
     parser.add_argument("--high_percentile", type=float, default=99.0)
+    parser.add_argument(
+        "--pseudo_rgb_mode",
+        choices=("adjacent", "center_repeat"),
+        default="adjacent",
+        help="BiomedParse pseudo-RGB encoding for each center slice.",
+    )
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument(
         "--raw_cache_cases",
@@ -75,6 +81,20 @@ def main():
     parser.add_argument("--ot_max_grid_size", type=int, default=32)
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--resume_checkpoint", type=str, default="")
+    parser.add_argument(
+        "--init_checkpoint",
+        type=str,
+        default="",
+        help=(
+            "Transfer-initialize selected fusion weights while resetting "
+            "optimizer, epoch, scaler, and best metric."
+        ),
+    )
+    parser.add_argument(
+        "--init_scope",
+        choices=("student_router", "all_fusion"),
+        default="student_router",
+    )
     parser.add_argument("--val_every_epochs", type=int, default=5)
     parser.add_argument("--train_case_limit", type=int, default=0)
     parser.add_argument("--val_case_limit", type=int, default=0)
@@ -97,6 +117,7 @@ def main():
         ),
         low_percentile=args.low_percentile,
         high_percentile=args.high_percentile,
+        pseudo_rgb_mode=args.pseudo_rgb_mode,
         num_workers=args.num_workers,
         raw_cache_cases=args.raw_cache_cases,
         lr=args.lr,
@@ -119,6 +140,8 @@ def main():
         ot_max_grid_size=args.ot_max_grid_size,
         amp=not args.no_amp,
         resume_checkpoint=args.resume_checkpoint,
+        init_checkpoint=args.init_checkpoint,
+        init_scope=args.init_scope,
         val_every_epochs=args.val_every_epochs,
         train_case_limit=args.train_case_limit,
         val_case_limit=args.val_case_limit,
@@ -126,6 +149,10 @@ def main():
         max_val_batches=args.max_val_batches,
     )
     cfg.resolve_paths()
+    if cfg.resume_checkpoint and cfg.init_checkpoint:
+        raise ValueError(
+            "--resume_checkpoint and --init_checkpoint are mutually exclusive"
+        )
     try:
         cfg.source_commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],

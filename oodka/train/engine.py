@@ -123,8 +123,18 @@ class OODKATrainer:
         }
         self.best_val_dice = -float("inf")
         self.start_epoch = 1
+        self.initialized_modules: List[str] = []
+        if cfg.resume_checkpoint and cfg.init_checkpoint:
+            raise ValueError(
+                "resume_checkpoint and init_checkpoint are mutually exclusive"
+            )
         if cfg.resume_checkpoint:
             self._load_checkpoint(cfg.resume_checkpoint)
+        elif cfg.init_checkpoint:
+            self._load_initialization_checkpoint(
+                cfg.init_checkpoint,
+                scope=cfg.init_scope,
+            )
 
     def _set_fusion_mode(self, train: bool) -> None:
         for module in self.fusion_modules.values():
@@ -145,6 +155,7 @@ class OODKATrainer:
             window_width=cfg.window_width,
             low_percentile=cfg.low_percentile,
             high_percentile=cfg.high_percentile,
+            pseudo_rgb_mode=cfg.pseudo_rgb_mode,
             raw_cache_cases=cfg.raw_cache_cases,
             require_no_crop=cfg.require_no_crop,
             biomedparse_modality=cfg.biomedparse_modality,
@@ -317,6 +328,13 @@ class OODKATrainer:
             f"{cfg.ot_max_grid_size}"
         )
         log(f"Output: {cfg.output_dir}")
+        if cfg.init_checkpoint:
+            log(f"Transfer init: {cfg.init_checkpoint}")
+            log(
+                f"Transfer scope: {cfg.init_scope} "
+                f"({', '.join(self.initialized_modules)})"
+            )
+            log("Transfer state: fresh optimizer, epoch=1, best=-inf")
 
         for epoch in range(self.start_epoch, cfg.n_epochs + 1):
             train_sampler.set_epoch(epoch)
@@ -449,3 +467,46 @@ class OODKATrainer:
             checkpoint.get("best_val_dice", self.best_val_dice)
         )
         self.start_epoch = int(checkpoint.get("epoch", 0)) + 1
+
+    def _load_initialization_checkpoint(
+        self,
+        checkpoint_path: str,
+        *,
+        scope: str,
+    ) -> None:
+        """Initialize selected modules without restoring training state.
+
+        ``student_router`` transfers exactly the modules used by the deployed
+        CT OOD model: the four BiomedParse P/S projections and text router.
+        ``all_fusion`` additionally transfers expert nnUNet adapters.
+        Optimizer, scaler, epoch, best metric, and source config are never
+        restored here.
+        """
+        if scope not in {"student_router", "all_fusion"}:
+            raise ValueError(
+                "init_scope must be 'student_router' or 'all_fusion', got "
+                f"{scope!r}"
+            )
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        if scope == "student_router":
+            selected = [
+                name
+                for name in self.fusion_modules
+                if name.startswith("dis_b_") or name == "beta_router"
+            ]
+        else:
+            selected = [
+                name
+                for name in self.fusion_modules
+                if name != "ot_distillation"
+            ]
+        missing = [name for name in selected if name not in checkpoint]
+        if missing:
+            raise KeyError(
+                f"Initialization checkpoint is missing modules: {missing}"
+            )
+        for name in selected:
+            self.fusion_modules[name].load_state_dict(
+                checkpoint[name], strict=True
+            )
+        self.initialized_modules = selected

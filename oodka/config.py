@@ -86,6 +86,9 @@ class TrainConfig:
     window_width: float = 400.0
     low_percentile: float = 1.0
     high_percentile: float = 99.0
+    # BiomedParse expects three input channels. ``adjacent`` encodes
+    # [z-1,z,z+1], while ``center_repeat`` encodes one LGE slice as [z,z,z].
+    pseudo_rgb_mode: str = "adjacent"
 
     n_epochs: int = 100
     batch_size: int = 1
@@ -131,6 +134,10 @@ class TrainConfig:
     amp: bool = True
     amp_dtype: str = "float16"
     resume_checkpoint: str = ""
+    # Transfer initialization is deliberately distinct from exact resume: it
+    # loads selected module weights but starts with fresh optimizer/epoch/best.
+    init_checkpoint: str = ""
+    init_scope: str = "student_router"
 
     num_workers: int = 2
     val_every_epochs: int = 5
@@ -193,6 +200,7 @@ class EvalConfig:
     window_width: float = 400.0
     low_percentile: float = 1.0
     high_percentile: float = 99.0
+    pseudo_rgb_mode: str = "adjacent"
 
     tile_step_size: float = 0.5
     device: str = "cuda:0"

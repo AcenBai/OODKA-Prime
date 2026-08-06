@@ -29,6 +29,12 @@ def main():
                         help="Number B of independent contiguous-Z blocks")
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--norm_mode", type=str, default="ct", choices=("ct", "mri"))
+    parser.add_argument(
+        "--pseudo_rgb_mode",
+        choices=("adjacent", "center_repeat"),
+        default=None,
+        help="Override checkpoint pseudo-RGB encoding.",
+    )
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--distangler_ckpt", type=str, required=True)
     parser.add_argument("--out_dir", type=str, default="")
@@ -43,6 +49,7 @@ def main():
         batch_size=args.batch_size,
         image_size=args.image_size,
         norm_mode=args.norm_mode,
+        pseudo_rgb_mode=args.pseudo_rgb_mode or "adjacent",
         device=args.device,
         distangler_ckpt=args.distangler_ckpt,
         out_dir=args.out_dir or os.path.join("outputs", f"oodka_eval_{args.dataset_name}"),
@@ -56,6 +63,10 @@ def main():
     ckpt = torch.load(cfg.distangler_ckpt, map_location=device)
     checkpoint_cfg = ckpt.get("config", {})
     cfg.norm_mode = str(checkpoint_cfg.get("norm_mode", cfg.norm_mode))
+    cfg.pseudo_rgb_mode = str(
+        args.pseudo_rgb_mode
+        or checkpoint_cfg.get("pseudo_rgb_mode", cfg.pseudo_rgb_mode)
+    )
     cfg.low_percentile = float(
         checkpoint_cfg.get("low_percentile", cfg.low_percentile)
     )
