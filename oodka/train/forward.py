@@ -288,6 +288,7 @@ def _compute_segmentation_loss_and_metrics(
     valid_z: torch.Tensor,
     class_ids: torch.Tensor,
     prompt_reduction: str = "mean",
+    prompt_valid: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, float, Dict[int, float | None]]:
     """Vectorized BCE/Dice objective over all ``B*P`` class-volume pairs."""
     B, P, Z, H, W = logits.shape
@@ -297,6 +298,12 @@ def _compute_segmentation_loss_and_metrics(
         raise ValueError(f"valid_z must be [B,Z]={B,Z}, got {valid_z.shape}")
     if class_ids.shape != (P,):
         raise ValueError(f"class_ids must be [P]={P}, got {class_ids.shape}")
+    if prompt_valid is None:
+        prompt_valid = torch.ones((B, P), dtype=torch.bool, device=logits.device)
+    else:
+        prompt_valid = prompt_valid.to(device=logits.device, dtype=torch.bool)
+        if prompt_valid.shape != (B, P):
+            raise ValueError(f"prompt_valid must be [B,P]={B,P}, got {prompt_valid.shape}")
 
     valid = (gt != -1) & valid_z[:, :, None, None]
     valid_bp = valid[:, None]
@@ -329,7 +336,7 @@ def _compute_segmentation_loss_and_metrics(
         gt_empty,
         torch.full_like(loss_per_pair, 0.5),
         torch.ones_like(loss_per_pair),
-    )
+    ) * prompt_valid.float()
     if prompt_reduction == "mean":
         loss_seg = (
             (pair_weights * loss_per_pair).sum()
@@ -353,7 +360,7 @@ def _compute_segmentation_loss_and_metrics(
         )
         hard_dice = (2.0 * hard_intersection + 1e-6) / (hard_union + 1e-6)
         for prompt_index in range(P):
-            nonempty = ~gt_empty[:, prompt_index]
+            nonempty = (~gt_empty[:, prompt_index]) & prompt_valid[:, prompt_index]
             if nonempty.any():
                 value = float(hard_dice[nonempty, prompt_index].mean().item())
                 dice_per_class[prompt_index] = value
@@ -371,6 +378,7 @@ def _compute_detached_pixel_error_maps(
     valid_z: torch.Tensor,
     class_ids: torch.Tensor,
     expert_class_groups: Sequence[Sequence[int]] | None = None,
+    prompt_valid: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return comparable prompt-wise BCE maps for student and expert.
 
@@ -427,12 +435,27 @@ def _compute_detached_pixel_error_maps(
         target = (
             gt[:, None] == class_ids[None, :, None, None, None]
         ).float()
-        base_error = F.binary_cross_entropy_with_logits(
+        base_error_by_prompt = F.binary_cross_entropy_with_logits(
             base_logits.detach().float(), target, reduction="none"
-        ).mean(dim=1)
-        expert_error = F.binary_cross_entropy_with_logits(
+        )
+        expert_error_by_prompt = F.binary_cross_entropy_with_logits(
             selected_expert.detach().float(), target, reduction="none"
-        ).mean(dim=1)
+        )
+        if prompt_valid is None:
+            prompt_weights = torch.ones(
+                (B, P, 1, 1, 1), device=base_logits.device
+            )
+        else:
+            prompt_weights = prompt_valid.to(
+                device=base_logits.device, dtype=torch.float32
+            )[:, :, None, None, None]
+        prompt_denominator = prompt_weights.sum(dim=1).clamp_min(1.0)
+        base_error = (
+            base_error_by_prompt * prompt_weights
+        ).sum(dim=1) / prompt_denominator
+        expert_error = (
+            expert_error_by_prompt * prompt_weights
+        ).sum(dim=1) / prompt_denominator
         valid = (gt != -1) & valid_z[:, :, None, None]
         base_error = torch.where(valid, base_error, torch.zeros_like(base_error))
         expert_error = torch.where(
@@ -592,6 +615,7 @@ def forward_one_batch(
         valid_z,
         class_ids,
         prompt_reduction=prompt_loss_reduction,
+        prompt_valid=batch_data.get("prompt_valid"),
     )
 
     # Dynamic expert transports are a detached training-only supervision path.
@@ -603,6 +627,7 @@ def forward_one_batch(
             valid_z,
             class_ids,
             expert_class_groups=expert_class_groups,
+            prompt_valid=batch_data.get("prompt_valid"),
         )
         ot_output = fusion_modules["ot_distillation"](
             feats,

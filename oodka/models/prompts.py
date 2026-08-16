@@ -76,9 +76,19 @@ MYOPS_LGE_ROI_REFINEMENT_PROMPTS = {
     ),
 }
 
+# V2 predicts every deployable class inside the myocardium-derived ROI so
+# cavity and myocardial prompts are calibrated in the same forward pass.
+MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS = {
+    "1": MYOPS_LGE_ROI_ANATOMY_PROMPTS["1"],
+    "2": MYOPS_LGE_ROI_ANATOMY_PROMPTS["2"],
+    "3": MYOPS_LGE_ROI_REFINEMENT_PROMPTS["1"],
+    "4": MYOPS_LGE_ROI_REFINEMENT_PROMPTS["2"],
+}
+
 # Original Dataset011 labels grouped for each branch.
 MYOPS_LGE_ROI_ANATOMY_GROUPS = ((3,), (5,), (1, 2, 4))
 MYOPS_LGE_ROI_REFINEMENT_GROUPS = ((4,), (1, 2))
+MYOPS_LGE_ROI_V2_REFINEMENT_GROUPS = ((3,), (5,), (4,), (1, 2))
 
 # Final deployment labels: background=0, LV=1, RV=2, normal-MYO=3,
 # scar+edema=4.

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
@@ -17,10 +19,14 @@ from ..data.lge_roi import (
     ROICache,
     ROICoordinates,
     ROIGenerator,
+    augment_lge_batch,
     crop_and_resize_batch,
+    hard_switch_foreground_logits,
+    jitter_roi,
     remap_grouped_labels,
     restore_roi_logits,
     roi_diagnostics,
+    roi_prompt_visibility,
 )
 from ..models.prompts import (
     MYOPS_LGE_ROI_FINAL_NAMES,
@@ -210,6 +216,8 @@ class LGEROIMixedTrainer(OODKATrainer):
             "anchor_seg", "refine_seg", "loss_ae", "loss_ortho",
             "loss_route", "loss_p_ot", "loss_s_ot", "roi_gt_recall",
             "roi_area_fraction", "roi_fallback_rate",
+            "roi_lv_loss_valid_rate", "roi_rv_loss_valid_rate",
+            "anchor_sigmoid_dice", "refine_sigmoid_dice",
         )
         meter = {key: 0.0 for key in meter_keys}
         n_batches = 0
@@ -233,8 +241,20 @@ class LGEROIMixedTrainer(OODKATrainer):
                     enabled=self.amp_enabled,
                 ):
                     regularizer_scale = 0.5 if mixed else 1.0
+                    anchor_batch = batch_data
+                    if train and self.cfg.lge_augment:
+                        anchor_batch = augment_lge_batch(
+                            batch_data,
+                            rotation_degrees=self.cfg.augment_rotation_degrees,
+                            scale_min=self.cfg.augment_scale_min,
+                            scale_max=self.cfg.augment_scale_max,
+                            translation_fraction=self.cfg.augment_translation_fraction,
+                            horizontal_flip_probability=self.cfg.augment_horizontal_flip_probability,
+                            vertical_flip_probability=self.cfg.augment_vertical_flip_probability,
+                            intensity_probability=self.cfg.augment_intensity_probability,
+                        )
                     anchor_loss, anchor_logs = self._branch_forward(
-                        batch_data,
+                        anchor_batch,
                         prompt_features=self.anatomy_prompt_features,
                         groups=self.anatomy_groups,
                         regularizer_scale=regularizer_scale,
@@ -251,7 +271,43 @@ class LGEROIMixedTrainer(OODKATrainer):
                             self._cached_rois(batch_data)
                             if train else self._online_rois(anatomy_logits)
                         )
+                        if train and self.cfg.roi_v2_hard_switch:
+                            rois = [
+                                jitter_roi(
+                                    roi,
+                                    batch_data["gt"].shape[-2:],
+                                    center_fraction=self.cfg.roi_jitter_center_fraction,
+                                    scale_min=self.cfg.roi_jitter_scale_min,
+                                    scale_max=self.cfg.roi_jitter_scale_max,
+                                )
+                                for roi in rois
+                            ]
                         roi_batch = crop_and_resize_batch(batch_data, rois)
+                        if self.cfg.roi_v2_hard_switch:
+                            prompt_valid = roi_prompt_visibility(
+                                batch_data["gt"],
+                                rois,
+                                self.refinement_groups,
+                                min_coverage=self.cfg.roi_visibility_min_coverage,
+                            )
+                            roi_batch["prompt_valid"] = prompt_valid
+                            meter["roi_lv_loss_valid_rate"] += float(
+                                prompt_valid[:, 0].float().mean()
+                            )
+                            meter["roi_rv_loss_valid_rate"] += float(
+                                prompt_valid[:, 1].float().mean()
+                            )
+                        if train and self.cfg.lge_augment:
+                            roi_batch = augment_lge_batch(
+                                roi_batch,
+                                rotation_degrees=self.cfg.augment_rotation_degrees,
+                                scale_min=self.cfg.augment_scale_min,
+                                scale_max=self.cfg.augment_scale_max,
+                                translation_fraction=self.cfg.augment_translation_fraction,
+                                horizontal_flip_probability=self.cfg.augment_horizontal_flip_probability,
+                                vertical_flip_probability=self.cfg.augment_vertical_flip_probability,
+                                intensity_probability=self.cfg.augment_intensity_probability,
+                            )
                         refine_loss, refine_logs = self._branch_forward(
                             roi_batch,
                             prompt_features=self.refinement_prompt_features,
@@ -279,23 +335,34 @@ class LGEROIMixedTrainer(OODKATrainer):
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
 
-                if mixed:
+                # Full and ROI branches receive independent random affine transforms
+                # during training. Their logits therefore cannot be restored into one
+                # coordinate system for a meaningful hard-switch training metric.
+                # Validation is unaugmented and remains the exact inference pipeline.
+                score_hard_switch = not (train and self.cfg.lge_augment)
+                if mixed and score_hard_switch:
                     restored = restore_roi_logits(
                         refinement_logits,
                         rois,
                         batch_data["gt"].shape[-2:],
                     )
                     background = torch.zeros_like(anatomy_logits[:, :1])
-                    final_scores = torch.cat(
-                        [
-                            background,
-                            anatomy_logits[:, 0:1],
-                            anatomy_logits[:, 1:2],
-                            restored[:, 0:1],
-                            restored[:, 1:2],
-                        ],
-                        dim=1,
-                    )
+                    if self.cfg.roi_v2_hard_switch:
+                        foreground = hard_switch_foreground_logits(
+                            anatomy_logits, restored, rois
+                        )
+                        final_scores = torch.cat([background, foreground], dim=1)
+                    else:
+                        final_scores = torch.cat(
+                            [
+                                background,
+                                anatomy_logits[:, 0:1],
+                                anatomy_logits[:, 1:2],
+                                restored[:, 0:1],
+                                restored[:, 1:2],
+                            ],
+                            dim=1,
+                        )
                     prediction = final_scores.argmax(dim=1)
                     target = remap_grouped_labels(
                         batch_data["gt"],
@@ -308,6 +375,24 @@ class LGEROIMixedTrainer(OODKATrainer):
                         target,
                         4,
                     )
+                else:
+                    if not mixed:
+                        background = torch.zeros_like(anatomy_logits[:, :1])
+                        prediction = torch.cat(
+                            [background, anatomy_logits], dim=1
+                        ).argmax(dim=1)
+                        target = remap_grouped_labels(
+                            anchor_batch["gt"], self.anatomy_groups
+                        )
+                        _update_case_counts(
+                            case_counts,
+                            batch_data["case_id"],
+                            prediction,
+                            target,
+                            3,
+                        )
+
+                if mixed:
                     roi_recall, roi_area = self._roi_quality(
                         batch_data["gt"], rois
                     )
@@ -316,27 +401,18 @@ class LGEROIMixedTrainer(OODKATrainer):
                     meter["roi_fallback_rate"] += float(
                         np.mean([roi.fallback for roi in rois])
                     )
-                else:
-                    background = torch.zeros_like(anatomy_logits[:, :1])
-                    prediction = torch.cat(
-                        [background, anatomy_logits], dim=1
-                    ).argmax(dim=1)
-                    target = remap_grouped_labels(
-                        batch_data["gt"], self.anatomy_groups
-                    )
-                    _update_case_counts(
-                        case_counts,
-                        batch_data["case_id"],
-                        prediction,
-                        target,
-                        3,
-                    )
 
                 meter["loss_total"] += float(total_loss.detach())
                 meter["loss_anchor"] += float(anchor_loss.detach())
                 meter["loss_refine"] += float(refine_loss.detach())
                 meter["anchor_seg"] += anchor_logs.get("loss_seg", 0.0)
                 meter["refine_seg"] += refine_logs.get("loss_seg", 0.0)
+                meter["anchor_sigmoid_dice"] += anchor_logs.get(
+                    "dice_mean", 0.0
+                )
+                meter["refine_sigmoid_dice"] += refine_logs.get(
+                    "dice_mean", 0.0
+                )
                 for name in (
                     "loss_ae", "loss_ortho", "loss_route",
                     "loss_p_ot", "loss_s_ot",
@@ -351,7 +427,10 @@ class LGEROIMixedTrainer(OODKATrainer):
         macro, per_class = _case_dice_from_counts(case_counts, class_count)
         meter["exclusive_macro_dice"] = macro
         meter["exclusive_dice_per_class"] = per_class
-        meter["mode"] = "mixed" if mixed else "warmup_anatomy"
+        if mixed and train and self.cfg.lge_augment:
+            meter["mode"] = "mixed_augmented_branches"
+        else:
+            meter["mode"] = "mixed" if mixed else "warmup_anatomy"
         meter["peak_cuda_memory_gib"] = (
             float(torch.cuda.max_memory_allocated(self.device) / 1024**3)
             if self.device.type == "cuda"
@@ -453,7 +532,11 @@ class LGEROIMixedTrainer(OODKATrainer):
             "epoch": epoch,
             "best_val_dice": self.best_val_dice,
             "config": asdict(self.cfg),
-            "format": "oodka_lge_roi_v1",
+            "format": (
+                "oodka_lge_roi_v2"
+                if self.cfg.roi_v2_hard_switch
+                else "oodka_lge_roi_v1"
+            ),
             "prompt_texts": self.prompt_texts,
             "anatomy_groups": self.anatomy_groups,
             "refinement_groups": self.refinement_groups,
@@ -462,11 +545,46 @@ class LGEROIMixedTrainer(OODKATrainer):
             state[name] = module.state_dict()
         state["optimizer"] = self.optimizer.state_dict()
         state["scaler"] = self.scaler.state_dict()
-        filename = (
-            "fusion_lge_roi_best.pth" if best
-            else f"fusion_lge_roi_epoch{epoch:03d}.pth"
-        )
+        prefix = "fusion_lge_roi_v2" if self.cfg.roi_v2_hard_switch else "fusion_lge_roi"
+        filename = f"{prefix}_best.pth" if best else f"{prefix}_epoch{epoch:03d}.pth"
         torch.save(state, os.path.join(self.cfg.output_dir, filename))
+
+    def _evaluate_best_on_test(self, epoch: int) -> dict:
+        """Run the current validation-best checkpoint on test for diagnostics."""
+        prefix = (
+            "fusion_lge_roi_v2"
+            if self.cfg.roi_v2_hard_switch else "fusion_lge_roi"
+        )
+        checkpoint = os.path.join(self.cfg.output_dir, f"{prefix}_best.pth")
+        out_dir = os.path.join(
+            self.cfg.output_dir, "test_by_val_best", f"epoch{epoch:03d}"
+        )
+        maybe_mkdir_p(out_dir)
+        repo_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        command = [
+            sys.executable,
+            os.path.join(repo_dir, "run_eval_lge_roi.py"),
+            "--checkpoint", checkpoint,
+            "--split", "test",
+            "--device", self.cfg.best_test_device,
+            "--batch_size", str(self.cfg.best_test_batch_size),
+            "--decision", "auto",
+            "--out_dir", out_dir,
+        ]
+        with open(
+            os.path.join(out_dir, "evaluation.log"), "w", encoding="utf-8"
+        ) as handle:
+            subprocess.run(
+                command,
+                cwd=repo_dir,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                check=True,
+            )
+        with open(
+            os.path.join(out_dir, "summary.json"), encoding="utf-8"
+        ) as handle:
+            return json.load(handle)
 
     def train(self) -> None:
         cfg = self.cfg
@@ -510,13 +628,15 @@ class LGEROIMixedTrainer(OODKATrainer):
         cache_loader, _ = self._make_loader(train_dataset, shuffle=False)
         val_loader, val_sampler = self._make_loader(val_dataset, shuffle=False)
         log(
-            f"LGE ROI v1: train={len(train_ids)} cases/{len(train_dataset)} slices, "
+            f"LGE ROI {'v2' if cfg.roi_v2_hard_switch else 'v1'}: "
+            f"train={len(train_ids)} cases/{len(train_dataset)} slices, "
             f"val={len(val_ids)} cases/{len(val_dataset)} slices"
         )
         log(
             f"B={cfg.batch_size}, Z=1, image={cfg.image_size}, "
             f"warmup={cfg.roi_warmup_epochs}, threshold={cfg.roi_threshold}, "
-            f"expand={cfg.roi_expand}, pseudoRGB={cfg.pseudo_rgb_mode}"
+            f"expand={cfg.roi_expand}, pseudoRGB={cfg.pseudo_rgb_mode}, "
+            f"augment={cfg.lge_augment}"
         )
 
         for epoch in range(self.start_epoch, cfg.n_epochs + 1):
@@ -579,6 +699,7 @@ class LGEROIMixedTrainer(OODKATrainer):
                 f"lr={current_lr:.3g}"
             )
             val_metrics = None
+            test_best_metrics = None
             if epoch % cfg.val_every_epochs == 0 or epoch == cfg.n_epochs:
                 val_metrics = self._run_loader(
                     val_loader,
@@ -603,11 +724,22 @@ class LGEROIMixedTrainer(OODKATrainer):
                     self.best_val_dice = val_metrics["exclusive_macro_dice"]
                     self._save_roi_checkpoint(epoch, best=True)
                     log(f"  -> new best exclusive argmax={self.best_val_dice:.4f}")
+                    if cfg.best_test_on_improvement:
+                        log(
+                            "  -> evaluating validation-best checkpoint on test "
+                            f"using {cfg.best_test_device}"
+                        )
+                        test_best_metrics = self._evaluate_best_on_test(epoch)
+                        log(
+                            "  -> diagnostic test macro="
+                            f"{test_best_metrics['mean_dice_gt_present']:.4f}"
+                        )
             record = {
                 "epoch": epoch,
                 "lr": current_lr,
                 "train": train_metrics,
                 "val": val_metrics,
+                "test_best_diagnostic": test_best_metrics,
             }
             self.history.append(record)
             with open(

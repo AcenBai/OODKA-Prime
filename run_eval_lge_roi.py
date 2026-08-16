@@ -19,12 +19,18 @@ from tqdm import tqdm
 
 from oodka.config import EvalConfig
 from oodka.data.aligned_preprocessing import AlignedBiomedParsePreprocessor
-from oodka.data.lge_roi import ROIGenerator, restore_roi_logits, roi_diagnostics
+from oodka.data.lge_roi import (
+    ROIGenerator,
+    hard_switch_foreground_logits,
+    restore_roi_logits,
+    roi_diagnostics,
+)
 from oodka.data.slice_dataset import make_biomedparse_block
 from oodka.models.prompts import (
     MYOPS_LGE_ROI_ANATOMY_PROMPTS,
     MYOPS_LGE_ROI_FINAL_NAMES,
     MYOPS_LGE_ROI_REFINEMENT_PROMPTS,
+    MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS,
 )
 from oodka.train.forward import predict_block_logits_per_class
 from oodka.train.model_builder import (
@@ -101,8 +107,8 @@ def main() -> None:
     parser.add_argument("--case_limit", type=int, default=0)
     parser.add_argument(
         "--decision",
-        choices=("flat", "hierarchical", "independent"),
-        default="flat",
+        choices=("auto", "flat", "hierarchical", "independent", "spatial"),
+        default="auto",
         help="Final cross-pass decision rule.",
     )
     parser.add_argument(
@@ -117,8 +123,17 @@ def main() -> None:
 
     device = torch.device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location=device)
-    if checkpoint.get("format") != "oodka_lge_roi_v1":
-        raise ValueError("Checkpoint is not an oodka_lge_roi_v1 model")
+    checkpoint_format = checkpoint.get("format")
+    if checkpoint_format not in {"oodka_lge_roi_v1", "oodka_lge_roi_v2"}:
+        raise ValueError("Checkpoint is not an OODKA LGE ROI model")
+    is_v2 = checkpoint_format == "oodka_lge_roi_v2"
+    decision = args.decision
+    if decision == "auto":
+        decision = "spatial" if is_v2 else "flat"
+    if is_v2 and decision != "spatial":
+        raise ValueError("V2 checkpoints require --decision spatial (or auto)")
+    if not is_v2 and decision == "spatial":
+        raise ValueError("Spatial hard switching requires a V2 checkpoint")
     saved = checkpoint["config"]
     cfg = EvalConfig(
         dataset_name="Dataset011_MYO_LGE_BC_OOD",
@@ -151,8 +166,12 @@ def main() -> None:
     anatomy_features = build_prompt_features(
         model, MYOPS_LGE_ROI_ANATOMY_PROMPTS, device
     )
+    refinement_prompts = (
+        MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
+        if is_v2 else MYOPS_LGE_ROI_REFINEMENT_PROMPTS
+    )
     refinement_features = build_prompt_features(
-        model, MYOPS_LGE_ROI_REFINEMENT_PROMPTS, device
+        model, refinement_prompts, device
     )
     modules = build_fusion_modules(
         None,
@@ -190,7 +209,7 @@ def main() -> None:
     pred_dir = os.path.join(args.out_dir, "pred_nii")
     maybe_mkdir_p(pred_dir)
     independent_dirs = {}
-    if args.decision == "independent":
+    if decision == "independent":
         for class_id, class_name in MYOPS_LGE_ROI_FINAL_NAMES.items():
             class_dir = os.path.join(args.out_dir, "pred_binary", class_name)
             maybe_mkdir_p(class_dir)
@@ -269,7 +288,7 @@ def main() -> None:
                     valid,
                     (cfg.image_size, cfg.image_size),
                     refinement_features,
-                    2,
+                    4 if is_v2 else 2,
                     model,
                     modules,
                     device,
@@ -279,7 +298,11 @@ def main() -> None:
                     rois,
                     (cfg.image_size, cfg.image_size),
                 )
-                if args.decision == "hierarchical":
+                if decision == "spatial":
+                    foreground_scores = hard_switch_foreground_logits(
+                        anatomy, restored, rois
+                    )
+                elif decision == "hierarchical":
                     foreground_scores = _hierarchical_foreground_logits(
                         anatomy, restored
                     )
@@ -326,7 +349,7 @@ def main() -> None:
 
         gt_raw, spacing = read_nifti_as_zyx_with_spacing(label_path)
         target = _remap_gt(gt_raw)
-        if args.decision == "independent":
+        if decision == "independent":
             threshold_logit = float(
                 np.log(
                     args.independent_threshold
@@ -417,7 +440,8 @@ def main() -> None:
         writer.writerows(rows)
     summary = {
         "n_cases": len(rows),
-        "decision": args.decision,
+        "decision": decision,
+        "checkpoint_format": checkpoint_format,
         "mean_dice_gt_present": float(np.mean([r["dice_mean_gt"] for r in rows])),
         "class_names": MYOPS_LGE_ROI_FINAL_NAMES,
     }
@@ -446,7 +470,7 @@ def main() -> None:
         np.mean(probability_outside) if probability_outside else 0.0
     )
     summary["roi"] = roi_summary
-    if args.decision == "independent":
+    if decision == "independent":
         summary["independent_threshold"] = args.independent_threshold
         summary["independent_predicted_voxels"] = independent_predicted.tolist()
         summary["independent_target_voxels"] = independent_target.tolist()

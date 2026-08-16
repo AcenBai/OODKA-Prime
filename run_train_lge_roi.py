@@ -18,6 +18,8 @@ from oodka.models.prompts import (
     MYOPS_LGE_ROI_ANATOMY_PROMPTS,
     MYOPS_LGE_ROI_REFINEMENT_GROUPS,
     MYOPS_LGE_ROI_REFINEMENT_PROMPTS,
+    MYOPS_LGE_ROI_V2_REFINEMENT_GROUPS,
+    MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS,
 )
 from oodka.train.lge_roi_engine import LGEROIMixedTrainer
 from oodka.train.model_builder import (
@@ -47,6 +49,14 @@ def main() -> None:
     parser.add_argument("--max_train_batches", type=int, default=0)
     parser.add_argument("--max_val_batches", type=int, default=0)
     parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument(
+        "--v2",
+        action="store_true",
+        help="ROI predicts LV/RV/normal/scar-edema with hard spatial switching.",
+    )
+    parser.add_argument("--no_augment", action="store_true")
+    parser.add_argument("--test_best_on_improvement", action="store_true")
+    parser.add_argument("--best_test_device", default="cuda:2")
     args = parser.parse_args()
 
     cfg = TrainConfig(
@@ -86,6 +96,22 @@ def main() -> None:
         roi_refresh_every=args.roi_refresh_every,
         lambda_anchor=1.0,
         lambda_refine=1.0,
+        roi_v2_hard_switch=args.v2,
+        roi_visibility_min_coverage=0.01,
+        roi_jitter_center_fraction=0.03 if args.v2 else 0.0,
+        roi_jitter_scale_min=1.0,
+        roi_jitter_scale_max=1.15 if args.v2 else 1.0,
+        lge_augment=args.v2 and not args.no_augment,
+        augment_rotation_degrees=10.0,
+        augment_scale_min=0.95,
+        augment_scale_max=1.05,
+        augment_translation_fraction=0.05,
+        augment_horizontal_flip_probability=0.5,
+        augment_vertical_flip_probability=0.2,
+        augment_intensity_probability=0.8,
+        best_test_on_improvement=args.test_best_on_improvement,
+        best_test_device=args.best_test_device,
+        best_test_batch_size=args.batch_size,
         amp=not args.no_amp,
         device=args.device,
         output_dir=args.output_dir,
@@ -115,8 +141,16 @@ def main() -> None:
     anatomy_features = build_prompt_features(
         model_biomedparse, MYOPS_LGE_ROI_ANATOMY_PROMPTS, device
     )
+    refinement_prompts = (
+        MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
+        if args.v2 else MYOPS_LGE_ROI_REFINEMENT_PROMPTS
+    )
+    refinement_groups = (
+        MYOPS_LGE_ROI_V2_REFINEMENT_GROUPS
+        if args.v2 else MYOPS_LGE_ROI_REFINEMENT_GROUPS
+    )
     refinement_features = build_prompt_features(
-        model_biomedparse, MYOPS_LGE_ROI_REFINEMENT_PROMPTS, device
+        model_biomedparse, refinement_prompts, device
     )
     fusion_modules = build_fusion_modules(
         model_nnunet,
@@ -144,7 +178,7 @@ def main() -> None:
     )
     prompt_texts = {
         "anatomy": MYOPS_LGE_ROI_ANATOMY_PROMPTS,
-        "refinement": MYOPS_LGE_ROI_REFINEMENT_PROMPTS,
+        "refinement": refinement_prompts,
     }
     trainer = LGEROIMixedTrainer(
         cfg=cfg,
@@ -154,7 +188,7 @@ def main() -> None:
         anatomy_prompt_features=anatomy_features,
         refinement_prompt_features=refinement_features,
         anatomy_groups=MYOPS_LGE_ROI_ANATOMY_GROUPS,
-        refinement_groups=MYOPS_LGE_ROI_REFINEMENT_GROUPS,
+        refinement_groups=refinement_groups,
         prompt_texts=prompt_texts,
     )
     trainer.train()

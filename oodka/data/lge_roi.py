@@ -103,6 +103,166 @@ class ROIGenerator:
         return ROICoordinates(x0, y0, x1, y1, fallback=False)
 
 
+def jitter_roi(
+    roi: ROICoordinates,
+    image_size: tuple[int, int],
+    *,
+    center_fraction: float,
+    scale_min: float,
+    scale_max: float,
+) -> ROICoordinates:
+    """Randomly perturb a cached ROI without changing its coordinate space."""
+    if center_fraction <= 0.0 and scale_min == 1.0 and scale_max == 1.0:
+        return roi
+    if not 0.0 < scale_min <= scale_max:
+        raise ValueError("ROI jitter scales must satisfy 0 < min <= max")
+    height, width = image_size
+    scale = float(torch.empty(()).uniform_(scale_min, scale_max))
+    dx = float(torch.empty(()).uniform_(-center_fraction, center_fraction))
+    dy = float(torch.empty(()).uniform_(-center_fraction, center_fraction))
+    center_x = 0.5 * (roi.x0 + roi.x1) + dx * roi.width
+    center_y = 0.5 * (roi.y0 + roi.y1) + dy * roi.height
+    out_w = max(2, int(round(roi.width * scale)))
+    out_h = max(2, int(round(roi.height * scale)))
+    x0 = int(round(center_x - out_w / 2.0))
+    y0 = int(round(center_y - out_h / 2.0))
+    x0 = min(max(0, x0), max(0, width - out_w))
+    y0 = min(max(0, y0), max(0, height - out_h))
+    return ROICoordinates(
+        x0=x0,
+        y0=y0,
+        x1=min(width, x0 + out_w),
+        y1=min(height, y0 + out_h),
+        fallback=roi.fallback,
+    )
+
+
+def roi_prompt_visibility(
+    original_gt: torch.Tensor,
+    rois: Sequence[ROICoordinates],
+    groups: Sequence[Sequence[int]],
+    *,
+    min_coverage: float,
+) -> torch.Tensor:
+    """Return [B,P] validity, skipping classes truncated by an ROI crop.
+
+    A class absent on the full slice is a genuine negative. A class present on
+    the full slice is supervised only when the ROI retains enough of it.
+    """
+    batch_size = original_gt.shape[0]
+    visible = torch.ones((batch_size, len(groups)), dtype=torch.bool)
+    for index, roi in enumerate(rois):
+        full = original_gt[index, 0]
+        for prompt_index, source_ids in enumerate(groups):
+            mask = torch.zeros_like(full, dtype=torch.bool)
+            for source_id in source_ids:
+                mask |= full == int(source_id)
+            total = int(mask.sum())
+            if total == 0:
+                continue
+            inside = int(mask[roi.y0 : roi.y1, roi.x0 : roi.x1].sum())
+            visible[index, prompt_index] = inside / total >= min_coverage
+    return visible
+
+
+def hard_switch_foreground_logits(
+    anatomy_logits: torch.Tensor,
+    restored_roi_logits: torch.Tensor,
+    rois: Sequence[ROICoordinates],
+) -> torch.Tensor:
+    """Use Pass 1 outside each ROI and Pass 2 inside, without logit mixing."""
+    if anatomy_logits.ndim != 5 or anatomy_logits.shape[1] < 2:
+        raise ValueError("anatomy_logits must be [B,>=2,1,H,W]")
+    if restored_roi_logits.ndim != 5 or restored_roi_logits.shape[1] != 4:
+        raise ValueError("V2 ROI logits must be [B,4,1,H,W]")
+    batch_size, _, _, height, width = restored_roi_logits.shape
+    if len(rois) != batch_size:
+        raise ValueError("ROI count does not match logits batch")
+    outside = restored_roi_logits.new_full(
+        (batch_size, 4, 1, height, width), -20.0
+    )
+    outside[:, 0:2] = anatomy_logits[:, 0:2]
+    mask = torch.zeros(
+        (batch_size, 1, 1, height, width),
+        dtype=torch.bool,
+        device=restored_roi_logits.device,
+    )
+    for index, roi in enumerate(rois):
+        mask[index, :, :, roi.y0 : roi.y1, roi.x0 : roi.x1] = True
+    return torch.where(mask, restored_roi_logits, outside)
+
+
+def augment_lge_batch(
+    batch_data: dict,
+    *,
+    rotation_degrees: float,
+    scale_min: float,
+    scale_max: float,
+    translation_fraction: float,
+    horizontal_flip_probability: float,
+    vertical_flip_probability: float,
+    intensity_probability: float,
+) -> dict:
+    """Apply synchronized affine and mild modality-aware intensity jitter."""
+    output = dict(batch_data)
+    nn_image = batch_data["nnunet_image"]
+    bp_image = batch_data["biomedparse_image"]
+    gt = batch_data["gt"]
+    if nn_image.shape[1] != 1 or bp_image.shape[1] != 1:
+        raise ValueError("LGE augmentation requires Z=1")
+    batch_size = nn_image.shape[0]
+    angles = torch.empty(batch_size).uniform_(-rotation_degrees, rotation_degrees)
+    angles = angles * torch.pi / 180.0
+    scales = torch.empty(batch_size).uniform_(scale_min, scale_max)
+    flip_x = torch.where(
+        torch.rand(batch_size) < horizontal_flip_probability, -1.0, 1.0
+    )
+    flip_y = torch.where(
+        torch.rand(batch_size) < vertical_flip_probability, -1.0, 1.0
+    )
+    tx = torch.empty(batch_size).uniform_(-translation_fraction, translation_fraction) * 2.0
+    ty = torch.empty(batch_size).uniform_(-translation_fraction, translation_fraction) * 2.0
+    theta = torch.zeros((batch_size, 2, 3), dtype=nn_image.dtype)
+    theta[:, 0, 0] = torch.cos(angles) * flip_x / scales
+    theta[:, 0, 1] = -torch.sin(angles) * flip_y / scales
+    theta[:, 1, 0] = torch.sin(angles) * flip_x / scales
+    theta[:, 1, 1] = torch.cos(angles) * flip_y / scales
+    theta[:, 0, 2] = tx
+    theta[:, 1, 2] = ty
+
+    def spatial(images: torch.Tensor, mode: str) -> torch.Tensor:
+        flat = images[:, 0]
+        grid = F.affine_grid(theta, flat.shape, align_corners=False)
+        return F.grid_sample(
+            flat, grid, mode=mode, padding_mode="zeros", align_corners=False
+        )[:, None]
+
+    nn_aug = spatial(nn_image, "bilinear")
+    bp_aug = spatial(bp_image, "bilinear")
+    gt_aug = spatial(gt[:, :, None].float(), "nearest")[:, :, 0].to(gt.dtype)
+
+    for index in range(batch_size):
+        if float(torch.rand(())) >= intensity_probability:
+            continue
+        contrast = float(torch.empty(()).uniform_(0.8, 1.2))
+        shift = float(torch.empty(()).uniform_(-0.1, 0.1))
+        noise = float(torch.empty(()).uniform_(0.0, 0.04))
+        for images, clamp in ((nn_aug, False), (bp_aug, True)):
+            value = images[index]
+            mean = value.mean()
+            std = value.std().clamp_min(1e-6)
+            value = mean + contrast * (value - mean) + shift * std
+            value = value + torch.randn_like(value) * (noise * std)
+            if clamp:
+                gamma = float(torch.empty(()).uniform_(0.75, 1.35))
+                value = (value.clamp(0.0, 255.0) / 255.0).pow(gamma) * 255.0
+            images[index] = value
+    output["nnunet_image"] = nn_aug
+    output["biomedparse_image"] = bp_aug
+    output["gt"] = gt_aug
+    return output
+
+
 class ROICache:
     """Slice-keyed fixed ROI cache generated after anatomy warm-up."""
 

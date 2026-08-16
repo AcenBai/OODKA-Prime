@@ -97,6 +97,22 @@ class TrainConfig:
     roi_refresh_every: int = 0
     lambda_anchor: float = 1.0
     lambda_refine: float = 1.0
+    roi_v2_hard_switch: bool = False
+    roi_visibility_min_coverage: float = 0.01
+    roi_jitter_center_fraction: float = 0.0
+    roi_jitter_scale_min: float = 1.0
+    roi_jitter_scale_max: float = 1.0
+    lge_augment: bool = False
+    augment_rotation_degrees: float = 10.0
+    augment_scale_min: float = 0.95
+    augment_scale_max: float = 1.05
+    augment_translation_fraction: float = 0.05
+    augment_horizontal_flip_probability: float = 0.5
+    augment_vertical_flip_probability: float = 0.2
+    augment_intensity_probability: float = 0.8
+    best_test_on_improvement: bool = False
+    best_test_device: str = "cuda:2"
+    best_test_batch_size: int = 18
 
     n_epochs: int = 100
     batch_size: int = 1
