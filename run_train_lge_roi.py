@@ -98,9 +98,13 @@ def main() -> None:
         lambda_refine=1.0,
         roi_v2_hard_switch=args.v2,
         roi_visibility_min_coverage=0.01,
-        roi_jitter_center_fraction=0.03 if args.v2 else 0.0,
+        roi_jitter_center_fraction=(
+            0.03 if args.v2 and not args.no_augment else 0.0
+        ),
         roi_jitter_scale_min=1.0,
-        roi_jitter_scale_max=1.15 if args.v2 else 1.0,
+        roi_jitter_scale_max=(
+            1.15 if args.v2 and not args.no_augment else 1.0
+        ),
         lge_augment=args.v2 and not args.no_augment,
         augment_rotation_degrees=10.0,
         augment_scale_min=0.95,
