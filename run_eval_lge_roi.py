@@ -99,11 +99,19 @@ def main() -> None:
     parser.add_argument("--case_limit", type=int, default=0)
     parser.add_argument(
         "--decision",
-        choices=("flat", "hierarchical"),
+        choices=("flat", "hierarchical", "independent"),
         default="flat",
         help="Final cross-pass decision rule.",
     )
+    parser.add_argument(
+        "--independent_threshold",
+        type=float,
+        default=0.5,
+        help="Sigmoid threshold for independent non-exclusive masks.",
+    )
     args = parser.parse_args()
+    if not 0.0 < args.independent_threshold < 1.0:
+        raise ValueError("--independent_threshold must be in (0,1)")
 
     device = torch.device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location=device)
@@ -179,6 +187,12 @@ def main() -> None:
     maybe_mkdir_p(args.out_dir)
     pred_dir = os.path.join(args.out_dir, "pred_nii")
     maybe_mkdir_p(pred_dir)
+    independent_dirs = {}
+    if args.decision == "independent":
+        for class_id, class_name in MYOPS_LGE_ROI_FINAL_NAMES.items():
+            class_dir = os.path.join(args.out_dir, "pred_binary", class_name)
+            maybe_mkdir_p(class_dir)
+            independent_dirs[class_id] = class_dir
     rows = []
     all_rois = []
     coverage_values = []
@@ -189,6 +203,8 @@ def main() -> None:
     total_myo_empty_slices = 0
     probability_inside = []
     probability_outside = []
+    independent_predicted = np.zeros(5, dtype=np.int64)
+    independent_target = np.zeros(5, dtype=np.int64)
 
     for case_id in tqdm(case_ids, desc=f"LGE ROI {args.split}"):
         image_files = find_raw_image_files(images_dir, case_id, ending)
@@ -306,6 +322,65 @@ def main() -> None:
                 )
                 coverage_values.append(inside / total if total else 1.0)
 
+        gt_raw, spacing = read_nifti_as_zyx_with_spacing(label_path)
+        target = _remap_gt(gt_raw)
+        if args.decision == "independent":
+            threshold_logit = float(
+                np.log(
+                    args.independent_threshold
+                    / (1.0 - args.independent_threshold)
+                )
+            )
+            row = {"case_id": case_id}
+            present_scores = []
+            for class_id in range(1, 5):
+                binary = preprocessor.prompt_logits_to_raw_segmentation(
+                    final_prompt_logits[class_id - 1 : class_id]
+                    - threshold_logit,
+                    {0: 1},
+                    properties,
+                ) > 0
+                if tuple(binary.shape) != raw_shape:
+                    raise ValueError(
+                        f"{case_id}: restored={binary.shape}, raw={raw_shape}"
+                    )
+                binary_target = target == class_id
+                denominator = int(binary.sum() + binary_target.sum())
+                raw_dice = (
+                    2.0 * int((binary & binary_target).sum()) / denominator
+                    if denominator > 0
+                    else None
+                )
+                dice_value = raw_dice if binary_target.any() else None
+                row[f"dice_{class_id}"] = dice_value
+                if dice_value is not None:
+                    present_scores.append(dice_value)
+                precision, recall, hd95 = precision_recall_hd95_no_ignore(
+                    binary.astype(np.int16),
+                    binary_target.astype(np.int16),
+                    (1,),
+                    spacing,
+                )
+                row[f"prec_{class_id}"] = precision.get(1)
+                row[f"rec_{class_id}"] = recall.get(1)
+                row[f"hd95_{class_id}"] = hd95.get(1)
+                independent_predicted[class_id] += int(binary.sum())
+                independent_target[class_id] += int(binary_target.sum())
+                output = sitk.GetImageFromArray(binary.astype(np.int16))
+                output.CopyInformation(sitk.ReadImage(label_path))
+                sitk.WriteImage(
+                    output,
+                    os.path.join(independent_dirs[class_id], case_id + ending),
+                )
+            row["dice_mean_gt"] = (
+                float(np.mean(present_scores)) if present_scores else None
+            )
+            # Keep a stable CSV column order shared with the exclusive path.
+            ordered = {"case_id": row.pop("case_id"), "dice_mean_gt": row.pop("dice_mean_gt")}
+            ordered.update(row)
+            rows.append(ordered)
+            continue
+
         prediction = preprocessor.prompt_logits_to_raw_segmentation(
             final_prompt_logits,
             {0: 1, 1: 2, 2: 3, 3: 4},
@@ -315,8 +390,6 @@ def main() -> None:
             raise ValueError(
                 f"{case_id}: restored={prediction.shape}, raw={raw_shape}"
             )
-        gt_raw, spacing = read_nifti_as_zyx_with_spacing(label_path)
-        target = _remap_gt(gt_raw)
         encoded = target.astype(np.int64) * 5 + prediction.astype(np.int64)
         confusion += np.bincount(encoded.ravel(), minlength=25).reshape(5, 5)
         dice_pc, dice_mean, _ = dice_no_ignore(
@@ -371,13 +444,18 @@ def main() -> None:
         np.mean(probability_outside) if probability_outside else 0.0
     )
     summary["roi"] = roi_summary
-    summary["confusion_gt_rows_pred_columns"] = confusion.tolist()
-    summary["gt_voxel_fraction"] = (
-        confusion.sum(axis=1) / max(1, confusion.sum())
-    ).tolist()
-    summary["pred_voxel_fraction"] = (
-        confusion.sum(axis=0) / max(1, confusion.sum())
-    ).tolist()
+    if args.decision == "independent":
+        summary["independent_threshold"] = args.independent_threshold
+        summary["independent_predicted_voxels"] = independent_predicted.tolist()
+        summary["independent_target_voxels"] = independent_target.tolist()
+    else:
+        summary["confusion_gt_rows_pred_columns"] = confusion.tolist()
+        summary["gt_voxel_fraction"] = (
+            confusion.sum(axis=1) / max(1, confusion.sum())
+        ).tolist()
+        summary["pred_voxel_fraction"] = (
+            confusion.sum(axis=0) / max(1, confusion.sum())
+        ).tolist()
     with open(os.path.join(args.out_dir, "summary.json"), "w") as handle:
         json.dump(summary, handle, indent=2)
     print(json.dumps(summary, indent=2))
