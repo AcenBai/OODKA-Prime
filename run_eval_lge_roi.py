@@ -50,6 +50,45 @@ def _remap_gt(array: np.ndarray) -> np.ndarray:
     return output
 
 
+def _hierarchical_foreground_logits(
+    anatomy_logits: torch.Tensor,
+    refinement_logits: torch.Tensor,
+    *,
+    selected_logit: float = 20.0,
+    rejected_logit: float = -20.0,
+) -> torch.Tensor:
+    """Encode strict coarse-to-fine decisions as four foreground logits."""
+    if anatomy_logits.ndim != 5 or anatomy_logits.shape[1:3] != (3, 1):
+        raise ValueError("anatomy_logits must be [B,3,1,H,W]")
+    if refinement_logits.ndim != 5 or refinement_logits.shape[1:3] != (2, 1):
+        raise ValueError("refinement_logits must be [B,2,1,H,W]")
+    if (
+        anatomy_logits.shape[0] != refinement_logits.shape[0]
+        or anatomy_logits.shape[-2:] != refinement_logits.shape[-2:]
+    ):
+        raise ValueError(
+            "Anatomy and refinement logits must share batch/spatial shape"
+        )
+
+    anatomy = anatomy_logits[:, :, 0]
+    refinement = refinement_logits[:, :, 0]
+    background = torch.zeros_like(anatomy[:, :1])
+    coarse = torch.cat([background, anatomy], dim=1).argmax(dim=1)
+    fine = refinement.argmax(dim=1) + 3  # normal=3, scar-edema=4
+    final_label = torch.where(coarse == 3, fine, coarse)
+
+    foreground = anatomy.new_full(
+        (anatomy.shape[0], 4, *anatomy.shape[-2:]), rejected_logit
+    )
+    for class_id in range(1, 5):
+        foreground[:, class_id - 1] = torch.where(
+            final_label == class_id,
+            foreground.new_tensor(selected_logit),
+            foreground[:, class_id - 1],
+        )
+    return foreground[:, :, None]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
@@ -58,6 +97,12 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--case_limit", type=int, default=0)
+    parser.add_argument(
+        "--decision",
+        choices=("flat", "hierarchical"),
+        default="flat",
+        help="Final cross-pass decision rule.",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -216,9 +261,14 @@ def main() -> None:
                     rois,
                     (cfg.image_size, cfg.image_size),
                 )
-                foreground_scores = torch.cat(
-                    [anatomy[:, 0:2], restored], dim=1
-                )
+                if args.decision == "hierarchical":
+                    foreground_scores = _hierarchical_foreground_logits(
+                        anatomy, restored
+                    )
+                else:
+                    foreground_scores = torch.cat(
+                        [anatomy[:, 0:2], restored], dim=1
+                    )
                 resized = F.interpolate(
                     foreground_scores[:, :, 0],
                     size=spatial_shape[1:],
@@ -292,6 +342,7 @@ def main() -> None:
         writer.writerows(rows)
     summary = {
         "n_cases": len(rows),
+        "decision": args.decision,
         "mean_dice_gt_present": float(np.mean([r["dice_mean_gt"] for r in rows])),
         "class_names": MYOPS_LGE_ROI_FINAL_NAMES,
     }

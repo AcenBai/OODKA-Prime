@@ -10,6 +10,7 @@ from oodka.data.lge_roi import (
     remap_grouped_labels,
     restore_roi_logits,
 )
+from run_eval_lge_roi import _hierarchical_foreground_logits
 
 
 def test_roi_generation_expands_about_center_and_clips():
@@ -62,3 +63,18 @@ def test_roi_cache_roundtrip(tmp_path):
     assert payload["metadata"]["threshold"] == 0.3
     restored = ROICache.load(path)
     assert restored.get("case", 3) == cache.get("case", 3)
+
+
+def test_hierarchical_decision_only_refines_total_myo():
+    anatomy = torch.full((1, 3, 1, 1, 4), -5.0)
+    # coarse outputs: background, LV, RV, total-MYO
+    anatomy[0, 0, 0, 0, 1] = 4.0
+    anatomy[0, 1, 0, 0, 2] = 4.0
+    anatomy[0, 2, 0, 0, 3] = 4.0
+    refinement = torch.zeros((1, 2, 1, 1, 4))
+    refinement[0, 1, 0, 0] = 10.0
+
+    foreground = _hierarchical_foreground_logits(anatomy, refinement)
+    background = torch.zeros_like(foreground[:, :1])
+    labels = torch.cat([background, foreground], dim=1).argmax(dim=1)
+    assert labels.flatten().tolist() == [0, 1, 2, 4]
