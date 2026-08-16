@@ -145,6 +145,7 @@ class OODKATrainer:
             window_width=cfg.window_width,
             low_percentile=cfg.low_percentile,
             high_percentile=cfg.high_percentile,
+            pseudo_rgb_mode=cfg.pseudo_rgb_mode,
             raw_cache_cases=cfg.raw_cache_cases,
             require_no_crop=cfg.require_no_crop,
             biomedparse_modality=cfg.biomedparse_modality,

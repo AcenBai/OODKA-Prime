@@ -86,6 +86,17 @@ class TrainConfig:
     window_width: float = 400.0
     low_percentile: float = 1.0
     high_percentile: float = 99.0
+    pseudo_rgb_mode: str = "adjacent"
+
+    # LGE full-image anatomy + predicted-myocardium ROI refinement.
+    lge_roi_two_pass: bool = False
+    roi_warmup_epochs: int = 10
+    roi_threshold: float = 0.3
+    roi_expand: float = 1.25
+    roi_fallback: str = "full"
+    roi_refresh_every: int = 0
+    lambda_anchor: float = 1.0
+    lambda_refine: float = 1.0
 
     n_epochs: int = 100
     batch_size: int = 1
@@ -193,6 +204,7 @@ class EvalConfig:
     window_width: float = 400.0
     low_percentile: float = 1.0
     high_percentile: float = 99.0
+    pseudo_rgb_mode: str = "adjacent"
 
     tile_step_size: float = 0.5
     device: str = "cuda:0"

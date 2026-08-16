@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -287,6 +287,7 @@ def _compute_segmentation_loss_and_metrics(
     gt: torch.Tensor,
     valid_z: torch.Tensor,
     class_ids: torch.Tensor,
+    prompt_reduction: str = "mean",
 ) -> Tuple[torch.Tensor, float, Dict[int, float | None]]:
     """Vectorized BCE/Dice objective over all ``B*P`` class-volume pairs."""
     B, P, Z, H, W = logits.shape
@@ -329,7 +330,18 @@ def _compute_segmentation_loss_and_metrics(
         torch.full_like(loss_per_pair, 0.5),
         torch.ones_like(loss_per_pair),
     )
-    loss_seg = (pair_weights * loss_per_pair).sum() / pair_weights.sum().clamp_min(1e-6)
+    if prompt_reduction == "mean":
+        loss_seg = (
+            (pair_weights * loss_per_pair).sum()
+            / pair_weights.sum().clamp_min(1e-6)
+        )
+    elif prompt_reduction == "sum":
+        loss_seg = (
+            (pair_weights * loss_per_pair).sum(dim=0)
+            / pair_weights.sum(dim=0).clamp_min(1e-6)
+        ).sum()
+    else:
+        raise ValueError(f"Unknown prompt_reduction={prompt_reduction!r}")
 
     dice_values = []
     dice_per_class: Dict[int, float | None] = {}
@@ -358,6 +370,7 @@ def _compute_detached_pixel_error_maps(
     gt: torch.Tensor,
     valid_z: torch.Tensor,
     class_ids: torch.Tensor,
+    expert_class_groups: Sequence[Sequence[int]] | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return comparable prompt-wise BCE maps for student and expert.
 
@@ -382,7 +395,28 @@ def _compute_detached_pixel_error_maps(
         )
 
     with torch.no_grad():
-        selected_expert = expert_logits[:, class_ids.long()]
+        if expert_class_groups is None:
+            selected_expert = expert_logits[:, class_ids.long()]
+        else:
+            if len(expert_class_groups) != P:
+                raise ValueError(
+                    "expert_class_groups must contain one group per prompt"
+                )
+            expert_probabilities = expert_logits.float().softmax(dim=1)
+            grouped_probabilities = []
+            for group in expert_class_groups:
+                indices = torch.as_tensor(
+                    list(group), device=expert_logits.device, dtype=torch.long
+                )
+                if indices.numel() == 0 or int(indices.max()) >= expert_logits.shape[1]:
+                    raise ValueError(f"Invalid expert class group: {tuple(group)}")
+                grouped_probabilities.append(
+                    expert_probabilities.index_select(1, indices).sum(dim=1)
+                )
+            grouped = torch.stack(grouped_probabilities, dim=1).clamp(
+                1e-6, 1.0 - 1e-6
+            )
+            selected_expert = torch.logit(grouped)
         if selected_expert.shape[-3:] != (Z, H, W):
             selected_expert = F.interpolate(
                 selected_expert.float(),
@@ -425,6 +459,9 @@ def forward_one_batch(
     w_s_ot: float = 0.0,
     route_sample: bool | None = None,
     ot_expert_perturbation: str | None = None,
+    expert_class_groups: Sequence[Sequence[int]] | None = None,
+    prompt_loss_reduction: str = "mean",
+    return_logits: bool = False,
 ) -> Tuple[torch.Tensor, Dict]:
     """
     Single training/validation forward pass on a batch.
@@ -554,6 +591,7 @@ def forward_one_batch(
         gt_patches,
         valid_z,
         class_ids,
+        prompt_reduction=prompt_loss_reduction,
     )
 
     # Dynamic expert transports are a detached training-only supervision path.
@@ -564,6 +602,7 @@ def forward_one_batch(
             gt_patches,
             valid_z,
             class_ids,
+            expert_class_groups=expert_class_groups,
         )
         ot_output = fusion_modules["ot_distillation"](
             feats,
@@ -667,6 +706,8 @@ def forward_one_batch(
     for level, values in logs["ot_levels"].items():
         for name, value in values.items():
             logs[f"ot_res{level}_{name}"] = value
+    if return_logits:
+        logs["_logits"] = all_prompt_logits
     return total_loss, logs
 
 

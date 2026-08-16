@@ -48,6 +48,48 @@ MYOPS_LGE_PROMPTS = {
     ),
 }
 
+# Two-pass LGE ROI experiment. ``total_myo`` is an auxiliary localization
+# query and is never emitted as a final segmentation class.
+MYOPS_LGE_ROI_ANATOMY_PROMPTS = {
+    "1": (
+        "LGE short-axis cardiac MRI showing the blood pool within the "
+        "left ventricular cavity"
+    ),
+    "2": (
+        "LGE short-axis cardiac MRI showing the blood pool within the "
+        "right ventricular cavity"
+    ),
+    "3": (
+        "LGE short-axis cardiac MRI showing the complete left ventricular "
+        "myocardium, including normal myocardium, scar, and edema"
+    ),
+}
+
+MYOPS_LGE_ROI_REFINEMENT_PROMPTS = {
+    "1": (
+        "LGE short-axis cardiac MRI showing normal left ventricular "
+        "myocardium"
+    ),
+    "2": (
+        "LGE short-axis cardiac MRI showing pathological myocardial tissue "
+        "consisting of scar or edema within the left ventricular myocardium"
+    ),
+}
+
+# Original Dataset011 labels grouped for each branch.
+MYOPS_LGE_ROI_ANATOMY_GROUPS = ((3,), (5,), (1, 2, 4))
+MYOPS_LGE_ROI_REFINEMENT_GROUPS = ((4,), (1, 2))
+
+# Final deployment labels: background=0, LV=1, RV=2, normal-MYO=3,
+# scar+edema=4.
+MYOPS_LGE_ROI_FINAL_GROUPS = ((3,), (5,), (4,), (1, 2))
+MYOPS_LGE_ROI_FINAL_NAMES = {
+    1: "LV",
+    2: "RV",
+    3: "normal_myo",
+    4: "scar_edema_on_myo",
+}
+
 DATASET_PROMPT_REGISTRY: Dict[str, Dict[str, str]] = {
     "Dataset009_CT_OOD": WHS_CT_PROMPTS,
     "Dataset010_WHS_MRI_OOD": WHS_MRI_PROMPTS,

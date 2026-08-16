@@ -79,12 +79,26 @@ def make_biomedparse_block(
     image_u8: np.ndarray,
     centers: Sequence[int],
     image_size: int,
+    *,
+    pseudo_rgb_mode: str = "adjacent",
 ) -> torch.Tensor:
-    """Build adjacent-slice pseudo-RGB images as ``[Z,3,H,W]``."""
+    """Build adjacent-slice or center-repeat pseudo-RGB images."""
+    if pseudo_rgb_mode not in {"adjacent", "center_repeat"}:
+        raise ValueError(
+            "pseudo_rgb_mode must be 'adjacent' or 'center_repeat', got "
+            f"{pseudo_rgb_mode!r}"
+        )
     block = []
     for z in centers:
         z = int(z)
-        z_indices = (max(z - 1, 0), z, min(z + 1, image_u8.shape[0] - 1))
+        if pseudo_rgb_mode == "center_repeat":
+            z_indices = (z, z, z)
+        else:
+            z_indices = (
+                max(z - 1, 0),
+                z,
+                min(z + 1, image_u8.shape[0] - 1),
+            )
         block.append(np.stack([image_u8[i] for i in z_indices]))
     return _resize_images(torch.from_numpy(np.stack(block)).float(), image_size)
 
@@ -113,6 +127,7 @@ class FullSliceBlockDataset(Dataset):
         window_width: float = 400.0,
         low_percentile: float = 1.0,
         high_percentile: float = 99.0,
+        pseudo_rgb_mode: str = "adjacent",
         raw_cache_cases: int = 2,
         require_no_crop: bool = True,
         biomedparse_modality: int = 0,
@@ -130,6 +145,7 @@ class FullSliceBlockDataset(Dataset):
         self.window_width = float(window_width)
         self.low_percentile = float(low_percentile)
         self.high_percentile = float(high_percentile)
+        self.pseudo_rgb_mode = str(pseudo_rgb_mode)
         self.raw_cache_cases = max(1, int(raw_cache_cases))
         self.require_no_crop = bool(require_no_crop)
         self.biomedparse_modality = int(biomedparse_modality)
@@ -144,6 +160,10 @@ class FullSliceBlockDataset(Dataset):
             raise ValueError(f"block_z must be positive, got {self.block_z}")
         if self.norm_mode not in {"ct", "mri"}:
             raise ValueError(f"norm_mode must be 'ct' or 'mri', got {self.norm_mode!r}")
+        if self.pseudo_rgb_mode not in {"adjacent", "center_repeat"}:
+            raise ValueError(
+                "pseudo_rgb_mode must be 'adjacent' or 'center_repeat'"
+            )
         if not self.case_ids:
             raise ValueError("FullSliceBlockDataset needs at least one case")
 
@@ -371,7 +391,12 @@ class FullSliceBlockDataset(Dataset):
 
         valid_centers = list(range(z_start, z_start + valid_count))
         centers = valid_centers + [valid_centers[-1]] * (self.block_z - valid_count)
-        bp_images = make_biomedparse_block(image, centers, self.image_size)
+        bp_images = make_biomedparse_block(
+            image,
+            centers,
+            self.image_size,
+            pseudo_rgb_mode=self.pseudo_rgb_mode,
+        )
 
         nn_array = self._open_b2nd(case_id)
         nn_valid = np.asarray(
