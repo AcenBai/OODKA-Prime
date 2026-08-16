@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_dir="/data4/baihexiang/SegMan/spatial_combination"
 python_bin="/data4/baihexiang/conda_envs/biomedparse_v2/bin/python"
-experiment_dir="${1:-${repo_dir}/experiments/lge_roi_v2_z1_b18_100ep_20260817}"
+experiment_dir="${1:-${repo_dir}/experiments/lge_roi_v2_z1_b18_30ep_20260817}"
 
 cd "${repo_dir}"
 mkdir -p "${experiment_dir}"
@@ -11,7 +11,7 @@ mkdir -p "${experiment_dir}"
 "${python_bin}" run_train_lge_roi.py \
   --v2 \
   --device cuda:1 \
-  --n_epochs 100 \
+  --n_epochs 30 \
   --warmup_epochs 10 \
   --batch_size 18 \
   --num_workers 4 \
