@@ -92,7 +92,9 @@ def _hierarchical_foreground_logits(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--split", choices=("val", "test"), default="test")
+    parser.add_argument(
+        "--split", choices=("train", "val", "test"), default="test"
+    )
     parser.add_argument("--device", default="cuda:1")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--out_dir", required=True)
@@ -135,9 +137,9 @@ def main() -> None:
     with open(cfg.dataset_json_path, encoding="utf-8") as handle:
         dataset_json = json.load(handle)
     ending = dataset_json.get("file_ending", ".nii.gz")
-    if args.split == "val":
+    if args.split in {"train", "val"}:
         with open(cfg.splits_final_json, encoding="utf-8") as handle:
-            case_ids = json.load(handle)[cfg.fold]["val"]
+            case_ids = json.load(handle)[cfg.fold][args.split]
         images_dir, labels_dir = cfg.imagesTr_dir, cfg.labelsTr_dir
     else:
         case_ids = discover_case_ids_from_dir(cfg.labelsTs_dir, ending)
