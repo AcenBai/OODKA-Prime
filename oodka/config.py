@@ -99,6 +99,7 @@ class TrainConfig:
     lambda_anchor: float = 1.0
     lambda_refine: float = 1.0
     roi_v2_hard_switch: bool = False
+    lge_split_pathology: bool = False
     roi_visibility_min_coverage: float = 0.01
     roi_jitter_center_fraction: float = 0.0
     roi_jitter_scale_min: float = 1.0

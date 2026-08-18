@@ -85,10 +85,27 @@ MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS = {
     "4": MYOPS_LGE_ROI_REFINEMENT_PROMPTS["2"],
 }
 
+# V3 keeps the V2 cavity-aware ROI refinement, but separates the two
+# pathological tissues so their local competition can be measured directly.
+MYOPS_LGE_ROI_V3_REFINEMENT_PROMPTS = {
+    "1": MYOPS_LGE_ROI_ANATOMY_PROMPTS["1"],
+    "2": MYOPS_LGE_ROI_ANATOMY_PROMPTS["2"],
+    "3": MYOPS_LGE_ROI_REFINEMENT_PROMPTS["1"],
+    "4": (
+        "LGE short-axis cardiac MRI showing pathological myocardial scar "
+        "tissue within the left ventricular myocardium"
+    ),
+    "5": (
+        "LGE short-axis cardiac MRI showing pathological myocardial edema "
+        "within the left ventricular myocardium"
+    ),
+}
+
 # Original Dataset011 labels grouped for each branch.
 MYOPS_LGE_ROI_ANATOMY_GROUPS = ((3,), (5,), (1, 2, 4))
 MYOPS_LGE_ROI_REFINEMENT_GROUPS = ((4,), (1, 2))
 MYOPS_LGE_ROI_V2_REFINEMENT_GROUPS = ((3,), (5,), (4,), (1, 2))
+MYOPS_LGE_ROI_V3_REFINEMENT_GROUPS = ((3,), (5,), (4,), (1,), (2,))
 
 # Final deployment labels: background=0, LV=1, RV=2, normal-MYO=3,
 # scar+edema=4.
@@ -98,6 +115,14 @@ MYOPS_LGE_ROI_FINAL_NAMES = {
     2: "RV",
     3: "normal_myo",
     4: "scar_edema_on_myo",
+}
+MYOPS_LGE_ROI_SPLIT_FINAL_GROUPS = MYOPS_LGE_ROI_V3_REFINEMENT_GROUPS
+MYOPS_LGE_ROI_SPLIT_FINAL_NAMES = {
+    1: "LV",
+    2: "RV",
+    3: "normal_myo",
+    4: "scar_on_myo",
+    5: "edema_on_myo",
 }
 
 DATASET_PROMPT_REGISTRY: Dict[str, Dict[str, str]] = {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two-pass predicted-ROI inference for the four-class LGE experiment."""
+"""Two-pass predicted-ROI inference for merged or split-pathology LGE."""
 
 from __future__ import annotations
 
@@ -28,9 +28,13 @@ from oodka.data.lge_roi import (
 from oodka.data.slice_dataset import make_biomedparse_block
 from oodka.models.prompts import (
     MYOPS_LGE_ROI_ANATOMY_PROMPTS,
+    MYOPS_LGE_ROI_FINAL_GROUPS,
     MYOPS_LGE_ROI_FINAL_NAMES,
     MYOPS_LGE_ROI_REFINEMENT_PROMPTS,
+    MYOPS_LGE_ROI_SPLIT_FINAL_GROUPS,
+    MYOPS_LGE_ROI_SPLIT_FINAL_NAMES,
     MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS,
+    MYOPS_LGE_ROI_V3_REFINEMENT_PROMPTS,
 )
 from oodka.train.forward import predict_block_logits_per_class
 from oodka.train.model_builder import (
@@ -47,12 +51,10 @@ from oodka.utils.io_utils import (
 from oodka.utils.metrics import dice_no_ignore, precision_recall_hd95_no_ignore
 
 
-def _remap_gt(array: np.ndarray) -> np.ndarray:
+def _remap_gt(array: np.ndarray, groups=MYOPS_LGE_ROI_FINAL_GROUPS) -> np.ndarray:
     output = np.zeros(array.shape, dtype=np.int16)
-    output[array == 3] = 1
-    output[array == 5] = 2
-    output[array == 4] = 3
-    output[(array == 1) | (array == 2)] = 4
+    for class_id, source_ids in enumerate(groups, start=1):
+        output[np.isin(array, source_ids)] = class_id
     return output
 
 
@@ -125,10 +127,12 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location=device)
     checkpoint_format = checkpoint.get("format")
     if checkpoint_format not in {
-        "oodka_lge_roi_v1", "oodka_lge_roi_v2", "oodka_lge_flat_v1"
+        "oodka_lge_roi_v1", "oodka_lge_roi_v2",
+        "oodka_lge_roi_v3_split5", "oodka_lge_flat_v1"
     }:
         raise ValueError("Checkpoint is not an OODKA LGE ROI model")
-    is_v2 = checkpoint_format == "oodka_lge_roi_v2"
+    is_split = checkpoint_format == "oodka_lge_roi_v3_split5"
+    is_v2 = checkpoint_format in {"oodka_lge_roi_v2", "oodka_lge_roi_v3_split5"}
     is_flat = checkpoint_format == "oodka_lge_flat_v1"
     decision = args.decision
     if decision == "auto":
@@ -174,9 +178,19 @@ def main() -> None:
     )
     anatomy_features = build_prompt_features(model, anatomy_prompts, device)
     refinement_prompts = (
-        MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
+        MYOPS_LGE_ROI_V3_REFINEMENT_PROMPTS
+        if is_split else MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
         if is_v2 else MYOPS_LGE_ROI_REFINEMENT_PROMPTS
     )
+    final_groups = (
+        MYOPS_LGE_ROI_SPLIT_FINAL_GROUPS
+        if is_split else MYOPS_LGE_ROI_FINAL_GROUPS
+    )
+    final_names = (
+        MYOPS_LGE_ROI_SPLIT_FINAL_NAMES
+        if is_split else MYOPS_LGE_ROI_FINAL_NAMES
+    )
+    final_count = len(final_groups)
     refinement_features = build_prompt_features(
         model, refinement_prompts, device
     )
@@ -217,22 +231,22 @@ def main() -> None:
     maybe_mkdir_p(pred_dir)
     independent_dirs = {}
     if decision == "independent":
-        for class_id, class_name in MYOPS_LGE_ROI_FINAL_NAMES.items():
+        for class_id, class_name in final_names.items():
             class_dir = os.path.join(args.out_dir, "pred_binary", class_name)
             maybe_mkdir_p(class_dir)
             independent_dirs[class_id] = class_dir
     rows = []
     all_rois = []
     coverage_values = []
-    confusion = np.zeros((5, 5), dtype=np.int64)
+    confusion = np.zeros((final_count + 1, final_count + 1), dtype=np.int64)
     total_myo_intersection = 0
     total_myo_predicted = 0
     total_myo_target = 0
     total_myo_empty_slices = 0
     probability_inside = []
     probability_outside = []
-    independent_predicted = np.zeros(5, dtype=np.int64)
-    independent_target = np.zeros(5, dtype=np.int64)
+    independent_predicted = np.zeros(final_count + 1, dtype=np.int64)
+    independent_target = np.zeros(final_count + 1, dtype=np.int64)
 
     for case_id in tqdm(
         case_ids, desc=f"LGE {'flat' if is_flat else 'ROI'} {args.split}"
@@ -245,7 +259,7 @@ def main() -> None:
             image_files, label_path, modality=0
         )
         spatial_shape = bp_u8.shape
-        final_prompt_logits = np.zeros((4, *spatial_shape), dtype=np.float32)
+        final_prompt_logits = np.zeros((final_count, *spatial_shape), dtype=np.float32)
         for start in range(0, spatial_shape[0], args.batch_size):
             z_indices = list(
                 range(start, min(spatial_shape[0], start + args.batch_size))
@@ -304,7 +318,7 @@ def main() -> None:
                         valid,
                         (cfg.image_size, cfg.image_size),
                         refinement_features,
-                        4 if is_v2 else 2,
+                        len(refinement_prompts),
                         model,
                         modules,
                         device,
@@ -366,7 +380,7 @@ def main() -> None:
                 coverage_values.append(inside / total if total else 1.0)
 
         gt_raw, spacing = read_nifti_as_zyx_with_spacing(label_path)
-        target = _remap_gt(gt_raw)
+        target = _remap_gt(gt_raw, final_groups)
         if decision == "independent":
             threshold_logit = float(
                 np.log(
@@ -376,7 +390,7 @@ def main() -> None:
             )
             row = {"case_id": case_id}
             present_scores = []
-            for class_id in range(1, 5):
+            for class_id in range(1, final_count + 1):
                 binary = preprocessor.prompt_logits_to_raw_segmentation(
                     final_prompt_logits[class_id - 1 : class_id]
                     - threshold_logit,
@@ -426,23 +440,26 @@ def main() -> None:
 
         prediction = preprocessor.prompt_logits_to_raw_segmentation(
             final_prompt_logits,
-            {0: 1, 1: 2, 2: 3, 3: 4},
+            {index: index + 1 for index in range(final_count)},
             properties,
         )
         if tuple(prediction.shape) != raw_shape:
             raise ValueError(
                 f"{case_id}: restored={prediction.shape}, raw={raw_shape}"
             )
-        encoded = target.astype(np.int64) * 5 + prediction.astype(np.int64)
-        confusion += np.bincount(encoded.ravel(), minlength=25).reshape(5, 5)
+        width = final_count + 1
+        encoded = target.astype(np.int64) * width + prediction.astype(np.int64)
+        confusion += np.bincount(
+            encoded.ravel(), minlength=width * width
+        ).reshape(width, width)
         dice_pc, dice_mean, _ = dice_no_ignore(
-            prediction, target, (1, 2, 3, 4)
+            prediction, target, tuple(range(1, final_count + 1))
         )
         precision, recall, hd95 = precision_recall_hd95_no_ignore(
-            prediction, target, (1, 2, 3, 4), spacing
+            prediction, target, tuple(range(1, final_count + 1)), spacing
         )
         row = {"case_id": case_id, "dice_mean_gt": dice_mean}
-        for class_id in range(1, 5):
+        for class_id in range(1, final_count + 1):
             row[f"dice_{class_id}"] = dice_pc.get(class_id)
             row[f"prec_{class_id}"] = precision.get(class_id)
             row[f"rec_{class_id}"] = recall.get(class_id)
@@ -461,9 +478,9 @@ def main() -> None:
         "decision": decision,
         "checkpoint_format": checkpoint_format,
         "mean_dice_gt_present": float(np.mean([r["dice_mean_gt"] for r in rows])),
-        "class_names": MYOPS_LGE_ROI_FINAL_NAMES,
+        "class_names": final_names,
     }
-    for class_id in range(1, 5):
+    for class_id in range(1, final_count + 1):
         values = [r[f"dice_{class_id}"] for r in rows if r[f"dice_{class_id}"] is not None]
         summary[f"dice_{class_id}_mean"] = float(np.mean(values)) if values else None
     if not is_flat:

@@ -28,9 +28,6 @@ from ..data.lge_roi import (
     roi_diagnostics,
     roi_prompt_visibility,
 )
-from ..models.prompts import (
-    MYOPS_LGE_ROI_FINAL_NAMES,
-)
 from ..utils.io_utils import maybe_mkdir_p
 from .engine import OODKATrainer, learning_rate_scale, load_fold_cases, set_seed
 from .forward import forward_one_batch, predict_block_logits_per_class
@@ -364,16 +361,20 @@ class LGEROIMixedTrainer(OODKATrainer):
                             dim=1,
                         )
                     prediction = final_scores.argmax(dim=1)
+                    final_groups = (
+                        self.refinement_groups
+                        if self.cfg.roi_v2_hard_switch
+                        else ((3,), (5,), (4,), (1, 2))
+                    )
                     target = remap_grouped_labels(
-                        batch_data["gt"],
-                        ((3,), (5,), (4,), (1, 2)),
+                        batch_data["gt"], final_groups
                     )
                     _update_case_counts(
                         case_counts,
                         batch_data["case_id"],
                         prediction,
                         target,
-                        4,
+                        len(final_groups),
                     )
                 else:
                     if not mixed:
@@ -423,7 +424,11 @@ class LGEROIMixedTrainer(OODKATrainer):
 
         for key in meter:
             meter[key] /= max(1, n_batches)
-        class_count = 4 if mixed else len(self.anatomy_groups)
+        class_count = (
+            len(self.refinement_groups)
+            if mixed and self.cfg.roi_v2_hard_switch
+            else (4 if mixed else len(self.anatomy_groups))
+        )
         macro, per_class = _case_dice_from_counts(case_counts, class_count)
         meter["exclusive_macro_dice"] = macro
         meter["exclusive_dice_per_class"] = per_class
@@ -538,7 +543,9 @@ class LGEROIMixedTrainer(OODKATrainer):
                 "oodka_lge_flat_v1"
                 if self.cfg.lge_flat_four_prompt
                 else (
-                    "oodka_lge_roi_v2"
+                    "oodka_lge_roi_v3_split5"
+                    if self.cfg.lge_split_pathology
+                    else "oodka_lge_roi_v2"
                     if self.cfg.roi_v2_hard_switch
                     else "oodka_lge_roi_v1"
                 )
@@ -555,7 +562,9 @@ class LGEROIMixedTrainer(OODKATrainer):
             prefix = "fusion_lge_flat"
         else:
             prefix = (
-                "fusion_lge_roi_v2"
+                "fusion_lge_roi_v3_split5"
+                if self.cfg.lge_split_pathology
+                else "fusion_lge_roi_v2"
                 if self.cfg.roi_v2_hard_switch else "fusion_lge_roi"
             )
         filename = f"{prefix}_best.pth" if best else f"{prefix}_epoch{epoch:03d}.pth"
@@ -567,7 +576,9 @@ class LGEROIMixedTrainer(OODKATrainer):
             prefix = "fusion_lge_flat"
         else:
             prefix = (
-                "fusion_lge_roi_v2"
+                "fusion_lge_roi_v3_split5"
+                if self.cfg.lge_split_pathology
+                else "fusion_lge_roi_v2"
                 if self.cfg.roi_v2_hard_switch else "fusion_lge_roi"
             )
         checkpoint = os.path.join(self.cfg.output_dir, f"{prefix}_best.pth")
@@ -643,7 +654,7 @@ class LGEROIMixedTrainer(OODKATrainer):
         cache_loader, _ = self._make_loader(train_dataset, shuffle=False)
         val_loader, val_sampler = self._make_loader(val_dataset, shuffle=False)
         log(
-            f"LGE {'flat-4' if cfg.lge_flat_four_prompt else ('ROI v2' if cfg.roi_v2_hard_switch else 'ROI v1')}: "
+            f"LGE {'flat-4' if cfg.lge_flat_four_prompt else ('ROI v3 split-5' if cfg.lge_split_pathology else ('ROI v2' if cfg.roi_v2_hard_switch else 'ROI v1'))}: "
             f"train={len(train_ids)} cases/{len(train_dataset)} slices, "
             f"val={len(val_ids)} cases/{len(val_dataset)} slices"
         )

@@ -20,6 +20,8 @@ from oodka.models.prompts import (
     MYOPS_LGE_ROI_REFINEMENT_PROMPTS,
     MYOPS_LGE_ROI_V2_REFINEMENT_GROUPS,
     MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS,
+    MYOPS_LGE_ROI_V3_REFINEMENT_GROUPS,
+    MYOPS_LGE_ROI_V3_REFINEMENT_PROMPTS,
 )
 from oodka.train.lge_roi_engine import LGEROIMixedTrainer
 from oodka.train.model_builder import (
@@ -55,6 +57,11 @@ def main() -> None:
         help="ROI predicts LV/RV/normal/scar-edema with hard spatial switching.",
     )
     parser.add_argument("--no_augment", action="store_true")
+    parser.add_argument(
+        "--split_pathology",
+        action="store_true",
+        help="ROI V2 with separate scar and edema final prompts/classes.",
+    )
     parser.add_argument(
         "--flat_four_prompt",
         action="store_true",
@@ -103,6 +110,7 @@ def main() -> None:
         lambda_anchor=1.0,
         lambda_refine=1.0,
         roi_v2_hard_switch=args.v2 and not args.flat_four_prompt,
+        lge_split_pathology=args.split_pathology,
         roi_visibility_min_coverage=0.01,
         roi_jitter_center_fraction=(
             0.03 if args.v2 and not args.no_augment else 0.0
@@ -159,14 +167,20 @@ def main() -> None:
     anatomy_features = build_prompt_features(
         model_biomedparse, anatomy_prompts, device
     )
-    refinement_prompts = (
-        MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
-        if args.v2 else MYOPS_LGE_ROI_REFINEMENT_PROMPTS
-    )
-    refinement_groups = (
-        MYOPS_LGE_ROI_V2_REFINEMENT_GROUPS
-        if args.v2 else MYOPS_LGE_ROI_REFINEMENT_GROUPS
-    )
+    if args.split_pathology:
+        if not args.v2 or args.flat_four_prompt:
+            raise ValueError("--split_pathology requires --v2 ROI training")
+        refinement_prompts = MYOPS_LGE_ROI_V3_REFINEMENT_PROMPTS
+        refinement_groups = MYOPS_LGE_ROI_V3_REFINEMENT_GROUPS
+    else:
+        refinement_prompts = (
+            MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
+            if args.v2 else MYOPS_LGE_ROI_REFINEMENT_PROMPTS
+        )
+        refinement_groups = (
+            MYOPS_LGE_ROI_V2_REFINEMENT_GROUPS
+            if args.v2 else MYOPS_LGE_ROI_REFINEMENT_GROUPS
+        )
     refinement_features = build_prompt_features(
         model_biomedparse, refinement_prompts, device
     )

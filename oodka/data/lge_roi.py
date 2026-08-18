@@ -173,13 +173,13 @@ def hard_switch_foreground_logits(
     """Use Pass 1 outside each ROI and Pass 2 inside, without logit mixing."""
     if anatomy_logits.ndim != 5 or anatomy_logits.shape[1] < 2:
         raise ValueError("anatomy_logits must be [B,>=2,1,H,W]")
-    if restored_roi_logits.ndim != 5 or restored_roi_logits.shape[1] != 4:
-        raise ValueError("V2 ROI logits must be [B,4,1,H,W]")
-    batch_size, _, _, height, width = restored_roi_logits.shape
+    if restored_roi_logits.ndim != 5 or restored_roi_logits.shape[1] < 4:
+        raise ValueError("V2/V3 ROI logits must be [B,>=4,1,H,W]")
+    batch_size, prompt_count, _, height, width = restored_roi_logits.shape
     if len(rois) != batch_size:
         raise ValueError("ROI count does not match logits batch")
     outside = restored_roi_logits.new_full(
-        (batch_size, 4, 1, height, width), -20.0
+        (batch_size, prompt_count, 1, height, width), -20.0
     )
     outside[:, 0:2] = anatomy_logits[:, 0:2]
     mask = torch.zeros(

@@ -21,6 +21,9 @@ def main() -> None:
     history_path = os.path.join(args.experiment_dir, "history.json")
     with open(history_path, encoding="utf-8") as handle:
         history = json.load(handle)
+    config_path = os.path.join(args.experiment_dir, "resolved_config.json")
+    with open(config_path, encoding="utf-8") as handle:
+        config = json.load(handle)
     plots_dir = os.path.join(args.experiment_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
 
@@ -72,7 +75,12 @@ def main() -> None:
     axes[0, 2].legend()
 
     mixed_val = [row for row in val_rows if row["val"]["mode"] == "mixed"]
-    for class_id, label in ((1, "LV"), (2, "RV"), (3, "normal_myo"), (4, "scar_edema")):
+    class_labels = (
+        ((1, "LV"), (2, "RV"), (3, "normal_myo"), (4, "scar"), (5, "edema"))
+        if config.get("lge_split_pathology", False)
+        else ((1, "LV"), (2, "RV"), (3, "normal_myo"), (4, "scar_edema"))
+    )
+    for class_id, label in class_labels:
         axes[1, 0].plot(
             [row["epoch"] for row in mixed_val],
             [row["val"]["exclusive_dice_per_class"].get(str(class_id), 0.0) for row in mixed_val],

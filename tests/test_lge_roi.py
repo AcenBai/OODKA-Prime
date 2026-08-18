@@ -39,6 +39,13 @@ def test_lge_group_remapping():
     assert torch.equal(final, expected)
 
 
+def test_lge_split_pathology_group_remapping():
+    labels = torch.tensor([[[[0, 1, 2], [3, 4, 5], [-1, 0, 0]]]])
+    final = remap_grouped_labels(labels, ((3,), (5,), (4,), (1,), (2,)))
+    expected = torch.tensor([[[[0, 4, 5], [1, 3, 2], [-1, 0, 0]]]])
+    assert torch.equal(final, expected)
+
+
 def test_crop_and_restore_coordinate_contract():
     image = torch.arange(16 * 16).reshape(1, 1, 1, 16, 16).float()
     batch = {
@@ -94,6 +101,19 @@ def test_v2_hard_switch_uses_pass1_outside_and_pass2_inside():
     labels = labels.argmax(dim=1)[0, 0]
     assert labels[0, 0] == 1
     assert torch.all(labels[1:3, 1:3] == 4)
+
+
+def test_v3_hard_switch_supports_separate_edema_channel():
+    anatomy = torch.full((1, 3, 1, 4, 4), -5.0)
+    anatomy[:, 1] = 6.0
+    refinement = torch.full((1, 5, 1, 4, 4), -5.0)
+    refinement[:, 4] = 8.0
+    roi = ROICoordinates(1, 1, 3, 3)
+    foreground = hard_switch_foreground_logits(anatomy, refinement, [roi])
+    labels = torch.cat([torch.zeros_like(foreground[:, :1]), foreground], dim=1)
+    labels = labels.argmax(dim=1)[0, 0]
+    assert labels[0, 0] == 2
+    assert torch.all(labels[1:3, 1:3] == 5)
 
 
 def test_roi_visibility_skips_truncated_positive_but_keeps_true_negative():
