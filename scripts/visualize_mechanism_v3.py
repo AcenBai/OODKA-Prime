@@ -46,6 +46,15 @@ from oodka.models.feature_extraction import (
 )
 from oodka.models.ot.cost import _coordinates
 from oodka.models.prompts import build_text_prompts_for_dataset
+from oodka.models.prompts import (
+    MYOPS_LGE_ROI_ANATOMY_PROMPTS,
+    MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS,
+)
+from oodka.data.lge_roi import (
+    ROIGenerator,
+    crop_and_resize_batch,
+    remap_grouped_labels,
+)
 from oodka.train.forward import (
     _compute_detached_pixel_error_maps,
     _predict_all_prompt_logits,
@@ -558,16 +567,20 @@ def _plot_representation(
         "pixel_decoder": {"vmin": 0.0, "vmax": decoder_vmax},
         "share": {"vmin": 0.0, "vmax": 1.0},
     }
-    if scales_override is None or "student_relative" not in scales_override:
-        raise ValueError(
-            "mechanism v3 requires per-level student_relative P1/P99 scales"
-        )
     relative_maps: dict[int, np.ndarray] = {}
     scales["student_relative"] = {}
     for level in LEVELS:
-        window = scales_override["student_relative"][f"res{level}"]
-        p1 = float(window["p1"])
-        p99 = float(window["p99"])
+        if scales_override is not None and "student_relative" in scales_override:
+            window = scales_override["student_relative"][f"res{level}"]
+            p1 = float(window["p1"])
+            p99 = float(window["p99"])
+            scope = str(window.get("scope", "shared override"))
+        else:
+            student = raw_maps[level]["student"]
+            p1, p99 = (float(value) for value in np.percentile(student, (1, 99)))
+            if p99 <= p1:
+                p99 = p1 + 1e-8
+            scope = "single-pass fallback"
         if p99 <= p1:
             raise ValueError(f"Invalid Student relative scale for res{level}")
         relative_maps[level] = np.clip(
@@ -579,7 +592,7 @@ def _plot_representation(
             "p1": p1,
             "p99": p99,
             "normalization": "clip((RMS - P1) / (P99 - P1), 0, 1)",
-            "scope": "same level jointly across both selected cases",
+            "scope": scope,
         }
     _save_json(output_dir / "color_scales.json", scales)
 
@@ -1359,7 +1372,11 @@ def _plot_decision(
             last = _heat(
                 axes[row, column],
                 fused_maps[class_id][level],
-                title=f"res{level}" if row == 0 else f"P gate={mean[row, column-1]:.3f}",
+                title=(
+                    f"res{level}"
+                    if row == 0
+                    else f"mean P gate={float(mean[row].mean()):.3f}"
+                ),
                 vmax=decoder_vmax,
             )
     figure.colorbar(
@@ -1412,7 +1429,7 @@ def _plot_decision(
             _heat(
                 axes[row, 3],
                 fused_maps[class_id][level],
-                title=f"Fused, P gate={mean[prompt_index, row]:.3f}",
+                title=f"Fused, mean P gate={float(mean[prompt_index].mean()):.3f}",
                 vmax=decoder_vmax,
             )
             delta = fused_maps[class_id][level] - fixed_maps[class_id][level]
@@ -1521,7 +1538,7 @@ def main() -> None:
     parser.add_argument("--block_z", type=int, default=6)
     parser.add_argument(
         "--shared_color_scales",
-        required=True,
+        default=None,
         help=(
             "JSON with fixed raw/decomposed/pixel_decoder vmax values and "
             "per-level Student relative P1/P99"
@@ -1532,13 +1549,36 @@ def main() -> None:
         required=True,
         help="Root under which <case>_z<slice> is created",
     )
+    parser.add_argument(
+        "--lge_roi_pass",
+        choices=("none", "pass1", "pass2"),
+        default="none",
+        help=(
+            "Reproduce the LGE ROI-v2 full-image anatomy pass or predicted-ROI "
+            "refinement pass while retaining the complete mechanism-v3 dump."
+        ),
+    )
     args = parser.parse_args()
 
-    cfg = TrainConfig(device=args.device, block_z=args.block_z, num_workers=0)
-    cfg.resolve_paths()
     device = torch.device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location=device)
     checkpoint_cfg = checkpoint.get("config", {})
+    cfg = TrainConfig(
+        device=args.device,
+        block_z=args.block_z,
+        num_workers=0,
+        dataset_name=str(checkpoint_cfg.get("dataset_name", "Dataset009_CT_OOD")),
+        image_size=int(checkpoint_cfg.get("image_size", 512)),
+        norm_mode=str(checkpoint_cfg.get("norm_mode", "ct")),
+        pseudo_rgb_mode=str(checkpoint_cfg.get("pseudo_rgb_mode", "adjacent")),
+        low_percentile=float(checkpoint_cfg.get("low_percentile", 1.0)),
+        high_percentile=float(checkpoint_cfg.get("high_percentile", 99.0)),
+        require_no_crop=bool(checkpoint_cfg.get("require_no_crop", True)),
+        biomedparse_modality=int(checkpoint_cfg.get("biomedparse_modality", 0)),
+    )
+    cfg.resolve_paths()
+    if checkpoint_cfg.get("biomedparse_preproc_dir"):
+        cfg.biomedparse_preproc_dir = str(checkpoint_cfg["biomedparse_preproc_dir"])
     coordinate_weight = float(
         checkpoint_cfg.get("ot_coordinate_weight", cfg.ot_coordinate_weight)
     )
@@ -1568,8 +1608,16 @@ def main() -> None:
     if not image_files:
         raise FileNotFoundError(args.case_id)
     label_path = os.path.join(labels_dir, args.case_id + ending)
-    raw = np.asarray(sitk.GetArrayFromImage(sitk.ReadImage(image_files[0])))
-    gt_volume = np.asarray(sitk.GetArrayFromImage(sitk.ReadImage(label_path)))
+    if args.lge_roi_pass != "none":
+        aligned_path = Path(cfg.biomedparse_preproc_dir) / f"{args.case_id}.npz"
+        with np.load(aligned_path) as aligned:
+            raw = np.asarray(
+                aligned["data"][cfg.biomedparse_modality], dtype=np.float32
+            )
+            gt_volume = np.asarray(aligned["seg"][0], dtype=np.int16)
+    else:
+        raw = np.asarray(sitk.GetArrayFromImage(sitk.ReadImage(image_files[0])))
+        gt_volume = np.asarray(sitk.GetArrayFromImage(sitk.ReadImage(label_path)))
     center = _select_slice(gt_volume, args.selection, args.slice_index)
 
     dataset = FullSliceBlockDataset(
@@ -1588,6 +1636,8 @@ def main() -> None:
         raw_cache_cases=1,
         require_no_crop=cfg.require_no_crop,
         biomedparse_modality=cfg.biomedparse_modality,
+        biomedparse_preproc_dir=cfg.biomedparse_preproc_dir,
+        pseudo_rgb_mode=cfg.pseudo_rgb_mode,
     )
     record_index = next(
         index
@@ -1609,9 +1659,21 @@ def main() -> None:
     model_nnunet, model_biomedparse = load_frozen_backbones(
         cfg.nnunet_model_dir, cfg.fold, device
     )
-    prompts, prompt_to_class_id = build_text_prompts_for_dataset(
-        dataset_name=cfg.dataset_name
-    )
+    expert_class_groups = None
+    if args.lge_roi_pass == "pass1":
+        prompts = MYOPS_LGE_ROI_ANATOMY_PROMPTS
+        expert_class_groups = ((3,), (5,), (1, 2, 4))
+        prompt_to_class_id = {index: index + 1 for index in range(len(prompts))}
+        label_names = {1: "LV", 2: "RV", 3: "total_myo"}
+    elif args.lge_roi_pass == "pass2":
+        prompts = MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
+        expert_class_groups = ((3,), (5,), (4,), (1, 2))
+        prompt_to_class_id = {index: index + 1 for index in range(len(prompts))}
+        label_names = {1: "LV", 2: "RV", 3: "normal_myo", 4: "scar_edema"}
+    else:
+        prompts, prompt_to_class_id = build_text_prompts_for_dataset(
+            dataset_name=cfg.dataset_name
+        )
     prompt_features = build_prompt_features(model_biomedparse, prompts, device)
     modules = build_fusion_modules(
         model_nnunet,
@@ -1650,9 +1712,95 @@ def main() -> None:
             module.load_state_dict(checkpoint[name])
         module.eval()
 
-    output_hw = tuple(int(value) for value in gt_volume.shape[-2:])
-    image = raw[center]
-    gt = gt_volume[center]
+    roi_metadata = None
+    if args.lge_roi_pass == "pass2":
+        anatomy_prompt_features = build_prompt_features(
+            model_biomedparse, MYOPS_LGE_ROI_ANATOMY_PROMPTS, device
+        )
+        with torch.no_grad():
+            anatomy_embeds, anatomy_student = (
+                extract_biomedparse_backbone_features_2p5d(
+                    model_biomedparse,
+                    bp.to(device),
+                    device,
+                    res_names=("res2", "res3", "res4", "res5"),
+                )
+            )
+            anatomy_features = {}
+            for level in LEVELS:
+                p_value, s_value = modules[f"dis_b_res{level}"](
+                    anatomy_student[f"res{level}"]
+                )
+                anatomy_features[f"Zb{level}_p"] = p_value
+                anatomy_features[f"Zb{level}_s"] = s_value
+            anatomy_base = dict(anatomy_embeds)
+            for level in LEVELS:
+                anatomy_base.pop(f"res{level}", None)
+            anatomy_p, anatomy_multi_p = _run_pixel_decoder(
+                model_biomedparse, anatomy_base, anatomy_features, "p", B=1, Dm=1
+            )
+            anatomy_s, anatomy_multi_s = _run_pixel_decoder(
+                model_biomedparse, anatomy_base, anatomy_features, "s", B=1, Dm=1
+            )
+            anatomy_route = modules["beta_router"](
+                anatomy_prompt_features["class_emb"].detach(),
+                spatial_size=anatomy_p.shape[-2:],
+                batch_size=1,
+                sample=False,
+            )
+            anatomy_logits = _predict_all_prompt_logits(
+                sem_seg_head=model_biomedparse.sem_seg_head,
+                mask_features_p=anatomy_p,
+                mask_features_s=anatomy_s,
+                ms_p=anatomy_multi_p,
+                ms_s=anatomy_multi_s,
+                gate=anatomy_route["gate"],
+                prompt_features=anatomy_prompt_features,
+                B=1,
+                Z=1,
+                P=len(MYOPS_LGE_ROI_ANATOMY_PROMPTS),
+                output_shape=(1, *gt_block.shape[-2:]),
+            )
+        roi_generator = ROIGenerator(
+            threshold=float(checkpoint_cfg.get("roi_threshold", 0.3)),
+            expand=float(checkpoint_cfg.get("roi_expand", 1.25)),
+            fallback=str(checkpoint_cfg.get("roi_fallback", "full")),
+        )
+        roi = roi_generator.from_probability(
+            torch.sigmoid(anatomy_logits[0, 2, 0]).detach()
+        )
+        cropped = crop_and_resize_batch(
+            {
+                "nnunet_image": item["nnunet_image"].unsqueeze(0),
+                "biomedparse_image": item["biomedparse_image"].unsqueeze(0),
+                "gt": item["gt"].unsqueeze(0),
+            },
+            [roi],
+        )
+        bp = cropped["biomedparse_image"]
+        nn_input = cropped["nnunet_image"].permute(0, 2, 1, 3, 4).contiguous()
+        gt_block = cropped["gt"]
+        valid_z = torch.ones((1, 1), dtype=torch.bool)
+        image = bp[0, 0, 0].cpu().numpy()
+        center_local = 0
+        roi_metadata = {
+            "x0": roi.x0, "y0": roi.y0, "x1": roi.x1, "y1": roi.y1,
+            "width": roi.width, "height": roi.height,
+            "fallback": roi.fallback,
+        }
+
+    if expert_class_groups is not None:
+        gt_block = remap_grouped_labels(gt_block, expert_class_groups)
+        gt = gt_block[0, center_local].cpu().numpy()
+
+    if args.lge_roi_pass != "none":
+        output_hw = tuple(int(value) for value in gt_block.shape[-2:])
+        image = bp[0, center_local, 0].cpu().numpy()
+        gt = gt_block[0, center_local].cpu().numpy()
+    else:
+        output_hw = tuple(int(value) for value in gt_volume.shape[-2:])
+        image = raw[center]
+        gt = gt_volume[center]
     raw_maps: dict[int, dict[str, np.ndarray]] = {}
     branch_maps: dict[int, dict[str, np.ndarray]] = {}
     decoder_maps: dict[int, dict[str, np.ndarray]] = {}
@@ -1779,12 +1927,10 @@ def main() -> None:
             gt_block.to(device),
             valid_z.to(device),
             class_ids_tensor,
+            expert_class_groups=expert_class_groups,
         )
 
-    case_root = (
-        Path(args.output_root).resolve()
-        / f"{args.case_id}_z{center:04d}"
-    )
+    case_root = Path(args.output_root).resolve() / f"{args.case_id}_z{center:04d}"
     representation_dir = case_root / "representation"
     ot_dir = case_root / "ot"
     decision_dir = case_root / "decision"
@@ -2024,6 +2170,18 @@ def main() -> None:
         "checkpoint_sha256": _sha256(checkpoint_path),
         "checkpoint_epoch": int(checkpoint.get("epoch", -1)),
         "block_z": args.block_z,
+        "dataset_name": cfg.dataset_name,
+        "norm_mode": cfg.norm_mode,
+        "pseudo_rgb_mode": cfg.pseudo_rgb_mode,
+        "input_geometry": (
+            "predicted total_myo ROI resized to model canvas"
+            if args.lge_roi_pass == "pass2"
+            else "aligned full-slice"
+            if args.lge_roi_pass == "pass1"
+            else "raw full-slice"
+        ),
+        "lge_roi_pass": args.lge_roi_pass,
+        "predicted_roi": roi_metadata,
         "block_z_start": int(item["z_start"]),
         "center_local": center_local,
         "color_scales": scales,
