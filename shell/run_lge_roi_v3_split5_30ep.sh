@@ -21,8 +21,6 @@ mkdir -p "${experiment_dir}"
   --roi_fallback full \
   --roi_refresh_every 0 \
   --val_every_epochs 5 \
-  --test_best_on_improvement \
-  --best_test_device cuda:2 \
   --output_dir "${experiment_dir}"
 
 checkpoint="${experiment_dir}/fusion_lge_roi_v3_split5_best.pth"
