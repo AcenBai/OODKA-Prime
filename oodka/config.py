@@ -90,6 +90,7 @@ class TrainConfig:
 
     # LGE full-image anatomy + predicted-myocardium ROI refinement.
     lge_roi_two_pass: bool = False
+    lge_flat_four_prompt: bool = False
     roi_warmup_epochs: int = 10
     roi_threshold: float = 0.3
     roi_expand: float = 1.25

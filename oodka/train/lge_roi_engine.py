@@ -389,7 +389,7 @@ class LGEROIMixedTrainer(OODKATrainer):
                             batch_data["case_id"],
                             prediction,
                             target,
-                            3,
+                            len(self.anatomy_groups),
                         )
 
                 if mixed:
@@ -423,11 +423,13 @@ class LGEROIMixedTrainer(OODKATrainer):
 
         for key in meter:
             meter[key] /= max(1, n_batches)
-        class_count = 4 if mixed else 3
+        class_count = 4 if mixed else len(self.anatomy_groups)
         macro, per_class = _case_dice_from_counts(case_counts, class_count)
         meter["exclusive_macro_dice"] = macro
         meter["exclusive_dice_per_class"] = per_class
-        if mixed and train and self.cfg.lge_augment:
+        if self.cfg.lge_flat_four_prompt:
+            meter["mode"] = "flat_full_image"
+        elif mixed and train and self.cfg.lge_augment:
             meter["mode"] = "mixed_augmented_branches"
         else:
             meter["mode"] = "mixed" if mixed else "warmup_anatomy"
@@ -533,9 +535,13 @@ class LGEROIMixedTrainer(OODKATrainer):
             "best_val_dice": self.best_val_dice,
             "config": asdict(self.cfg),
             "format": (
-                "oodka_lge_roi_v2"
-                if self.cfg.roi_v2_hard_switch
-                else "oodka_lge_roi_v1"
+                "oodka_lge_flat_v1"
+                if self.cfg.lge_flat_four_prompt
+                else (
+                    "oodka_lge_roi_v2"
+                    if self.cfg.roi_v2_hard_switch
+                    else "oodka_lge_roi_v1"
+                )
             ),
             "prompt_texts": self.prompt_texts,
             "anatomy_groups": self.anatomy_groups,
@@ -545,16 +551,25 @@ class LGEROIMixedTrainer(OODKATrainer):
             state[name] = module.state_dict()
         state["optimizer"] = self.optimizer.state_dict()
         state["scaler"] = self.scaler.state_dict()
-        prefix = "fusion_lge_roi_v2" if self.cfg.roi_v2_hard_switch else "fusion_lge_roi"
+        if self.cfg.lge_flat_four_prompt:
+            prefix = "fusion_lge_flat"
+        else:
+            prefix = (
+                "fusion_lge_roi_v2"
+                if self.cfg.roi_v2_hard_switch else "fusion_lge_roi"
+            )
         filename = f"{prefix}_best.pth" if best else f"{prefix}_epoch{epoch:03d}.pth"
         torch.save(state, os.path.join(self.cfg.output_dir, filename))
 
     def _evaluate_best_on_test(self, epoch: int) -> dict:
         """Run the current validation-best checkpoint on test for diagnostics."""
-        prefix = (
-            "fusion_lge_roi_v2"
-            if self.cfg.roi_v2_hard_switch else "fusion_lge_roi"
-        )
+        if self.cfg.lge_flat_four_prompt:
+            prefix = "fusion_lge_flat"
+        else:
+            prefix = (
+                "fusion_lge_roi_v2"
+                if self.cfg.roi_v2_hard_switch else "fusion_lge_roi"
+            )
         checkpoint = os.path.join(self.cfg.output_dir, f"{prefix}_best.pth")
         out_dir = os.path.join(
             self.cfg.output_dir, "test_by_val_best", f"epoch{epoch:03d}"
@@ -628,7 +643,7 @@ class LGEROIMixedTrainer(OODKATrainer):
         cache_loader, _ = self._make_loader(train_dataset, shuffle=False)
         val_loader, val_sampler = self._make_loader(val_dataset, shuffle=False)
         log(
-            f"LGE ROI {'v2' if cfg.roi_v2_hard_switch else 'v1'}: "
+            f"LGE {'flat-4' if cfg.lge_flat_four_prompt else ('ROI v2' if cfg.roi_v2_hard_switch else 'ROI v1')}: "
             f"train={len(train_ids)} cases/{len(train_dataset)} slices, "
             f"val={len(val_ids)} cases/{len(val_dataset)} slices"
         )
@@ -642,7 +657,10 @@ class LGEROIMixedTrainer(OODKATrainer):
         for epoch in range(self.start_epoch, cfg.n_epochs + 1):
             train_sampler.set_epoch(epoch)
             val_sampler.set_epoch(epoch)
-            mixed = epoch > cfg.roi_warmup_epochs
+            mixed = (
+                not cfg.lge_flat_four_prompt
+                and epoch > cfg.roi_warmup_epochs
+            )
             if mixed and (
                 self.roi_cache is None
                 or (
@@ -720,7 +738,10 @@ class LGEROIMixedTrainer(OODKATrainer):
                     f"fallback={val_metrics['roi_fallback_rate']:.4f} "
                     f"peakMem={val_metrics['peak_cuda_memory_gib']:.2f}GiB"
                 )
-                if mixed and val_metrics["exclusive_macro_dice"] > self.best_val_dice:
+                if (
+                    (mixed or cfg.lge_flat_four_prompt)
+                    and val_metrics["exclusive_macro_dice"] > self.best_val_dice
+                ):
                     self.best_val_dice = val_metrics["exclusive_macro_dice"]
                     self._save_roi_checkpoint(epoch, best=True)
                     log(f"  -> new best exclusive argmax={self.best_val_dice:.4f}")

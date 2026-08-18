@@ -124,9 +124,12 @@ def main() -> None:
     device = torch.device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location=device)
     checkpoint_format = checkpoint.get("format")
-    if checkpoint_format not in {"oodka_lge_roi_v1", "oodka_lge_roi_v2"}:
+    if checkpoint_format not in {
+        "oodka_lge_roi_v1", "oodka_lge_roi_v2", "oodka_lge_flat_v1"
+    }:
         raise ValueError("Checkpoint is not an OODKA LGE ROI model")
     is_v2 = checkpoint_format == "oodka_lge_roi_v2"
+    is_flat = checkpoint_format == "oodka_lge_flat_v1"
     decision = args.decision
     if decision == "auto":
         decision = "spatial" if is_v2 else "flat"
@@ -134,6 +137,8 @@ def main() -> None:
         raise ValueError("V2 checkpoints require --decision spatial (or auto)")
     if not is_v2 and decision == "spatial":
         raise ValueError("Spatial hard switching requires a V2 checkpoint")
+    if is_flat and decision != "flat":
+        raise ValueError("Flat checkpoints require --decision flat (or auto)")
     saved = checkpoint["config"]
     cfg = EvalConfig(
         dataset_name="Dataset011_MYO_LGE_BC_OOD",
@@ -163,9 +168,11 @@ def main() -> None:
         case_ids = case_ids[: args.case_limit]
 
     model = load_frozen_biomedparse(device)
-    anatomy_features = build_prompt_features(
-        model, MYOPS_LGE_ROI_ANATOMY_PROMPTS, device
+    anatomy_prompts = (
+        MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
+        if is_flat else MYOPS_LGE_ROI_ANATOMY_PROMPTS
     )
+    anatomy_features = build_prompt_features(model, anatomy_prompts, device)
     refinement_prompts = (
         MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
         if is_v2 else MYOPS_LGE_ROI_REFINEMENT_PROMPTS
@@ -176,7 +183,7 @@ def main() -> None:
     modules = build_fusion_modules(
         None,
         model,
-        3,
+        4 if is_flat else 3,
         device,
         text_dim=int(anatomy_features["class_emb"].shape[-1]),
         route_prior_p_mean=float(saved.get("route_prior_p_mean", 0.7)),
@@ -227,7 +234,9 @@ def main() -> None:
     independent_predicted = np.zeros(5, dtype=np.int64)
     independent_target = np.zeros(5, dtype=np.int64)
 
-    for case_id in tqdm(case_ids, desc=f"LGE ROI {args.split}"):
+    for case_id in tqdm(
+        case_ids, desc=f"LGE {'flat' if is_flat else 'ROI'} {args.split}"
+    ):
         image_files = find_raw_image_files(images_dir, case_id, ending)
         label_path = os.path.join(labels_dir, case_id + ending)
         raw_ref = sitk.ReadImage(image_files[0])
@@ -259,57 +268,64 @@ def main() -> None:
                     valid,
                     (cfg.image_size, cfg.image_size),
                     anatomy_features,
-                    3,
+                    4 if is_flat else 3,
                     model,
                     modules,
                     device,
                 )
-                rois = [
-                    roi_generator.from_probability(torch.sigmoid(value))
-                    for value in anatomy[:, 2, 0].detach()
-                ]
-                anatomy_probabilities = torch.sigmoid(anatomy[:, 2, 0]).cpu()
-                roi_blocks = []
-                for index, roi in enumerate(rois):
-                    crop = full_blocks[
-                        index, 0, :, roi.y0 : roi.y1, roi.x0 : roi.x1
-                    ]
-                    roi_blocks.append(
-                        F.interpolate(
-                            crop[None],
-                            size=(cfg.image_size, cfg.image_size),
-                            mode="bilinear",
-                            align_corners=False,
-                        )[0][None]
-                    )
-                roi_blocks = torch.stack(roi_blocks)
-                refinement = predict_block_logits_per_class(
-                    roi_blocks,
-                    valid,
-                    (cfg.image_size, cfg.image_size),
-                    refinement_features,
-                    4 if is_v2 else 2,
-                    model,
-                    modules,
-                    device,
-                )
-                restored = restore_roi_logits(
-                    refinement,
-                    rois,
-                    (cfg.image_size, cfg.image_size),
-                )
-                if decision == "spatial":
-                    foreground_scores = hard_switch_foreground_logits(
-                        anatomy, restored, rois
-                    )
-                elif decision == "hierarchical":
-                    foreground_scores = _hierarchical_foreground_logits(
-                        anatomy, restored
-                    )
+                if is_flat:
+                    foreground_scores = anatomy
+                    rois = []
+                    anatomy_probabilities = None
                 else:
-                    foreground_scores = torch.cat(
-                        [anatomy[:, 0:2], restored], dim=1
+                    rois = [
+                        roi_generator.from_probability(torch.sigmoid(value))
+                        for value in anatomy[:, 2, 0].detach()
+                    ]
+                    anatomy_probabilities = torch.sigmoid(
+                        anatomy[:, 2, 0]
+                    ).cpu()
+                    roi_blocks = []
+                    for index, roi in enumerate(rois):
+                        crop = full_blocks[
+                            index, 0, :, roi.y0 : roi.y1, roi.x0 : roi.x1
+                        ]
+                        roi_blocks.append(
+                            F.interpolate(
+                                crop[None],
+                                size=(cfg.image_size, cfg.image_size),
+                                mode="bilinear",
+                                align_corners=False,
+                            )[0][None]
+                        )
+                    roi_blocks = torch.stack(roi_blocks)
+                    refinement = predict_block_logits_per_class(
+                        roi_blocks,
+                        valid,
+                        (cfg.image_size, cfg.image_size),
+                        refinement_features,
+                        4 if is_v2 else 2,
+                        model,
+                        modules,
+                        device,
                     )
+                    restored = restore_roi_logits(
+                        refinement,
+                        rois,
+                        (cfg.image_size, cfg.image_size),
+                    )
+                    if decision == "spatial":
+                        foreground_scores = hard_switch_foreground_logits(
+                            anatomy, restored, rois
+                        )
+                    elif decision == "hierarchical":
+                        foreground_scores = _hierarchical_foreground_logits(
+                            anatomy, restored
+                        )
+                    else:
+                        foreground_scores = torch.cat(
+                            [anatomy[:, 0:2], restored], dim=1
+                        )
                 resized = F.interpolate(
                     foreground_scores[:, :, 0],
                     size=spatial_shape[1:],
@@ -318,6 +334,8 @@ def main() -> None:
                 ).float().cpu().numpy()
             for index, z in enumerate(z_indices):
                 final_prompt_logits[:, z] = resized[index]
+                if is_flat:
+                    continue
                 roi = rois[index]
                 all_rois.append(roi)
                 total_myo = np.isin(aligned_seg[z], (1, 2, 4))
@@ -448,28 +466,31 @@ def main() -> None:
     for class_id in range(1, 5):
         values = [r[f"dice_{class_id}"] for r in rows if r[f"dice_{class_id}"] is not None]
         summary[f"dice_{class_id}_mean"] = float(np.mean(values)) if values else None
-    roi_summary = roi_diagnostics(
-        all_rois, (cfg.image_size, cfg.image_size)
-    )
-    roi_summary["total_myo_gt_recall_mean"] = float(np.mean(coverage_values))
-    roi_summary["threshold_mask_dice"] = (
-        2.0 * total_myo_intersection
-        / max(1, total_myo_predicted + total_myo_target)
-    )
-    roi_summary["threshold_mask_precision"] = (
-        total_myo_intersection / max(1, total_myo_predicted)
-    )
-    roi_summary["threshold_mask_recall"] = (
-        total_myo_intersection / max(1, total_myo_target)
-    )
-    roi_summary["threshold_empty_slice_count"] = total_myo_empty_slices
-    roi_summary["probability_inside_gt_mean"] = float(
-        np.mean(probability_inside) if probability_inside else 0.0
-    )
-    roi_summary["probability_outside_gt_mean"] = float(
-        np.mean(probability_outside) if probability_outside else 0.0
-    )
-    summary["roi"] = roi_summary
+    if not is_flat:
+        roi_summary = roi_diagnostics(
+            all_rois, (cfg.image_size, cfg.image_size)
+        )
+        roi_summary["total_myo_gt_recall_mean"] = float(
+            np.mean(coverage_values)
+        )
+        roi_summary["threshold_mask_dice"] = (
+            2.0 * total_myo_intersection
+            / max(1, total_myo_predicted + total_myo_target)
+        )
+        roi_summary["threshold_mask_precision"] = (
+            total_myo_intersection / max(1, total_myo_predicted)
+        )
+        roi_summary["threshold_mask_recall"] = (
+            total_myo_intersection / max(1, total_myo_target)
+        )
+        roi_summary["threshold_empty_slice_count"] = total_myo_empty_slices
+        roi_summary["probability_inside_gt_mean"] = float(
+            np.mean(probability_inside) if probability_inside else 0.0
+        )
+        roi_summary["probability_outside_gt_mean"] = float(
+            np.mean(probability_outside) if probability_outside else 0.0
+        )
+        summary["roi"] = roi_summary
     if decision == "independent":
         summary["independent_threshold"] = args.independent_threshold
         summary["independent_predicted_voxels"] = independent_predicted.tolist()

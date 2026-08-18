@@ -55,6 +55,11 @@ def main() -> None:
         help="ROI predicts LV/RV/normal/scar-edema with hard spatial switching.",
     )
     parser.add_argument("--no_augment", action="store_true")
+    parser.add_argument(
+        "--flat_four_prompt",
+        action="store_true",
+        help="Single full-image LV/RV/normal/scar-edema ablation.",
+    )
     parser.add_argument("--test_best_on_improvement", action="store_true")
     parser.add_argument("--best_test_device", default="cuda:2")
     args = parser.parse_args()
@@ -88,7 +93,8 @@ def main() -> None:
         p_ot_start_epoch=2,
         s_ot_start_epoch=3,
         ot_warmup_epochs=5,
-        lge_roi_two_pass=True,
+        lge_roi_two_pass=not args.flat_four_prompt,
+        lge_flat_four_prompt=args.flat_four_prompt,
         roi_warmup_epochs=args.warmup_epochs,
         roi_threshold=args.roi_threshold,
         roi_expand=args.roi_expand,
@@ -96,7 +102,7 @@ def main() -> None:
         roi_refresh_every=args.roi_refresh_every,
         lambda_anchor=1.0,
         lambda_refine=1.0,
-        roi_v2_hard_switch=args.v2,
+        roi_v2_hard_switch=args.v2 and not args.flat_four_prompt,
         roi_visibility_min_coverage=0.01,
         roi_jitter_center_fraction=(
             0.03 if args.v2 and not args.no_augment else 0.0
@@ -142,8 +148,16 @@ def main() -> None:
     model_nnunet, model_biomedparse = load_frozen_backbones(
         cfg.nnunet_model_dir, cfg.fold, device
     )
+    anatomy_prompts = (
+        MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
+        if args.flat_four_prompt else MYOPS_LGE_ROI_ANATOMY_PROMPTS
+    )
+    anatomy_groups = (
+        MYOPS_LGE_ROI_V2_REFINEMENT_GROUPS
+        if args.flat_four_prompt else MYOPS_LGE_ROI_ANATOMY_GROUPS
+    )
     anatomy_features = build_prompt_features(
-        model_biomedparse, MYOPS_LGE_ROI_ANATOMY_PROMPTS, device
+        model_biomedparse, anatomy_prompts, device
     )
     refinement_prompts = (
         MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
@@ -159,7 +173,7 @@ def main() -> None:
     fusion_modules = build_fusion_modules(
         model_nnunet,
         model_biomedparse,
-        len(MYOPS_LGE_ROI_ANATOMY_GROUPS),
+        len(anatomy_groups),
         device,
         text_dim=int(anatomy_features["class_emb"].shape[-1]),
         route_prior_p_mean=cfg.route_prior_p_mean,
@@ -180,10 +194,11 @@ def main() -> None:
         ot_max_grid_size=cfg.ot_max_grid_size,
         remove_res5_expert_branch_norm=cfg.remove_res5_expert_branch_norm,
     )
-    prompt_texts = {
-        "anatomy": MYOPS_LGE_ROI_ANATOMY_PROMPTS,
-        "refinement": refinement_prompts,
-    }
+    prompt_texts = (
+        {"flat": anatomy_prompts}
+        if args.flat_four_prompt
+        else {"anatomy": anatomy_prompts, "refinement": refinement_prompts}
+    )
     trainer = LGEROIMixedTrainer(
         cfg=cfg,
         model_nnunet=model_nnunet,
@@ -191,7 +206,7 @@ def main() -> None:
         fusion_modules=fusion_modules,
         anatomy_prompt_features=anatomy_features,
         refinement_prompt_features=refinement_features,
-        anatomy_groups=MYOPS_LGE_ROI_ANATOMY_GROUPS,
+        anatomy_groups=anatomy_groups,
         refinement_groups=refinement_groups,
         prompt_texts=prompt_texts,
     )
