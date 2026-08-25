@@ -1,4 +1,4 @@
-"""nnUNet-geometry-aligned BiomedParse preprocessing for MRI/LGE data."""
+"""nnUNet-geometry-aligned BiomedParse preprocessing for CT and MRI."""
 
 from __future__ import annotations
 
@@ -12,10 +12,10 @@ from ..utils.normalization import BiomedParseMRINormalization
 
 
 class AlignedBiomedParsePreprocessor:
-    """Apply nnUNet crop/resampling with BiomedParse MRI normalization.
+    """Apply nnUNet crop/resampling with modality-aware BiomedParse normalization.
 
     Geometry is inherited from the frozen nnUNet expert's plans. Only the
-    intensity normalization is replaced by the LGE/MRI percentile mapping.
+    intensity normalization is replaced by CT windowing or MRI percentiles.
     This gives the expert and student exactly aligned spatial tensors.
     """
 
@@ -27,6 +27,9 @@ class AlignedBiomedParsePreprocessor:
         configuration_name: str = "2d",
         low_percentile: float = 1.0,
         high_percentile: float = 99.0,
+        norm_mode: str = "mri",
+        window_level: float = 40.0,
+        window_width: float = 400.0,
     ):
         ensure_nnunet_on_path()
         from nnunetv2.preprocessing.preprocessors.default_preprocessor import (
@@ -42,12 +45,32 @@ class AlignedBiomedParsePreprocessor:
         self.configuration_manager = self.plans_manager.get_configuration(
             configuration_name
         )
-        normalizer = BiomedParseMRINormalization(
-            low_percentile,
-            high_percentile,
-        )
+        norm_mode = str(norm_mode).lower()
+        if norm_mode == "mri":
+            normalizer = BiomedParseMRINormalization(
+                low_percentile,
+                high_percentile,
+            )
+        elif norm_mode == "ct":
+            lower = float(window_level) - float(window_width) / 2.0
+            upper = float(window_level) + float(window_width) / 2.0
+            if upper <= lower:
+                raise ValueError("window_width must be positive")
 
-        class _MRIAlignedPreprocessor(DefaultPreprocessor):
+            class _CTWindowNormalization:
+                @staticmethod
+                def run(image):
+                    work = np.asarray(image, dtype=np.float32).copy()
+                    np.clip(work, lower, upper, out=work)
+                    work -= lower
+                    work *= 255.0 / (upper - lower)
+                    return work
+
+            normalizer = _CTWindowNormalization()
+        else:
+            raise ValueError("norm_mode must be 'ct' or 'mri'")
+
+        class _AlignedPreprocessor(DefaultPreprocessor):
             def __init__(self):
                 super().__init__(verbose=False)
 
@@ -67,7 +90,7 @@ class AlignedBiomedParsePreprocessor:
                     data[channel_index] = normalizer.run(data[channel_index])
                 return data
 
-        self.preprocessor = _MRIAlignedPreprocessor()
+        self.preprocessor = _AlignedPreprocessor()
 
     def run_case(
         self,

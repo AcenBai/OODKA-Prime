@@ -64,6 +64,31 @@ def test_crop_and_restore_coordinate_contract():
     assert torch.allclose(restored[0, :, 0, 5:13, 4:12], torch.ones(2, 8, 8))
 
 
+def test_z4_block_roi_uses_one_coherent_cuboid():
+    image = torch.arange(2 * 4 * 16 * 16).reshape(2, 4, 1, 16, 16).float()
+    gt = torch.zeros((2, 4, 16, 16), dtype=torch.long)
+    gt[:, :, 4:12, 3:11] = 1
+    batch = {
+        "nnunet_image": image,
+        "biomedparse_image": image.repeat(1, 1, 3, 1, 1),
+        "gt": gt,
+        "valid_z": torch.ones((2, 4), dtype=torch.bool),
+    }
+    rois = [ROICoordinates(3, 4, 11, 12), ROICoordinates(2, 3, 10, 11)]
+    cropped = crop_and_resize_batch(batch, rois)
+    assert cropped["nnunet_image"].shape == image.shape
+    assert cropped["biomedparse_image"].shape == (2, 4, 3, 16, 16)
+    assert cropped["gt"].shape == gt.shape
+
+    logits = torch.ones((2, 3, 4, 16, 16))
+    restored = restore_roi_logits(logits, rois, (16, 16))
+    assert restored.shape == logits.shape
+    assert torch.all(restored[0, :, :, :4] < 0)
+    assert torch.allclose(
+        restored[0, :, :, 4:12, 3:11], torch.ones(3, 4, 8, 8)
+    )
+
+
 def test_roi_cache_roundtrip(tmp_path):
     cache = ROICache()
     cache.set("case", 3, ROICoordinates(1, 2, 8, 9, fallback=False))
@@ -150,3 +175,40 @@ def test_lge_augmentation_preserves_shapes_and_discrete_labels():
     assert augmented["biomedparse_image"].shape == (2, 1, 3, 16, 16)
     assert augmented["gt"].shape == gt.shape
     assert set(augmented["gt"].unique().tolist()) <= set(gt.unique().tolist())
+
+
+def test_z4_augmentation_preserves_block_shapes_and_labels():
+    image = torch.randn(2, 4, 1, 16, 16)
+    gt = torch.randint(0, 8, (2, 4, 16, 16))
+    batch = {
+        "nnunet_image": image,
+        "biomedparse_image": image.repeat(1, 1, 3, 1, 1),
+        "gt": gt,
+    }
+    augmented = augment_lge_batch(
+        batch,
+        rotation_degrees=10.0,
+        scale_min=0.95,
+        scale_max=1.05,
+        translation_fraction=0.05,
+        horizontal_flip_probability=0.5,
+        vertical_flip_probability=0.2,
+        intensity_probability=0.0,
+    )
+    assert augmented["nnunet_image"].shape == image.shape
+    assert augmented["biomedparse_image"].shape == (2, 4, 3, 16, 16)
+    assert augmented["gt"].shape == gt.shape
+    assert set(augmented["gt"].unique().tolist()) <= set(gt.unique().tolist())
+
+
+def test_z4_visibility_uses_shared_block_roi():
+    gt = torch.zeros((1, 4, 8, 8), dtype=torch.long)
+    gt[0, 0, 1:3, 1:3] = 1
+    gt[0, 3, 5:7, 5:7] = 1
+    visible = roi_prompt_visibility(
+        gt,
+        [ROICoordinates(0, 0, 4, 4)],
+        ((1,),),
+        min_coverage=0.75,
+    )
+    assert visible.tolist() == [[False]]

@@ -113,10 +113,14 @@ class OODKATrainer:
             "train_loss_ae": [], "train_loss_ortho": [],
             "train_loss_route": [],
             "train_loss_p_ot": [], "train_loss_s_ot": [],
+            "train_loss_p_ot_forward": [], "train_loss_s_ot_forward": [],
+            "train_loss_p_ot_reverse": [], "train_loss_s_ot_reverse": [],
             "val_loss_total": [], "val_loss_seg": [],
             "val_loss_ae": [], "val_loss_ortho": [],
             "val_loss_route": [],
             "val_loss_p_ot": [], "val_loss_s_ot": [],
+            "val_loss_p_ot_forward": [], "val_loss_s_ot_forward": [],
+            "val_loss_p_ot_reverse": [], "val_loss_s_ot_reverse": [],
             "train_dice_mean": [], "val_dice_mean": [],
             "train_dice_per_class": [], "val_dice_per_class": [],
             "train_gate_per_class": [],
@@ -194,6 +198,8 @@ class OODKATrainer:
                 "loss_total", "loss_seg", "loss_ae", "loss_ortho",
                 "loss_route",
                 "loss_p_ot", "loss_s_ot",
+                "loss_p_ot_forward", "loss_s_ot_forward",
+                "loss_p_ot_reverse", "loss_s_ot_reverse",
             ]
         }
         ot_keys = [
@@ -201,8 +207,9 @@ class OODKATrainer:
             for level in [2, 3, 4, 5]
             for name in [
                 "p_cost", "p_row_error", "p_col_error", "p_entropy",
+                "p_reverse_loss",
                 "s_cost", "s_received", "s_transported", "s_rejected",
-                "s_accept_ratio", "s_entropy", "s_gain",
+                "s_accept_ratio", "s_entropy", "s_gain", "s_reverse_loss",
             ]
         ]
         meter.update({key: 0.0 for key in ot_keys})
@@ -317,6 +324,11 @@ class OODKATrainer:
             f"OT grid rule: each native feature dimension is capped at "
             f"{cfg.ot_max_grid_size}"
         )
+        log(
+            "Relative KD: "
+            f"enabled={cfg.relative_kd} "
+            f"expert_weight={cfg.relative_kd_expert_weight:g}"
+        )
         log(f"Output: {cfg.output_dir}")
 
         for epoch in range(self.start_epoch, cfg.n_epochs + 1):
@@ -381,6 +393,8 @@ class OODKATrainer:
                         "  OT: "
                         f"P={val_meter['loss_p_ot']:.4f} "
                         f"S={val_meter['loss_s_ot']:.4f} "
+                        f"P_rev={val_meter['loss_p_ot_reverse']:.4f} "
+                        f"S_rev={val_meter['loss_s_ot_reverse']:.4f} "
                         f"res4_row={val_meter['ot_res4_p_row_error']:.3e} "
                         f"res4_col={val_meter['ot_res4_p_col_error']:.3e} "
                         f"res4_accept={val_meter['ot_res4_s_accept_ratio']:.4f}"
@@ -397,6 +411,8 @@ class OODKATrainer:
                 "loss_total", "loss_seg", "loss_ae", "loss_ortho",
                 "loss_route",
                 "loss_p_ot", "loss_s_ot",
+                "loss_p_ot_forward", "loss_s_ot_forward",
+                "loss_p_ot_reverse", "loss_s_ot_reverse",
             ]:
                 self.history[f"train_{key}"].append(train_meter[key])
                 self.history[f"val_{key}"].append(val_meter[key])

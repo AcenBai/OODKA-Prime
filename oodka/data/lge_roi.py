@@ -144,24 +144,31 @@ def roi_prompt_visibility(
     *,
     min_coverage: float,
 ) -> torch.Tensor:
-    """Return [B,P] validity, skipping classes truncated by an ROI crop.
+    """Return [B,P] validity, skipping classes truncated by ROI crops.
 
     A class absent on the full slice is a genuine negative. A class present on
-    the full slice is supervised only when the ROI retains enough of it.
+    the full block is supervised only when its shared block ROI retains enough
+    of it. The same XY crop is used for every Z slice in a block.
     """
-    batch_size = original_gt.shape[0]
+    if original_gt.ndim != 4:
+        raise ValueError("original_gt must be [B,Z,H,W]")
+    batch_size, block_z = original_gt.shape[:2]
+    if len(rois) != batch_size:
+        raise ValueError("ROI count must equal B")
     visible = torch.ones((batch_size, len(groups)), dtype=torch.bool)
-    for index, roi in enumerate(rois):
-        full = original_gt[index, 0]
+    for batch_index in range(batch_size):
         for prompt_index, source_ids in enumerate(groups):
-            mask = torch.zeros_like(full, dtype=torch.bool)
+            mask = torch.zeros_like(original_gt[batch_index], dtype=torch.bool)
             for source_id in source_ids:
-                mask |= full == int(source_id)
+                mask |= original_gt[batch_index] == int(source_id)
             total = int(mask.sum())
             if total == 0:
                 continue
-            inside = int(mask[roi.y0 : roi.y1, roi.x0 : roi.x1].sum())
-            visible[index, prompt_index] = inside / total >= min_coverage
+            roi = rois[batch_index]
+            inside = int(
+                mask[:, roi.y0 : roi.y1, roi.x0 : roi.x1].sum()
+            )
+            visible[batch_index, prompt_index] = inside / total >= min_coverage
     return visible
 
 
@@ -172,23 +179,25 @@ def hard_switch_foreground_logits(
 ) -> torch.Tensor:
     """Use Pass 1 outside each ROI and Pass 2 inside, without logit mixing."""
     if anatomy_logits.ndim != 5 or anatomy_logits.shape[1] < 2:
-        raise ValueError("anatomy_logits must be [B,>=2,1,H,W]")
+        raise ValueError("anatomy_logits must be [B,>=2,Z,H,W]")
     if restored_roi_logits.ndim != 5 or restored_roi_logits.shape[1] < 4:
-        raise ValueError("V2/V3 ROI logits must be [B,>=4,1,H,W]")
-    batch_size, prompt_count, _, height, width = restored_roi_logits.shape
+        raise ValueError("V2/V3 ROI logits must be [B,>=4,Z,H,W]")
+    batch_size, prompt_count, block_z, height, width = restored_roi_logits.shape
     if len(rois) != batch_size:
-        raise ValueError("ROI count does not match logits batch")
+        raise ValueError("ROI count must equal B")
     outside = restored_roi_logits.new_full(
-        (batch_size, prompt_count, 1, height, width), -20.0
+        (batch_size, prompt_count, block_z, height, width), -20.0
     )
     outside[:, 0:2] = anatomy_logits[:, 0:2]
     mask = torch.zeros(
-        (batch_size, 1, 1, height, width),
+        (batch_size, 1, block_z, height, width),
         dtype=torch.bool,
         device=restored_roi_logits.device,
     )
-    for index, roi in enumerate(rois):
-        mask[index, :, :, roi.y0 : roi.y1, roi.x0 : roi.x1] = True
+    for batch_index, roi in enumerate(rois):
+        mask[
+            batch_index, :, :, roi.y0 : roi.y1, roi.x0 : roi.x1
+        ] = True
     return torch.where(mask, restored_roi_logits, outside)
 
 
@@ -208,9 +217,9 @@ def augment_lge_batch(
     nn_image = batch_data["nnunet_image"]
     bp_image = batch_data["biomedparse_image"]
     gt = batch_data["gt"]
-    if nn_image.shape[1] != 1 or bp_image.shape[1] != 1:
-        raise ValueError("LGE augmentation requires Z=1")
-    batch_size = nn_image.shape[0]
+    if nn_image.ndim != 5 or bp_image.ndim != 5 or gt.ndim != 4:
+        raise ValueError("Unexpected batch tensor rank for augmentation")
+    batch_size, block_z = nn_image.shape[:2]
     angles = torch.empty(batch_size).uniform_(-rotation_degrees, rotation_degrees)
     angles = angles * torch.pi / 180.0
     scales = torch.empty(batch_size).uniform_(scale_min, scale_max)
@@ -230,25 +239,31 @@ def augment_lge_batch(
     theta[:, 0, 2] = tx
     theta[:, 1, 2] = ty
 
+    # Preserve 3-D block coherence by sharing one spatial transform across all
+    # Z slices of a block. Each slice's pseudo-RGB channels remain synchronized.
+    theta_bz = theta.repeat_interleave(block_z, dim=0)
+
     def spatial(images: torch.Tensor, mode: str) -> torch.Tensor:
-        flat = images[:, 0]
-        grid = F.affine_grid(theta, flat.shape, align_corners=False)
-        return F.grid_sample(
+        flat = images.flatten(0, 1)
+        grid = F.affine_grid(theta_bz, flat.shape, align_corners=False)
+        transformed = F.grid_sample(
             flat, grid, mode=mode, padding_mode="zeros", align_corners=False
-        )[:, None]
+        )
+        return transformed.unflatten(0, (batch_size, block_z))
 
     nn_aug = spatial(nn_image, "bilinear")
     bp_aug = spatial(bp_image, "bilinear")
     gt_aug = spatial(gt[:, :, None].float(), "nearest")[:, :, 0].to(gt.dtype)
 
-    for index in range(batch_size):
+    for index in range(batch_size * block_z):
         if float(torch.rand(())) >= intensity_probability:
             continue
         contrast = float(torch.empty(()).uniform_(0.8, 1.2))
         shift = float(torch.empty(()).uniform_(-0.1, 0.1))
         noise = float(torch.empty(()).uniform_(0.0, 0.04))
+        batch_index, z_index = divmod(index, block_z)
         for images, clamp in ((nn_aug, False), (bp_aug, True)):
-            value = images[index]
+            value = images[batch_index, z_index]
             mean = value.mean()
             std = value.std().clamp_min(1e-6)
             value = mean + contrast * (value - mean) + shift * std
@@ -256,7 +271,7 @@ def augment_lge_batch(
             if clamp:
                 gamma = float(torch.empty(()).uniform_(0.75, 1.35))
                 value = (value.clamp(0.0, 255.0) / 255.0).pow(gamma) * 255.0
-            images[index] = value
+            images[batch_index, z_index] = value
     output["nnunet_image"] = nn_aug
     output["biomedparse_image"] = bp_aug
     output["gt"] = gt_aug
@@ -327,51 +342,53 @@ def crop_and_resize_batch(
     batch_data: dict,
     rois: Sequence[ROICoordinates],
 ) -> dict:
-    """Apply per-slice ROIs identically to both visual branches and GT.
-
-    The experiment is intentionally Z=1, so each batch element has one ROI.
-    Crops are resized back to the original model-input H/W.
-    """
+    """Crop one coherent ``Z x H_roi x W_roi`` cuboid per batch block."""
     nn_image = batch_data["nnunet_image"]
     bp_image = batch_data["biomedparse_image"]
     gt = batch_data["gt"]
     if nn_image.ndim != 5 or bp_image.ndim != 5 or gt.ndim != 4:
         raise ValueError("Unexpected batch tensor rank for ROI crop")
     batch_size, block_z = nn_image.shape[:2]
-    if block_z != 1 or len(rois) != batch_size:
-        raise ValueError("ROI mixed training currently requires block_z=1")
+    if len(rois) != batch_size:
+        raise ValueError("ROI count must equal B")
     out_h, out_w = gt.shape[-2:]
     nn_crops = []
     bp_crops = []
     gt_crops = []
-    for index, roi in enumerate(rois):
+    for batch_index, roi in enumerate(rois):
         if roi.width <= 0 or roi.height <= 0:
             raise ValueError(f"Invalid ROI: {roi}")
-        nn_crop = nn_image[index, 0, :, roi.y0 : roi.y1, roi.x0 : roi.x1]
-        bp_crop = bp_image[index, 0, :, roi.y0 : roi.y1, roi.x0 : roi.x1]
-        gt_crop = gt[index, 0, roi.y0 : roi.y1, roi.x0 : roi.x1]
+        nn_crop = nn_image[
+            batch_index, :, :, roi.y0 : roi.y1, roi.x0 : roi.x1
+        ]
+        bp_crop = bp_image[
+            batch_index, :, :, roi.y0 : roi.y1, roi.x0 : roi.x1
+        ]
+        gt_crop = gt[
+            batch_index, :, roi.y0 : roi.y1, roi.x0 : roi.x1
+        ]
         nn_crops.append(
             F.interpolate(
-                nn_crop[None], size=(out_h, out_w), mode="bilinear",
+                nn_crop, size=(out_h, out_w), mode="bilinear",
                 align_corners=False,
-            )[0]
+            )
         )
         bp_crops.append(
             F.interpolate(
-                bp_crop[None], size=(out_h, out_w), mode="bilinear",
+                bp_crop, size=(out_h, out_w), mode="bilinear",
                 align_corners=False,
-            )[0]
+            )
         )
         gt_crops.append(
             F.interpolate(
-                gt_crop[None, None].float(), size=(out_h, out_w),
+                gt_crop[:, None].float(), size=(out_h, out_w),
                 mode="nearest",
-            )[0, 0].to(gt.dtype)
+            )[:, 0].to(gt.dtype)
         )
     output = dict(batch_data)
-    output["nnunet_image"] = torch.stack(nn_crops, dim=0)[:, None]
-    output["biomedparse_image"] = torch.stack(bp_crops, dim=0)[:, None]
-    output["gt"] = torch.stack(gt_crops, dim=0)[:, None]
+    output["nnunet_image"] = torch.stack(nn_crops, dim=0)
+    output["biomedparse_image"] = torch.stack(bp_crops, dim=0)
+    output["gt"] = torch.stack(gt_crops, dim=0)
     return output
 
 
@@ -381,24 +398,26 @@ def restore_roi_logits(
     output_size: tuple[int, int],
     outside_logit: float = -20.0,
 ) -> torch.Tensor:
-    """Restore ``[B,P,1,h,w]`` ROI logits to full-image coordinates."""
-    if roi_logits.ndim != 5 or roi_logits.shape[2] != 1:
-        raise ValueError("ROI logits must be [B,P,1,H,W]")
-    batch_size, prompts = roi_logits.shape[:2]
+    """Restore ``[B,P,Z,h,w]`` ROI logits to full-image coordinates."""
+    if roi_logits.ndim != 5:
+        raise ValueError("ROI logits must be [B,P,Z,H,W]")
+    batch_size, prompts, block_z = roi_logits.shape[:3]
     if len(rois) != batch_size:
-        raise ValueError("ROI count does not match batch")
+        raise ValueError("ROI count must equal B")
     height, width = output_size
     output = roi_logits.new_full(
-        (batch_size, prompts, 1, height, width), float(outside_logit)
+        (batch_size, prompts, block_z, height, width), float(outside_logit)
     )
-    for index, roi in enumerate(rois):
+    for batch_index, roi in enumerate(rois):
         resized = F.interpolate(
-            roi_logits[index, :, 0][None],
+            roi_logits[batch_index].permute(1, 0, 2, 3),
             size=(roi.height, roi.width),
             mode="bilinear",
             align_corners=False,
-        )[0]
-        output[index, :, 0, roi.y0 : roi.y1, roi.x0 : roi.x1] = resized
+        ).permute(1, 0, 2, 3)
+        output[
+            batch_index, :, :, roi.y0 : roi.y1, roi.x0 : roi.x1
+        ] = resized
     return output
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two-pass predicted-ROI inference for merged or split-pathology LGE."""
+"""Two-pass predicted-ROI inference for LGE and whole-heart models."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from tqdm import tqdm
 from oodka.config import EvalConfig
 from oodka.data.aligned_preprocessing import AlignedBiomedParsePreprocessor
 from oodka.data.lge_roi import (
+    ROICoordinates,
     ROIGenerator,
     hard_switch_foreground_logits,
     restore_roi_logits,
@@ -35,6 +36,11 @@ from oodka.models.prompts import (
     MYOPS_LGE_ROI_SPLIT_FINAL_NAMES,
     MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS,
     MYOPS_LGE_ROI_V3_REFINEMENT_PROMPTS,
+    WHS_CT_ROI_LOCALIZATION_PROMPTS,
+    WHS_CT_ROI_REFINEMENT_PROMPTS,
+    WHS_MRI_ROI_LOCALIZATION_PROMPTS,
+    WHS_MRI_ROI_REFINEMENT_PROMPTS,
+    WHS_ROI_REFINEMENT_GROUPS,
 )
 from oodka.train.forward import predict_block_logits_per_class
 from oodka.train.model_builder import (
@@ -108,8 +114,17 @@ def main() -> None:
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--case_limit", type=int, default=0)
     parser.add_argument(
+        "--roi_source",
+        choices=("predicted", "ground_truth", "full"),
+        default="predicted",
+        help="Diagnostic source of the second-pass crop.",
+    )
+    parser.add_argument(
         "--decision",
-        choices=("auto", "flat", "hierarchical", "independent", "spatial"),
+        choices=(
+            "auto", "flat", "hierarchical", "independent", "spatial",
+            "refinement",
+        ),
         default="auto",
         help="Final cross-pass decision rule.",
     )
@@ -128,30 +143,38 @@ def main() -> None:
     checkpoint_format = checkpoint.get("format")
     if checkpoint_format not in {
         "oodka_lge_roi_v1", "oodka_lge_roi_v2",
-        "oodka_lge_roi_v3_split5", "oodka_lge_flat_v1"
+        "oodka_lge_roi_v3_split5", "oodka_lge_flat_v1",
+        "oodka_whs_roi_v1",
     }:
-        raise ValueError("Checkpoint is not an OODKA LGE ROI model")
+        raise ValueError("Checkpoint is not a supported OODKA ROI model")
+    is_whs = checkpoint_format == "oodka_whs_roi_v1"
     is_split = checkpoint_format == "oodka_lge_roi_v3_split5"
     is_v2 = checkpoint_format in {"oodka_lge_roi_v2", "oodka_lge_roi_v3_split5"}
     is_flat = checkpoint_format == "oodka_lge_flat_v1"
     decision = args.decision
     if decision == "auto":
-        decision = "spatial" if is_v2 else "flat"
+        decision = "refinement" if is_whs else "spatial" if is_v2 else "flat"
+    if is_whs and decision != "refinement":
+        raise ValueError("WHS checkpoints require --decision refinement (or auto)")
     if is_v2 and decision != "spatial":
         raise ValueError("V2 checkpoints require --decision spatial (or auto)")
-    if not is_v2 and decision == "spatial":
+    if not is_v2 and not is_whs and decision == "spatial":
         raise ValueError("Spatial hard switching requires a V2 checkpoint")
     if is_flat and decision != "flat":
         raise ValueError("Flat checkpoints require --decision flat (or auto)")
     saved = checkpoint["config"]
+    dataset_name = (
+        str(saved.get("dataset_name"))
+        if is_whs else "Dataset011_MYO_LGE_BC_OOD"
+    )
     cfg = EvalConfig(
-        dataset_name="Dataset011_MYO_LGE_BC_OOD",
+        dataset_name=dataset_name,
         fold=int(saved.get("fold", 0)),
-        block_z=1,
+        block_z=int(saved.get("block_z", 1)),
         batch_size=args.batch_size,
         image_size=int(saved.get("image_size", 256)),
-        norm_mode="mri",
-        pseudo_rgb_mode="center_repeat",
+        norm_mode=str(saved.get("norm_mode", "mri")),
+        pseudo_rgb_mode=str(saved.get("pseudo_rgb_mode", "center_repeat")),
         device=args.device,
         split=args.split,
         out_dir=args.out_dir,
@@ -172,22 +195,37 @@ def main() -> None:
         case_ids = case_ids[: args.case_limit]
 
     model = load_frozen_biomedparse(device)
-    anatomy_prompts = (
-        MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
-        if is_flat else MYOPS_LGE_ROI_ANATOMY_PROMPTS
-    )
+    if is_whs:
+        if dataset_name == "Dataset009_CT_OOD":
+            anatomy_prompts = WHS_CT_ROI_LOCALIZATION_PROMPTS
+            refinement_prompts = WHS_CT_ROI_REFINEMENT_PROMPTS
+        elif dataset_name == "Dataset010_WHS_MRI_OOD":
+            anatomy_prompts = WHS_MRI_ROI_LOCALIZATION_PROMPTS
+            refinement_prompts = WHS_MRI_ROI_REFINEMENT_PROMPTS
+        else:
+            raise ValueError(f"Unsupported WHS dataset: {dataset_name}")
+    else:
+        anatomy_prompts = (
+            MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
+            if is_flat else MYOPS_LGE_ROI_ANATOMY_PROMPTS
+        )
+        refinement_prompts = (
+            MYOPS_LGE_ROI_V3_REFINEMENT_PROMPTS
+            if is_split else MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
+            if is_v2 else MYOPS_LGE_ROI_REFINEMENT_PROMPTS
+        )
     anatomy_features = build_prompt_features(model, anatomy_prompts, device)
-    refinement_prompts = (
-        MYOPS_LGE_ROI_V3_REFINEMENT_PROMPTS
-        if is_split else MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
-        if is_v2 else MYOPS_LGE_ROI_REFINEMENT_PROMPTS
-    )
     final_groups = (
-        MYOPS_LGE_ROI_SPLIT_FINAL_GROUPS
+        WHS_ROI_REFINEMENT_GROUPS
+        if is_whs else MYOPS_LGE_ROI_SPLIT_FINAL_GROUPS
         if is_split else MYOPS_LGE_ROI_FINAL_GROUPS
     )
     final_names = (
-        MYOPS_LGE_ROI_SPLIT_FINAL_NAMES
+        {
+            1: "LV", 2: "RV", 3: "LA", 4: "RA",
+            5: "Myo", 6: "AO", 7: "PA",
+        }
+        if is_whs else MYOPS_LGE_ROI_SPLIT_FINAL_NAMES
         if is_split else MYOPS_LGE_ROI_FINAL_NAMES
     )
     final_count = len(final_groups)
@@ -197,7 +235,7 @@ def main() -> None:
     modules = build_fusion_modules(
         None,
         model,
-        4 if is_flat else 3,
+        len(anatomy_prompts),
         device,
         text_dim=int(anatomy_features["class_emb"].shape[-1]),
         route_prior_p_mean=float(saved.get("route_prior_p_mean", 0.7)),
@@ -220,6 +258,9 @@ def main() -> None:
         configuration_name="2d",
         low_percentile=float(saved.get("low_percentile", 1.0)),
         high_percentile=float(saved.get("high_percentile", 99.0)),
+        norm_mode=str(saved.get("norm_mode", "mri")),
+        window_level=float(saved.get("window_level", 40.0)),
+        window_width=float(saved.get("window_width", 400.0)),
     )
     roi_generator = ROIGenerator(
         threshold=float(saved.get("roi_threshold", 0.3)),
@@ -248,9 +289,8 @@ def main() -> None:
     independent_predicted = np.zeros(final_count + 1, dtype=np.int64)
     independent_target = np.zeros(final_count + 1, dtype=np.int64)
 
-    for case_id in tqdm(
-        case_ids, desc=f"LGE {'flat' if is_flat else 'ROI'} {args.split}"
-    ):
+    task_label = "WHS ROI" if is_whs else f"LGE {'flat' if is_flat else 'ROI'}"
+    for case_id in tqdm(case_ids, desc=f"{task_label} {args.split}"):
         image_files = find_raw_image_files(images_dir, case_id, ending)
         label_path = os.path.join(labels_dir, case_id + ending)
         raw_ref = sitk.ReadImage(image_files[0])
@@ -260,29 +300,37 @@ def main() -> None:
         )
         spatial_shape = bp_u8.shape
         final_prompt_logits = np.zeros((final_count, *spatial_shape), dtype=np.float32)
-        for start in range(0, spatial_shape[0], args.batch_size):
-            z_indices = list(
-                range(start, min(spatial_shape[0], start + args.batch_size))
-            )
-            full_blocks = torch.stack(
-                [
+        block_starts = list(range(0, spatial_shape[0], cfg.block_z))
+        for block_batch_start in range(0, len(block_starts), args.batch_size):
+            current_starts = block_starts[
+                block_batch_start : block_batch_start + args.batch_size
+            ]
+            full_blocks_list = []
+            valid_rows = []
+            for z_start in current_starts:
+                valid_count = min(cfg.block_z, spatial_shape[0] - z_start)
+                centers = list(range(z_start, z_start + valid_count))
+                centers.extend([centers[-1]] * (cfg.block_z - valid_count))
+                full_blocks_list.append(
                     make_biomedparse_block(
                         bp_u8,
-                        [z],
+                        centers,
                         cfg.image_size,
-                        pseudo_rgb_mode="center_repeat",
+                        pseudo_rgb_mode=cfg.pseudo_rgb_mode,
                     )
-                    for z in z_indices
-                ]
-            )
-            valid = torch.ones((len(z_indices), 1), dtype=torch.bool)
+                )
+                valid_rows.append(
+                    torch.arange(cfg.block_z) < valid_count
+                )
+            full_blocks = torch.stack(full_blocks_list)
+            valid = torch.stack(valid_rows)
             with torch.autocast("cuda", dtype=torch.float16, enabled=device.type == "cuda"):
                 anatomy = predict_block_logits_per_class(
                     full_blocks,
                     valid,
                     (cfg.image_size, cfg.image_size),
                     anatomy_features,
-                    4 if is_flat else 3,
+                    len(anatomy_prompts),
                     model,
                     modules,
                     device,
@@ -292,25 +340,64 @@ def main() -> None:
                     rois = []
                     anatomy_probabilities = None
                 else:
-                    rois = [
-                        roi_generator.from_probability(torch.sigmoid(value))
-                        for value in anatomy[:, 2, 0].detach()
-                    ]
+                    if args.roi_source == "predicted":
+                        block_probability = torch.sigmoid(
+                            anatomy[
+                                :, int(checkpoint.get("roi_prompt_index", 2))
+                            ]
+                        ).masked_fill(
+                            ~valid.to(device)[:, :, None, None], 0.0
+                        ).amax(dim=1)
+                        rois = [
+                            roi_generator.from_probability(value)
+                            for value in block_probability.detach()
+                        ]
+                    elif args.roi_source == "ground_truth":
+                        foreground_source_ids = tuple(
+                            source_id
+                            for group in final_groups
+                            for source_id in group
+                        )
+                        rois = []
+                        for z_start, block_valid in zip(current_starts, valid):
+                            valid_count = int(block_valid.sum())
+                            target_mask = np.isin(
+                                aligned_seg[z_start : z_start + valid_count],
+                                foreground_source_ids,
+                            ).any(axis=0)
+                            target_resized = F.interpolate(
+                                torch.from_numpy(target_mask)[None, None].float(),
+                                size=(cfg.image_size, cfg.image_size),
+                                mode="nearest",
+                            )[0, 0]
+                            rois.append(
+                                roi_generator.from_probability(target_resized)
+                            )
+                    else:
+                        rois = [
+                            ROICoordinates(
+                                0, 0, cfg.image_size, cfg.image_size,
+                                fallback=False,
+                            )
+                            for _ in current_starts
+                        ]
                     anatomy_probabilities = torch.sigmoid(
-                        anatomy[:, 2, 0]
+                        anatomy[
+                            :, int(checkpoint.get("roi_prompt_index", 2))
+                        ]
                     ).cpu()
                     roi_blocks = []
                     for index, roi in enumerate(rois):
                         crop = full_blocks[
-                            index, 0, :, roi.y0 : roi.y1, roi.x0 : roi.x1
+                            index, :, :, roi.y0 : roi.y1, roi.x0 : roi.x1
                         ]
                         roi_blocks.append(
                             F.interpolate(
-                                crop[None],
+                                crop,
                                 size=(cfg.image_size, cfg.image_size),
                                 mode="bilinear",
                                 align_corners=False,
-                            )[0][None]
+                            )
                         )
                     roi_blocks = torch.stack(roi_blocks)
                     refinement = predict_block_logits_per_class(
@@ -328,7 +415,9 @@ def main() -> None:
                         rois,
                         (cfg.image_size, cfg.image_size),
                     )
-                    if decision == "spatial":
+                    if decision == "refinement":
+                        foreground_scores = restored
+                    elif decision == "spatial":
                         foreground_scores = hard_switch_foreground_logits(
                             anatomy, restored, rois
                         )
@@ -340,42 +429,74 @@ def main() -> None:
                         foreground_scores = torch.cat(
                             [anatomy[:, 0:2], restored], dim=1
                         )
+                block_count, _, block_z = foreground_scores.shape[:3]
                 resized = F.interpolate(
-                    foreground_scores[:, :, 0],
+                    foreground_scores.permute(0, 2, 1, 3, 4).reshape(
+                        block_count * block_z, final_count,
+                        cfg.image_size, cfg.image_size,
+                    ),
                     size=spatial_shape[1:],
                     mode="bilinear",
                     align_corners=False,
+                ).reshape(
+                    block_count, block_z, final_count,
+                    *spatial_shape[1:],
                 ).float().cpu().numpy()
-            for index, z in enumerate(z_indices):
-                final_prompt_logits[:, z] = resized[index]
+            for block_index, (z_start, block_valid) in enumerate(
+                zip(current_starts, valid)
+            ):
+                valid_count = int(block_valid.sum())
+                final_prompt_logits[
+                    :, z_start : z_start + valid_count
+                ] = resized[block_index, :valid_count].transpose(1, 0, 2, 3)
                 if is_flat:
                     continue
-                roi = rois[index]
+                roi = rois[block_index]
                 all_rois.append(roi)
-                total_myo = np.isin(aligned_seg[z], (1, 2, 4))
+                foreground_source_ids = tuple(
+                    source_id for group in final_groups for source_id in group
+                )
+                total_myo = np.isin(
+                    aligned_seg[z_start : z_start + valid_count],
+                    foreground_source_ids,
+                )
                 total_resized = F.interpolate(
-                    torch.from_numpy(total_myo)[None, None].float(),
+                    torch.from_numpy(total_myo)[:, None].float(),
                     size=(cfg.image_size, cfg.image_size),
                     mode="nearest",
-                )[0, 0].bool()
-                threshold_mask = anatomy_probabilities[index] >= float(
+                )[:, 0].bool()
+                threshold_mask = anatomy_probabilities[
+                    block_index, :valid_count
+                ] >= float(
                     saved.get("roi_threshold", 0.3)
                 )
                 total_myo_intersection += int((threshold_mask & total_resized).sum())
                 total_myo_predicted += int(threshold_mask.sum())
                 total_myo_target += int(total_resized.sum())
-                total_myo_empty_slices += int(not threshold_mask.any())
+                total_myo_empty_slices += int(
+                    (~threshold_mask.flatten(1).any(dim=1)).sum()
+                )
                 if total_resized.any():
                     probability_inside.append(
-                        float(anatomy_probabilities[index][total_resized].mean())
+                        float(
+                            anatomy_probabilities[
+                                block_index, :valid_count
+                            ][total_resized].mean()
+                        )
                     )
                 if (~total_resized).any():
                     probability_outside.append(
-                        float(anatomy_probabilities[index][~total_resized].mean())
+                        float(
+                            anatomy_probabilities[
+                                block_index, :valid_count
+                            ][~total_resized].mean()
+                        )
                     )
                 total = int(total_resized.sum())
                 inside = int(
-                    total_resized[roi.y0 : roi.y1, roi.x0 : roi.x1].sum()
+                    total_resized[
+                        :, roi.y0 : roi.y1, roi.x0 : roi.x1
+                    ].sum()
                 )
                 coverage_values.append(inside / total if total else 1.0)
 
@@ -476,6 +597,7 @@ def main() -> None:
     summary = {
         "n_cases": len(rows),
         "decision": decision,
+        "roi_source": args.roi_source,
         "checkpoint_format": checkpoint_format,
         "mean_dice_gt_present": float(np.mean([r["dice_mean_gt"] for r in rows])),
         "class_names": final_names,

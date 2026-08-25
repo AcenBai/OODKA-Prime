@@ -35,6 +35,16 @@ def main():
     parser.add_argument("--case_limit", type=int, default=0)
     parser.add_argument("--split", choices=("val", "test"), default="test")
     parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument(
+        "--override_block_z", type=int, default=0,
+        help="Diagnostic override for the checkpoint's Z-block length.",
+    )
+    parser.add_argument(
+        "--pseudo_rgb_mode",
+        choices=("adjacent", "center_repeat"),
+        default="",
+        help="Diagnostic override for BiomedParse pseudo-RGB construction.",
+    )
     args = parser.parse_args()
 
     cfg = EvalConfig(
@@ -75,6 +85,10 @@ def main():
     )
     cfg.block_z = int(checkpoint_cfg.get("block_z", cfg.block_z))
     cfg.image_size = int(checkpoint_cfg.get("image_size", cfg.image_size))
+    if args.override_block_z > 0:
+        cfg.block_z = args.override_block_z
+    if args.pseudo_rgb_mode:
+        cfg.pseudo_rgb_mode = args.pseudo_rgb_mode
     if "route_prior_p_mean" not in checkpoint_cfg:
         raise ValueError(
             "Checkpoint uses the legacy scalar Beta router; this evaluator "

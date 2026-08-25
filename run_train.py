@@ -73,6 +73,20 @@ def main():
     parser.add_argument("--s_ot_start_epoch", type=int, default=3)
     parser.add_argument("--ot_warmup_epochs", type=int, default=5)
     parser.add_argument("--ot_max_grid_size", type=int, default=32)
+    parser.add_argument(
+        "--relative_kd",
+        action="store_true",
+        help=(
+            "Reuse each detached OT correspondence for student-to-expert "
+            "distillation in addition to the original expert-to-student KD"
+        ),
+    )
+    parser.add_argument(
+        "--relative_kd_expert_weight",
+        type=float,
+        default=1.0,
+        help="Multiplier on the reverse student-to-expert KD term",
+    )
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--resume_checkpoint", type=str, default="")
     parser.add_argument("--val_every_epochs", type=int, default=5)
@@ -117,6 +131,8 @@ def main():
         s_ot_start_epoch=args.s_ot_start_epoch,
         ot_warmup_epochs=args.ot_warmup_epochs,
         ot_max_grid_size=args.ot_max_grid_size,
+        relative_kd=args.relative_kd,
+        relative_kd_expert_weight=args.relative_kd_expert_weight,
         amp=not args.no_amp,
         resume_checkpoint=args.resume_checkpoint,
         val_every_epochs=args.val_every_epochs,
@@ -255,6 +271,8 @@ def main():
         s_ot_rho_expert=cfg.s_ot_rho_expert,
         ot_sinkhorn_iterations=cfg.ot_sinkhorn_iterations,
         ot_max_grid_size=cfg.ot_max_grid_size,
+        relative_kd=cfg.relative_kd,
+        relative_kd_expert_weight=cfg.relative_kd_expert_weight,
         remove_res5_expert_branch_norm=cfg.remove_res5_expert_branch_norm,
     )
     n_params = sum(p.numel() for m in fusion_modules.values() for p in m.parameters() if p.requires_grad)

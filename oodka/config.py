@@ -98,6 +98,7 @@ class TrainConfig:
     roi_refresh_every: int = 0
     lambda_anchor: float = 1.0
     lambda_refine: float = 1.0
+    roi_prompt_loss_reduction: str = "sum"
     roi_v2_hard_switch: bool = False
     lge_split_pathology: bool = False
     roi_visibility_min_coverage: float = 0.01
@@ -154,6 +155,11 @@ class TrainConfig:
     s_ot_epsilon: float = 0.1
     s_ot_rho_base: float = 1.0
     s_ot_rho_expert: float = 0.2
+    # Reuse each detached OT correspondence in the reverse direction so the
+    # student representation also supervises the expert adapter.  The forward
+    # expert->student KD remains unchanged; this scales only student->expert.
+    relative_kd: bool = False
+    relative_kd_expert_weight: float = 1.0
     # Targeted res5 mitigation: retain all other expert-side normalizers.
     remove_res5_expert_branch_norm: bool = True
 

@@ -25,6 +25,32 @@ WHS_MRI_PROMPTS = {
     "7": "MRI of the pulmonary artery trunk in the thorax",
 }
 
+# Two-pass whole-heart ROI experiments. The localization branch predicts one
+# binary union of all seven foreground structures; the refinement branch then
+# resolves the seven original classes inside the expanded predicted ROI.
+WHS_CT_ROI_LOCALIZATION_PROMPTS = {
+    "1": (
+        "CT imaging of the whole heart, including the left and right "
+        "ventricular blood cavities, left and right atrial blood cavities, "
+        "left ventricular myocardium, ascending aorta, and pulmonary artery "
+        "trunk"
+    ),
+}
+
+WHS_MRI_ROI_LOCALIZATION_PROMPTS = {
+    "1": (
+        "MRI of the whole heart, including the left and right ventricular "
+        "blood cavities, left and right atrial blood cavities, left "
+        "ventricular myocardium, ascending aorta, and pulmonary artery trunk"
+    ),
+}
+
+WHS_CT_ROI_REFINEMENT_PROMPTS = dict(WHS_CT_PROMPTS)
+WHS_MRI_ROI_REFINEMENT_PROMPTS = dict(WHS_MRI_PROMPTS)
+
+WHS_ROI_LOCALIZATION_GROUPS = ((1, 2, 3, 4, 5, 6, 7),)
+WHS_ROI_REFINEMENT_GROUPS = tuple((class_id,) for class_id in range(1, 8))
+
 MYOPS_LGE_PROMPTS = {
     "1": (
         "LGE short-axis cardiac MRI showing scar tissue within the "

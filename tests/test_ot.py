@@ -227,6 +227,44 @@ def test_multiscale_objective_filters_invalid_z_and_backpropagates_student_only(
     assert features["Zn2_s"].grad is None
 
 
+def test_relative_kd_reuses_detached_transport_and_backpropagates_both_sides():
+    torch.manual_seed(23)
+    features = {}
+    for level in [2, 3, 4, 5]:
+        for domain in ("Zb", "Zn"):
+            for branch in ("p", "s"):
+                features[f"{domain}{level}_{branch}"] = torch.randn(
+                    1, 6, 1, 4, 4, requires_grad=True
+                )
+    gt = torch.zeros(1, 1, 16, 16, dtype=torch.long)
+    gt[:, :, 4:12, 4:12] = 1
+    base_error = torch.rand(1, 1, 16, 16)
+    expert_error = base_error * 0.5
+    objective = MultiScaleOTDistillation(
+        max_grid_size=4,
+        sinkhorn_iterations=20,
+        relative_kd=True,
+        relative_kd_expert_weight=1.0,
+    )
+    output = objective(
+        features,
+        gt=gt,
+        base_error=base_error,
+        expert_error=expert_error,
+        valid_z=torch.ones(1, 1, dtype=torch.bool),
+        class_ids=[1],
+    )
+    loss = output["loss_p"] + output["loss_s"]
+    assert torch.isfinite(loss)
+    assert output["loss_p_reverse"].item() > 0.0
+    assert output["loss_s_reverse"].item() > 0.0
+    loss.backward()
+    for key in ("Zb2_p", "Zb2_s", "Zn2_p", "Zn2_s"):
+        assert features[key].grad is not None
+        assert torch.isfinite(features[key].grad).all()
+        assert features[key].grad.abs().sum().item() > 0.0
+
+
 def test_multiscale_grid_caps_native_size_without_upsampling():
     objective = MultiScaleOTDistillation(max_grid_size=32)
     assert objective._target_size(torch.empty(1, 1, 128, 96)) == (32, 32)

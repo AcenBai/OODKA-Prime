@@ -152,6 +152,8 @@ def build_fusion_modules(
     s_ot_rho_expert: float = 0.2,
     ot_sinkhorn_iterations: int = 30,
     ot_max_grid_size: int = 32,
+    relative_kd: bool = False,
+    relative_kd_expert_weight: float = 1.0,
     remove_res5_expert_branch_norm: bool = True,
 ) -> Dict[str, nn.Module]:
     """
@@ -213,6 +215,8 @@ def build_fusion_modules(
             rho_base=s_ot_rho_base,
             rho_expert=s_ot_rho_expert,
             sinkhorn_iterations=ot_sinkhorn_iterations,
+            relative_kd=relative_kd,
+            relative_kd_expert_weight=relative_kd_expert_weight,
         ).to(device)
 
     return modules

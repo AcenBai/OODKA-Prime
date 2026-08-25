@@ -342,11 +342,20 @@ def _compute_segmentation_loss_and_metrics(
             (pair_weights * loss_per_pair).sum()
             / pair_weights.sum().clamp_min(1e-6)
         )
-    elif prompt_reduction == "sum":
-        loss_seg = (
+    elif prompt_reduction in {"sum", "prompt_mean"}:
+        prompt_weight = pair_weights.sum(dim=0)
+        loss_per_prompt = (
             (pair_weights * loss_per_pair).sum(dim=0)
-            / pair_weights.sum(dim=0).clamp_min(1e-6)
-        ).sum()
+            / prompt_weight.clamp_min(1e-6)
+        )
+        if prompt_reduction == "sum":
+            loss_seg = loss_per_prompt.sum()
+        else:
+            prompt_is_valid = prompt_weight > 0
+            loss_seg = (
+                (loss_per_prompt * prompt_is_valid).sum()
+                / prompt_is_valid.sum().clamp_min(1)
+            )
     else:
         raise ValueError(f"Unknown prompt_reduction={prompt_reduction!r}")
 
@@ -704,6 +713,18 @@ def forward_one_batch(
         "loss_route": float(loss_route.detach().item()),
         "loss_p_ot": float(loss_p_ot.detach().item()),
         "loss_s_ot": float(loss_s_ot.detach().item()),
+        "loss_p_ot_forward": float(
+            ot_output.get("loss_p_forward", loss_p_ot).detach().item()
+        ),
+        "loss_s_ot_forward": float(
+            ot_output.get("loss_s_forward", loss_s_ot).detach().item()
+        ),
+        "loss_p_ot_reverse": float(
+            ot_output.get("loss_p_reverse", loss_p_ot * 0.0).detach().item()
+        ),
+        "loss_s_ot_reverse": float(
+            ot_output.get("loss_s_reverse", loss_s_ot * 0.0).detach().item()
+        ),
         "dice_mean": dice_mean,
         "dice_per_class": dice_per_class,
         "gate_mean": float(gate.detach().mean().item()),

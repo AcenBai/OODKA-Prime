@@ -95,6 +95,12 @@ class LGEROIMixedTrainer(OODKATrainer):
         anatomy_groups: Sequence[Sequence[int]],
         refinement_groups: Sequence[Sequence[int]],
         prompt_texts: dict,
+        roi_prompt_index: int = 2,
+        roi_source_labels: Sequence[int] = (1, 2, 4),
+        refinement_only_output: bool = False,
+        experiment_name: str = "LGE",
+        checkpoint_format: str = "",
+        checkpoint_prefix: str = "",
         **kwargs,
     ) -> None:
         anatomy_count = len(anatomy_groups)
@@ -104,8 +110,12 @@ class LGEROIMixedTrainer(OODKATrainer):
             P=anatomy_count,
             **kwargs,
         )
-        if self.cfg.block_z != 1:
-            raise ValueError("LGE ROI mixed training requires block_z=1")
+        if self.cfg.roi_prompt_loss_reduction not in {
+            "mean", "sum", "prompt_mean"
+        }:
+            raise ValueError(
+                "roi_prompt_loss_reduction must be mean, sum, or prompt_mean"
+            )
         self.anatomy_prompt_features = anatomy_prompt_features
         self.refinement_prompt_features = refinement_prompt_features
         self.anatomy_groups = tuple(tuple(int(v) for v in g) for g in anatomy_groups)
@@ -113,6 +123,19 @@ class LGEROIMixedTrainer(OODKATrainer):
             tuple(int(v) for v in g) for g in refinement_groups
         )
         self.prompt_texts = prompt_texts
+        self.roi_prompt_index = int(roi_prompt_index)
+        if not 0 <= self.roi_prompt_index < len(self.anatomy_groups):
+            raise ValueError(
+                f"roi_prompt_index={self.roi_prompt_index} is invalid for "
+                f"{len(self.anatomy_groups)} localization prompts"
+            )
+        self.roi_source_labels = tuple(int(value) for value in roi_source_labels)
+        if not self.roi_source_labels:
+            raise ValueError("roi_source_labels must not be empty")
+        self.refinement_only_output = bool(refinement_only_output)
+        self.experiment_name = str(experiment_name)
+        self.checkpoint_format = str(checkpoint_format)
+        self.checkpoint_prefix = str(checkpoint_prefix)
         self.roi_generator = ROIGenerator(
             threshold=self.cfg.roi_threshold,
             expand=self.cfg.roi_expand,
@@ -151,13 +174,36 @@ class LGEROIMixedTrainer(OODKATrainer):
             w_p_ot=w_p_ot * regularizer_scale,
             w_s_ot=w_s_ot * regularizer_scale,
             expert_class_groups=groups,
-            prompt_loss_reduction="sum",
+            prompt_loss_reduction=self.cfg.roi_prompt_loss_reduction,
             return_logits=True,
         )
 
-    def _online_rois(self, anatomy_logits: torch.Tensor) -> List[ROICoordinates]:
-        probabilities = torch.sigmoid(anatomy_logits[:, 2, 0].detach())
-        return [self.roi_generator.from_probability(value) for value in probabilities]
+    def _online_rois(
+        self,
+        anatomy_logits: torch.Tensor,
+        valid_z: torch.Tensor | None = None,
+    ) -> List[ROICoordinates]:
+        probabilities = torch.sigmoid(
+            anatomy_logits[:, self.roi_prompt_index].detach()
+        )
+        if valid_z is not None:
+            probabilities = probabilities.masked_fill(
+                ~valid_z.to(probabilities.device)[:, :, None, None], 0.0
+            )
+        # A single XY box is shared by the whole contiguous Z block. Taking
+        # the maximum along Z is equivalent to bounding the thresholded 3-D
+        # foreground cuboid over its complete block extent.
+        block_probability = probabilities.amax(dim=1)
+        return [
+            self.roi_generator.from_probability(value)
+            for value in block_probability
+        ]
+
+    def _roi_target_mask(self, labels: torch.Tensor) -> torch.Tensor:
+        target = torch.zeros_like(labels, dtype=torch.bool)
+        for source_id in self.roi_source_labels:
+            target |= labels == source_id
+        return target
 
     def _cached_rois(self, batch_data: dict) -> List[ROICoordinates]:
         if self.roi_cache is None:
@@ -166,27 +212,31 @@ class LGEROIMixedTrainer(OODKATrainer):
         if torch.is_tensor(starts):
             starts = starts.tolist()
         return [
-            self.roi_cache.get(case_id, int(z_index))
-            for case_id, z_index in zip(batch_data["case_id"], starts)
+            self.roi_cache.get(case_id, int(z_start))
+            for case_id, z_start in zip(batch_data["case_id"], starts)
         ]
 
-    @staticmethod
     def _roi_quality(
+        self,
         original_gt: torch.Tensor,
         rois: Sequence[ROICoordinates],
+        valid_z: torch.Tensor | None = None,
     ) -> tuple[float, float]:
         recalls = []
         area_fractions = []
         height, width = original_gt.shape[-2:]
-        for index, roi in enumerate(rois):
-            total_myo = (
-                (original_gt[index, 0] == 1)
-                | (original_gt[index, 0] == 2)
-                | (original_gt[index, 0] == 4)
-            )
-            total = int(total_myo.sum())
+        batch_size, block_z = original_gt.shape[:2]
+        if len(rois) != batch_size:
+            raise ValueError("ROI count must equal B")
+        for batch_index, roi in enumerate(rois):
+            roi_target = self._roi_target_mask(original_gt[batch_index])
+            if valid_z is not None:
+                roi_target &= valid_z[batch_index, :, None, None].to(
+                    roi_target.device
+                )
+            total = int(roi_target.sum())
             inside = int(
-                total_myo[roi.y0 : roi.y1, roi.x0 : roi.x1].sum()
+                roi_target[:, roi.y0 : roi.y1, roi.x0 : roi.x1].sum()
             )
             recalls.append(inside / total if total > 0 else 1.0)
             area_fractions.append(
@@ -266,7 +316,9 @@ class LGEROIMixedTrainer(OODKATrainer):
                     if mixed:
                         rois = (
                             self._cached_rois(batch_data)
-                            if train else self._online_rois(anatomy_logits)
+                            if train else self._online_rois(
+                                anatomy_logits, batch_data["valid_z"]
+                            )
                         )
                         if train and self.cfg.roi_v2_hard_switch:
                             rois = [
@@ -344,7 +396,9 @@ class LGEROIMixedTrainer(OODKATrainer):
                         batch_data["gt"].shape[-2:],
                     )
                     background = torch.zeros_like(anatomy_logits[:, :1])
-                    if self.cfg.roi_v2_hard_switch:
+                    if self.refinement_only_output:
+                        final_scores = torch.cat([background, restored], dim=1)
+                    elif self.cfg.roi_v2_hard_switch:
                         foreground = hard_switch_foreground_logits(
                             anatomy_logits, restored, rois
                         )
@@ -363,7 +417,8 @@ class LGEROIMixedTrainer(OODKATrainer):
                     prediction = final_scores.argmax(dim=1)
                     final_groups = (
                         self.refinement_groups
-                        if self.cfg.roi_v2_hard_switch
+                        if self.refinement_only_output
+                        or self.cfg.roi_v2_hard_switch
                         else ((3,), (5,), (4,), (1, 2))
                     )
                     target = remap_grouped_labels(
@@ -395,7 +450,7 @@ class LGEROIMixedTrainer(OODKATrainer):
 
                 if mixed:
                     roi_recall, roi_area = self._roi_quality(
-                        batch_data["gt"], rois
+                        batch_data["gt"], rois, batch_data["valid_z"]
                     )
                     meter["roi_gt_recall"] += roi_recall
                     meter["roi_area_fraction"] += roi_area
@@ -426,7 +481,8 @@ class LGEROIMixedTrainer(OODKATrainer):
             meter[key] /= max(1, n_batches)
         class_count = (
             len(self.refinement_groups)
-            if mixed and self.cfg.roi_v2_hard_switch
+            if mixed
+            and (self.refinement_only_output or self.cfg.roi_v2_hard_switch)
             else (4 if mixed else len(self.anatomy_groups))
         )
         macro, per_class = _case_dice_from_counts(case_counts, class_count)
@@ -474,35 +530,49 @@ class LGEROIMixedTrainer(OODKATrainer):
                     fusion_modules=self.fusion_modules,
                     device=self.device,
                 )
-            rois = self._online_rois(logits)
-            probabilities = torch.sigmoid(logits[:, 2, 0]).cpu()
-            targets = (
-                (batch_data["gt"][:, 0] == 1)
-                | (batch_data["gt"][:, 0] == 2)
-                | (batch_data["gt"][:, 0] == 4)
-            )
+            rois = self._online_rois(logits, batch_data["valid_z"])
+            probabilities = torch.sigmoid(
+                logits[:, self.roi_prompt_index]
+            ).cpu()
+            targets = self._roi_target_mask(batch_data["gt"])
+            valid_z_cpu = batch_data["valid_z"].bool().cpu()
+            valid_pixels = valid_z_cpu[:, :, None, None].expand_as(targets)
             predictions = probabilities >= self.cfg.roi_threshold
-            threshold_intersection += float((predictions & targets).sum())
-            threshold_predicted += float(predictions.sum())
-            threshold_target += float(targets.sum())
-            if targets.any():
-                probability_inside.append(float(probabilities[targets].mean()))
-            if (~targets).any():
-                probability_outside.append(float(probabilities[~targets].mean()))
+            threshold_intersection += float(
+                (predictions & targets & valid_pixels).sum()
+            )
+            threshold_predicted += float((predictions & valid_pixels).sum())
+            threshold_target += float((targets & valid_pixels).sum())
+            inside_mask = targets & valid_pixels
+            outside_mask = (~targets) & valid_pixels
+            if inside_mask.any():
+                probability_inside.append(
+                    float(probabilities[inside_mask].mean())
+                )
+            if outside_mask.any():
+                probability_outside.append(
+                    float(probabilities[outside_mask].mean())
+                )
             starts = batch_data["z_start"]
             if torch.is_tensor(starts):
                 starts = starts.tolist()
-            for case_id, z_index, roi in zip(
+            for case_id, z_start, roi in zip(
                 batch_data["case_id"], starts, rois
             ):
-                cache.set(case_id, int(z_index), roi)
-            recall, _ = self._roi_quality(batch_data["gt"], rois)
+                cache.set(case_id, int(z_start), roi)
+                all_rois.append(roi)
+            recall, _ = self._roi_quality(
+                batch_data["gt"], rois, batch_data["valid_z"]
+            )
             gt_recalls.append(recall)
-            all_rois.extend(rois)
         diagnostics = roi_diagnostics(
             all_rois, (self.cfg.image_size, self.cfg.image_size)
         )
-        diagnostics["total_myo_gt_recall_mean"] = float(np.mean(gt_recalls))
+        diagnostics["roi_target_gt_recall_mean"] = float(np.mean(gt_recalls))
+        if self.experiment_name == "LGE":
+            diagnostics["total_myo_gt_recall_mean"] = diagnostics[
+                "roi_target_gt_recall_mean"
+            ]
         diagnostics["threshold_mask_dice"] = (
             2.0 * threshold_intersection
             / max(1.0, threshold_predicted + threshold_target)
@@ -535,30 +605,36 @@ class LGEROIMixedTrainer(OODKATrainer):
         return cache, diagnostics
 
     def _save_roi_checkpoint(self, epoch: int, best: bool = False) -> None:
+        default_format = (
+            "oodka_lge_flat_v1"
+            if self.cfg.lge_flat_four_prompt
+            else (
+                "oodka_lge_roi_v3_split5"
+                if self.cfg.lge_split_pathology
+                else "oodka_lge_roi_v2"
+                if self.cfg.roi_v2_hard_switch
+                else "oodka_lge_roi_v1"
+            )
+        )
         state = {
             "epoch": epoch,
             "best_val_dice": self.best_val_dice,
             "config": asdict(self.cfg),
-            "format": (
-                "oodka_lge_flat_v1"
-                if self.cfg.lge_flat_four_prompt
-                else (
-                    "oodka_lge_roi_v3_split5"
-                    if self.cfg.lge_split_pathology
-                    else "oodka_lge_roi_v2"
-                    if self.cfg.roi_v2_hard_switch
-                    else "oodka_lge_roi_v1"
-                )
-            ),
+            "format": self.checkpoint_format or default_format,
             "prompt_texts": self.prompt_texts,
             "anatomy_groups": self.anatomy_groups,
             "refinement_groups": self.refinement_groups,
+            "roi_prompt_index": self.roi_prompt_index,
+            "roi_source_labels": self.roi_source_labels,
+            "refinement_only_output": self.refinement_only_output,
         }
         for name, module in self.fusion_modules.items():
             state[name] = module.state_dict()
         state["optimizer"] = self.optimizer.state_dict()
         state["scaler"] = self.scaler.state_dict()
-        if self.cfg.lge_flat_four_prompt:
+        if self.checkpoint_prefix:
+            prefix = self.checkpoint_prefix
+        elif self.cfg.lge_flat_four_prompt:
             prefix = "fusion_lge_flat"
         else:
             prefix = (
@@ -572,7 +648,9 @@ class LGEROIMixedTrainer(OODKATrainer):
 
     def _evaluate_best_on_test(self, epoch: int) -> dict:
         """Run the current validation-best checkpoint on test for diagnostics."""
-        if self.cfg.lge_flat_four_prompt:
+        if self.checkpoint_prefix:
+            prefix = self.checkpoint_prefix
+        elif self.cfg.lge_flat_four_prompt:
             prefix = "fusion_lge_flat"
         else:
             prefix = (
@@ -654,15 +732,17 @@ class LGEROIMixedTrainer(OODKATrainer):
         cache_loader, _ = self._make_loader(train_dataset, shuffle=False)
         val_loader, val_sampler = self._make_loader(val_dataset, shuffle=False)
         log(
-            f"LGE {'flat-4' if cfg.lge_flat_four_prompt else ('ROI v3 split-5' if cfg.lge_split_pathology else ('ROI v2' if cfg.roi_v2_hard_switch else 'ROI v1'))}: "
+            f"{self.experiment_name} "
+            f"{'flat-4' if cfg.lge_flat_four_prompt else ('ROI v3 split-5' if cfg.lge_split_pathology else ('ROI v2' if cfg.roi_v2_hard_switch else 'ROI v1'))}: "
             f"train={len(train_ids)} cases/{len(train_dataset)} slices, "
             f"val={len(val_ids)} cases/{len(val_dataset)} slices"
         )
         log(
-            f"B={cfg.batch_size}, Z=1, image={cfg.image_size}, "
+            f"B={cfg.batch_size}, Z={cfg.block_z}, image={cfg.image_size}, "
             f"warmup={cfg.roi_warmup_epochs}, threshold={cfg.roi_threshold}, "
             f"expand={cfg.roi_expand}, pseudoRGB={cfg.pseudo_rgb_mode}, "
-            f"augment={cfg.lge_augment}"
+            f"augment={cfg.lge_augment}, "
+            f"promptReduction={cfg.roi_prompt_loss_reduction}"
         )
 
         for epoch in range(self.start_epoch, cfg.n_epochs + 1):
