@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="/data4/baihexiang/SegMan/spatial_combination"
 PYTHON="/data4/baihexiang/conda_envs/biomedparse_v2/bin/python"
-EXP_DIR="${ROOT}/experiments/spatial_beta_p07_ct_f0_relativekd_no_roi_noaug_30ep_20260825"
+EXP_DIR="${1:-${ROOT}/experiments/spatial_beta_p07_ct_f0_relativekd_no_roi_noaug_30ep_20260825}"
 OLD_SCALE="${ROOT}/experiments/spatial_beta_p07_ct_f0_30ep_20260730/analysis/mechanism_v3/heart_1004_z0079/representation/color_scales.json"
 
 export CUDA_VISIBLE_DEVICES=0

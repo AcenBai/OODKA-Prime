@@ -38,8 +38,12 @@ from oodka.models.prompts import (
     MYOPS_LGE_ROI_V3_REFINEMENT_PROMPTS,
     WHS_CT_ROI_LOCALIZATION_PROMPTS,
     WHS_CT_ROI_REFINEMENT_PROMPTS,
+    WHS_CT_GV_LOCALIZATION_PROMPTS,
+    WHS_CT_GV_REFINEMENT_PROMPTS,
     WHS_MRI_ROI_LOCALIZATION_PROMPTS,
     WHS_MRI_ROI_REFINEMENT_PROMPTS,
+    WHS_MRI_GV_LOCALIZATION_PROMPTS,
+    WHS_MRI_GV_REFINEMENT_PROMPTS,
     WHS_ROI_REFINEMENT_GROUPS,
 )
 from oodka.train.forward import predict_block_logits_per_class
@@ -145,17 +149,26 @@ def main() -> None:
         "oodka_lge_roi_v1", "oodka_lge_roi_v2",
         "oodka_lge_roi_v3_split5", "oodka_lge_flat_v1",
         "oodka_whs_roi_v1",
+        "oodka_whs_gv_roi_v1",
     }:
         raise ValueError("Checkpoint is not a supported OODKA ROI model")
-    is_whs = checkpoint_format == "oodka_whs_roi_v1"
+    is_whs_gv = checkpoint_format == "oodka_whs_gv_roi_v1"
+    is_whs = checkpoint_format in {
+        "oodka_whs_roi_v1", "oodka_whs_gv_roi_v1"
+    }
     is_split = checkpoint_format == "oodka_lge_roi_v3_split5"
     is_v2 = checkpoint_format in {"oodka_lge_roi_v2", "oodka_lge_roi_v3_split5"}
     is_flat = checkpoint_format == "oodka_lge_flat_v1"
     decision = args.decision
     if decision == "auto":
-        decision = "refinement" if is_whs else "spatial" if is_v2 else "flat"
-    if is_whs and decision != "refinement":
-        raise ValueError("WHS checkpoints require --decision refinement (or auto)")
+        decision = (
+            "spatial" if is_whs_gv else "refinement" if is_whs
+            else "spatial" if is_v2 else "flat"
+        )
+    if is_whs_gv and decision != "spatial":
+        raise ValueError("WHS-GV checkpoints require --decision spatial (or auto)")
+    if is_whs and not is_whs_gv and decision != "refinement":
+        raise ValueError("WHS whole-heart checkpoints require refinement (or auto)")
     if is_v2 and decision != "spatial":
         raise ValueError("V2 checkpoints require --decision spatial (or auto)")
     if not is_v2 and not is_whs and decision == "spatial":
@@ -197,11 +210,23 @@ def main() -> None:
     model = load_frozen_biomedparse(device)
     if is_whs:
         if dataset_name == "Dataset009_CT_OOD":
-            anatomy_prompts = WHS_CT_ROI_LOCALIZATION_PROMPTS
-            refinement_prompts = WHS_CT_ROI_REFINEMENT_PROMPTS
+            anatomy_prompts = (
+                WHS_CT_GV_LOCALIZATION_PROMPTS
+                if is_whs_gv else WHS_CT_ROI_LOCALIZATION_PROMPTS
+            )
+            refinement_prompts = (
+                WHS_CT_GV_REFINEMENT_PROMPTS
+                if is_whs_gv else WHS_CT_ROI_REFINEMENT_PROMPTS
+            )
         elif dataset_name == "Dataset010_WHS_MRI_OOD":
-            anatomy_prompts = WHS_MRI_ROI_LOCALIZATION_PROMPTS
-            refinement_prompts = WHS_MRI_ROI_REFINEMENT_PROMPTS
+            anatomy_prompts = (
+                WHS_MRI_GV_LOCALIZATION_PROMPTS
+                if is_whs_gv else WHS_MRI_ROI_LOCALIZATION_PROMPTS
+            )
+            refinement_prompts = (
+                WHS_MRI_GV_REFINEMENT_PROMPTS
+                if is_whs_gv else WHS_MRI_ROI_REFINEMENT_PROMPTS
+            )
         else:
             raise ValueError(f"Unsupported WHS dataset: {dataset_name}")
     else:
@@ -354,9 +379,14 @@ def main() -> None:
                         ]
                     elif args.roi_source == "ground_truth":
                         foreground_source_ids = tuple(
-                            source_id
-                            for group in final_groups
-                            for source_id in group
+                            int(source_id) for source_id in checkpoint.get(
+                                "roi_source_labels",
+                                tuple(
+                                    source_id
+                                    for group in final_groups
+                                    for source_id in group
+                                ),
+                            )
                         )
                         rois = []
                         for z_start, block_valid in zip(current_starts, valid):
@@ -419,7 +449,12 @@ def main() -> None:
                         foreground_scores = restored
                     elif decision == "spatial":
                         foreground_scores = hard_switch_foreground_logits(
-                            anatomy, restored, rois
+                            anatomy,
+                            restored,
+                            rois,
+                            checkpoint.get(
+                                "outside_prompt_mapping", ((0, 0), (1, 1))
+                            ),
                         )
                     elif decision == "hierarchical":
                         foreground_scores = _hierarchical_foreground_logits(
@@ -454,7 +489,14 @@ def main() -> None:
                 roi = rois[block_index]
                 all_rois.append(roi)
                 foreground_source_ids = tuple(
-                    source_id for group in final_groups for source_id in group
+                    int(source_id) for source_id in checkpoint.get(
+                        "roi_source_labels",
+                        tuple(
+                            source_id
+                            for group in final_groups
+                            for source_id in group
+                        ),
+                    )
                 )
                 total_myo = np.isin(
                     aligned_seg[z_start : z_start + valid_count],

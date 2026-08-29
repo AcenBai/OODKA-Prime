@@ -176,8 +176,14 @@ def hard_switch_foreground_logits(
     anatomy_logits: torch.Tensor,
     restored_roi_logits: torch.Tensor,
     rois: Sequence[ROICoordinates],
+    outside_prompt_mapping: Sequence[tuple[int, int]] = ((0, 0), (1, 1)),
 ) -> torch.Tensor:
-    """Use Pass 1 outside each ROI and Pass 2 inside, without logit mixing."""
+    """Use mapped Pass-1 classes outside each ROI and Pass 2 inside.
+
+    ``outside_prompt_mapping`` contains ``(anatomy_index, output_index)``
+    pairs. Auxiliary localization prompts can therefore produce the ROI
+    without ever becoming deployable output classes.
+    """
     if anatomy_logits.ndim != 5 or anatomy_logits.shape[1] < 2:
         raise ValueError("anatomy_logits must be [B,>=2,Z,H,W]")
     if restored_roi_logits.ndim != 5 or restored_roi_logits.shape[1] < 4:
@@ -188,7 +194,20 @@ def hard_switch_foreground_logits(
     outside = restored_roi_logits.new_full(
         (batch_size, prompt_count, block_z, height, width), -20.0
     )
-    outside[:, 0:2] = anatomy_logits[:, 0:2]
+    for anatomy_index, output_index in outside_prompt_mapping:
+        anatomy_index = int(anatomy_index)
+        output_index = int(output_index)
+        if not 0 <= anatomy_index < anatomy_logits.shape[1]:
+            raise ValueError(
+                f"Invalid anatomy prompt index {anatomy_index} for "
+                f"{anatomy_logits.shape[1]} prompts"
+            )
+        if not 0 <= output_index < prompt_count:
+            raise ValueError(
+                f"Invalid output prompt index {output_index} for "
+                f"{prompt_count} prompts"
+            )
+        outside[:, output_index] = anatomy_logits[:, anatomy_index]
     mask = torch.zeros(
         (batch_size, 1, block_z, height, width),
         dtype=torch.bool,

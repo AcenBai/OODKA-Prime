@@ -432,7 +432,7 @@ shell/run_ct_relative_kd_no_roi_noaug_30ep_20260825.sh
 
 ## 14. 测试状态
 
-当前 repository tests：`43 passed`。
+当前 repository tests：`45 passed`（2026-08-29 全量回归）。
 
 新增覆盖包括：
 
@@ -456,3 +456,92 @@ shell/run_ct_relative_kd_no_roi_noaug_30ep_20260825.sh
 当前最可靠的总判断是：
 
 > ROI localization 已经基本可用；CT/MRI 的主要问题是 local refinement 完整替换了一个更强的 global seven-class predictor。下一版应把 ROI 设计成保底全局预测上的局部增量，而不是另起一个必须独自完成任务的替代模型。
+
+## 16. 2026-08-29 实验结果与最新诊断
+
+### 16.1 MRI great-vessel bridge ROI
+
+新策略的 Pass 1 为六类全图预测：LV、RV、LA、RA、Myo、GV，其中
+GV 是 AO 与 PA 的并集，只负责产生 ROI；Pass 2 在 ROI 内细分完整七类，
+ROI 外保留前五个全图类别。配置为 `B=2, Z=4`、adjacent pseudo-RGB、
+augmentation、prompt-mean loss、30 epochs。
+
+独立 test（26 cases，predicted ROI，spatial hard switch）：
+
+| class | Dice |
+|---|---:|
+| LV | 0.8414 |
+| RV | 0.6549 |
+| LA | 0.8311 |
+| RA | 0.7490 |
+| Myo | 0.6409 |
+| AO | 0.4073 |
+| PA | 0.4310 |
+| mean | **0.6508** |
+
+它高于旧 3D whole-heart ROI 的 `0.6399`，但仍低于约 `0.67` 的
+historical no-ROI baseline。GV threshold mask Dice 为 `0.4346`，precision
+为 `0.3169`，expanded ROI 的 GT recall 约为 `0.9536`，full-image fallback
+rate 为 `0.2613`。结论是 GV bridge 有小幅改善，但仍未实现 ROI 正增益，
+AO/PA 是主要瓶颈。
+
+### 16.2 CT great-vessel bridge ROI
+
+`B=1, Z=4, 512x512` 在 epoch 10 warm-up 后切换到同时保留 full-image
+anchor 和 ROI refinement 两套反向图，训练进程峰值约 `20.50 GiB`。
+当时 GPU 另有约 3 GiB 常驻进程，epoch 11 申请额外 448 MiB 时 OOM。
+warm-up epoch-10 六类 validation Dice 为 `0.8974`，但没有保存 checkpoint，
+不能续训。已提供在完全空闲 GPU 上从头重跑 Z4/B1 的手动脚本。
+
+### 16.3 Relative KD CT
+
+关闭 ROI 和 augmentation、只开启 bidirectional relative KD 的 CT 30-epoch
+实验已完成。独立 test mean Dice 为 `0.89318`；旧 no-KD adjacent diagnostic
+为 `0.88766`，绝对提升约 `0.00552`。性能有小幅收益，但 Expert P/S 的
+可视化仍主要表现为区域内部/边缘、高频/低频的互补分解，没有形成预期的
+语义解耦。
+
+KD 日志中的 `P/S` 是 forward 与 reverse 的合计。拆分结果如下：
+
+| epoch | P forward | S forward | P reverse | S reverse |
+|---:|---:|---:|---:|---:|
+| 5 | 0.2023 | 0.2788 | 0.1345 | 0.1715 |
+| 10 | 0.1241 | 0.1193 | 0.0697 | 0.0514 |
+| 20 | 0.0886 | 0.0753 | 0.0433 | 0.0214 |
+| 30 | 0.0795 | 0.0656 | 0.0378 | 0.0182 |
+
+epoch 30 的 raw forward/reverse 比约为 `2.59:1`。乘以 `wP=wS=0.1`
+后，作用于 Expert 的 reverse KD 约为 `0.0056`，只占 validation total
+loss `0.5094` 的约 1.1%。transport 数值稳定且 loss 正常下降，但当前
+cosine KD 只约束每个空间 token 的通道方向，不约束 channel-RMS energy、
+P/S energy share 或空间关系，因此 KD 收敛不等价于 Expert energy maps
+语义化。
+
+### 16.4 Expert 平凡解的结构性原因与候选修正
+
+Student 使用两个无 bias、无 branch normalization 的 1x1x1 projections，
+直接满足 `P_b + S_b ~= Z_b`，并经过 frozen BiomedParse pixel decoder、
+prompt embedding 和 spatial router 接收 segmentation gradient。Expert 则
+经过公共 Conv-IN-GELU、两个独立 Conv-IN branch heads，以及两个独立可学习
+decoder，满足 `R_p(P_e) + R_s(S_e) ~= Z_e`。Expert P/S 不进入最终 predictor。
+
+因此 Expert 存在独立通道旋转/缩放可由各自 decoder 逆向补偿的 gauge
+freedom；orthogonality 只能鼓励互补，不能确定 branch semantics。res2--res4
+的独立 branch InstanceNorm 还会把 P/S 分别标准化到相近方差，容易产生接近
+0.5 的 S-share 和边缘/内部互补解。
+
+在不让 Expert 承担分割任务、继续以 BiomedParse 为轴体的前提下，建议按顺序
+做以下受控消融：
+
+1. 冻结 Student decomposers 与 Beta router，关闭 forward KD，只更新 Expert；
+2. 单独将 reverse KD 权重提高到 3--5，transport 仍逐 iteration 重算并 detach；
+3. 将 Expert orthogonality 权重从 0.3 暂降到 0.05--0.1；
+4. 去掉 res2--res5 Expert branch heads 各自的 InstanceNorm，仅保留公共 adapter norm；
+5. 增加 transported S-share/energy matching 与 spatial relational KD，以补足 cosine
+   对能量和空间关系不敏感的问题；
+6. 若仍存在平凡解，将两个独立 decoder 改为共享 `R(P_e+S_e)`，并增加
+   aligned-space `P_e+S_e ~= U_e`，限制独立 decoder 的补偿自由度。
+
+优先记录每层 forward/reverse KD、Expert adapter gradient norm、P/S RMS、
+S-share 均值/方差、cross-branch affinity 和 frozen linear-probe semantics，
+避免继续只根据总 loss 判断语义传递是否成功。

@@ -98,6 +98,7 @@ class LGEROIMixedTrainer(OODKATrainer):
         roi_prompt_index: int = 2,
         roi_source_labels: Sequence[int] = (1, 2, 4),
         refinement_only_output: bool = False,
+        outside_prompt_mapping: Sequence[tuple[int, int]] = ((0, 0), (1, 1)),
         experiment_name: str = "LGE",
         checkpoint_format: str = "",
         checkpoint_prefix: str = "",
@@ -133,6 +134,19 @@ class LGEROIMixedTrainer(OODKATrainer):
         if not self.roi_source_labels:
             raise ValueError("roi_source_labels must not be empty")
         self.refinement_only_output = bool(refinement_only_output)
+        self.outside_prompt_mapping = tuple(
+            (int(anatomy_index), int(output_index))
+            for anatomy_index, output_index in outside_prompt_mapping
+        )
+        for anatomy_index, output_index in self.outside_prompt_mapping:
+            if not 0 <= anatomy_index < len(self.anatomy_groups):
+                raise ValueError(
+                    f"Invalid outside anatomy prompt index {anatomy_index}"
+                )
+            if not 0 <= output_index < len(self.refinement_groups):
+                raise ValueError(
+                    f"Invalid outside refinement index {output_index}"
+                )
         self.experiment_name = str(experiment_name)
         self.checkpoint_format = str(checkpoint_format)
         self.checkpoint_prefix = str(checkpoint_prefix)
@@ -400,7 +414,10 @@ class LGEROIMixedTrainer(OODKATrainer):
                         final_scores = torch.cat([background, restored], dim=1)
                     elif self.cfg.roi_v2_hard_switch:
                         foreground = hard_switch_foreground_logits(
-                            anatomy_logits, restored, rois
+                            anatomy_logits,
+                            restored,
+                            rois,
+                            self.outside_prompt_mapping,
                         )
                         final_scores = torch.cat([background, foreground], dim=1)
                     else:
@@ -627,6 +644,7 @@ class LGEROIMixedTrainer(OODKATrainer):
             "roi_prompt_index": self.roi_prompt_index,
             "roi_source_labels": self.roi_source_labels,
             "refinement_only_output": self.refinement_only_output,
+            "outside_prompt_mapping": self.outside_prompt_mapping,
         }
         for name, module in self.fusion_modules.items():
             state[name] = module.state_dict()

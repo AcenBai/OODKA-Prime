@@ -16,8 +16,15 @@ from oodka.config import TrainConfig
 from oodka.models.prompts import (
     WHS_CT_ROI_LOCALIZATION_PROMPTS,
     WHS_CT_ROI_REFINEMENT_PROMPTS,
+    WHS_CT_GV_LOCALIZATION_PROMPTS,
+    WHS_CT_GV_REFINEMENT_PROMPTS,
     WHS_MRI_ROI_LOCALIZATION_PROMPTS,
     WHS_MRI_ROI_REFINEMENT_PROMPTS,
+    WHS_MRI_GV_LOCALIZATION_PROMPTS,
+    WHS_MRI_GV_REFINEMENT_PROMPTS,
+    WHS_GV_LOCALIZATION_GROUPS,
+    WHS_GV_OUTSIDE_PROMPT_MAPPING,
+    WHS_GV_REFINEMENT_GROUPS,
     WHS_ROI_LOCALIZATION_GROUPS,
     WHS_ROI_REFINEMENT_GROUPS,
 )
@@ -35,12 +42,16 @@ DATASET_SPECS = {
         "default_image_size": 512,
         "localization_prompts": WHS_CT_ROI_LOCALIZATION_PROMPTS,
         "refinement_prompts": WHS_CT_ROI_REFINEMENT_PROMPTS,
+        "gv_localization_prompts": WHS_CT_GV_LOCALIZATION_PROMPTS,
+        "gv_refinement_prompts": WHS_CT_GV_REFINEMENT_PROMPTS,
     },
     "Dataset010_WHS_MRI_OOD": {
         "modality": "mri",
         "default_image_size": 320,
         "localization_prompts": WHS_MRI_ROI_LOCALIZATION_PROMPTS,
         "refinement_prompts": WHS_MRI_ROI_REFINEMENT_PROMPTS,
+        "gv_localization_prompts": WHS_MRI_GV_LOCALIZATION_PROMPTS,
+        "gv_refinement_prompts": WHS_MRI_GV_REFINEMENT_PROMPTS,
     },
 }
 
@@ -64,6 +75,11 @@ def _source_metadata(cfg: TrainConfig) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_name", required=True, choices=tuple(DATASET_SPECS))
+    parser.add_argument(
+        "--roi_strategy",
+        choices=("whole_heart", "great_vessel"),
+        default="whole_heart",
+    )
     parser.add_argument("--device", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--n_epochs", type=int, default=100)
@@ -172,8 +188,21 @@ def main() -> None:
     model_nnunet, model_biomedparse = load_frozen_backbones(
         cfg.nnunet_model_dir, cfg.fold, device
     )
-    localization_prompts = spec["localization_prompts"]
-    refinement_prompts = spec["refinement_prompts"]
+    great_vessel = args.roi_strategy == "great_vessel"
+    localization_prompts = spec[
+        "gv_localization_prompts" if great_vessel else "localization_prompts"
+    ]
+    refinement_prompts = spec[
+        "gv_refinement_prompts" if great_vessel else "refinement_prompts"
+    ]
+    localization_groups = (
+        WHS_GV_LOCALIZATION_GROUPS
+        if great_vessel else WHS_ROI_LOCALIZATION_GROUPS
+    )
+    refinement_groups = (
+        WHS_GV_REFINEMENT_GROUPS
+        if great_vessel else WHS_ROI_REFINEMENT_GROUPS
+    )
     localization_features = build_prompt_features(
         model_biomedparse, localization_prompts, device
     )
@@ -183,7 +212,7 @@ def main() -> None:
     fusion_modules = build_fusion_modules(
         model_nnunet,
         model_biomedparse,
-        len(WHS_ROI_LOCALIZATION_GROUPS),
+        len(localization_groups),
         device,
         text_dim=int(localization_features["class_emb"].shape[-1]),
         route_prior_p_mean=cfg.route_prior_p_mean,
@@ -211,18 +240,30 @@ def main() -> None:
         fusion_modules=fusion_modules,
         anatomy_prompt_features=localization_features,
         refinement_prompt_features=refinement_features,
-        anatomy_groups=WHS_ROI_LOCALIZATION_GROUPS,
-        refinement_groups=WHS_ROI_REFINEMENT_GROUPS,
+        anatomy_groups=localization_groups,
+        refinement_groups=refinement_groups,
         prompt_texts={
             "localization": localization_prompts,
             "refinement": refinement_prompts,
         },
-        roi_prompt_index=0,
-        roi_source_labels=tuple(range(1, 8)),
-        refinement_only_output=True,
-        experiment_name=f"WHS-{str(spec['modality']).upper()}",
-        checkpoint_format="oodka_whs_roi_v1",
-        checkpoint_prefix=f"fusion_whs_{spec['modality']}_roi",
+        roi_prompt_index=5 if great_vessel else 0,
+        roi_source_labels=(6, 7) if great_vessel else tuple(range(1, 8)),
+        refinement_only_output=not great_vessel,
+        outside_prompt_mapping=(
+            WHS_GV_OUTSIDE_PROMPT_MAPPING
+            if great_vessel else ((0, 0), (1, 1))
+        ),
+        experiment_name=(
+            f"WHS-{str(spec['modality']).upper()}-GV"
+            if great_vessel else f"WHS-{str(spec['modality']).upper()}"
+        ),
+        checkpoint_format=(
+            "oodka_whs_gv_roi_v1" if great_vessel else "oodka_whs_roi_v1"
+        ),
+        checkpoint_prefix=(
+            f"fusion_whs_{spec['modality']}_gv_roi"
+            if great_vessel else f"fusion_whs_{spec['modality']}_roi"
+        ),
     )
     trainer.train()
 

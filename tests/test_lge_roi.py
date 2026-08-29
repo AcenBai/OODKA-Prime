@@ -141,6 +141,28 @@ def test_v3_hard_switch_supports_separate_edema_channel():
     assert torch.all(labels[1:3, 1:3] == 5)
 
 
+def test_gv_hard_switch_preserves_five_global_classes_outside_roi():
+    anatomy = torch.full((1, 6, 4, 6, 6), -5.0)
+    # Global MYO wins outside. GV is auxiliary and deliberately strongest,
+    # but must never become a final output channel.
+    anatomy[:, 4] = 6.0
+    anatomy[:, 5] = 12.0
+    refinement = torch.full((1, 7, 4, 6, 6), -5.0)
+    refinement[:, 6] = 9.0  # PA inside the GV ROI.
+    roi = ROICoordinates(2, 1, 5, 5)
+    foreground = hard_switch_foreground_logits(
+        anatomy,
+        refinement,
+        [roi],
+        tuple((index, index) for index in range(5)),
+    )
+    labels = torch.cat(
+        [torch.zeros_like(foreground[:, :1]), foreground], dim=1
+    ).argmax(dim=1)[0]
+    assert torch.all(labels[:, 0, 0] == 5)
+    assert torch.all(labels[:, 1:5, 2:5] == 7)
+
+
 def test_roi_visibility_skips_truncated_positive_but_keeps_true_negative():
     gt = torch.zeros((1, 1, 8, 8), dtype=torch.long)
     gt[0, 0, 1:5, 1:5] = 3

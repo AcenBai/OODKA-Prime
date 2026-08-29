@@ -1,0 +1,787 @@
+% Main-text-oriented matrix reformulation of the current OODKA-OT code.
+% Content follows docs/oodka_current_method.tex; implementation-specific
+% constants are retained in the appendix rather than interrupting the method.
+
+\documentclass[10pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\cI}{\mathcal{I}}
+\newcommand{\cQ}{\mathcal{Q}}
+\newcommand{\cL}{\mathcal{L}}
+\newcommand{\cG}{\mathcal{G}}
+\newcommand{\ones}{\bm{1}}
+\newcommand{\diag}{\operatorname{Diag}}
+\newcommand{\Mat}{\operatorname{Mat}}
+\newcommand{\Resize}{\operatorname{Resize}}
+\newcommand{\IN}{\operatorname{IN}}
+\newcommand{\LN}{\operatorname{LN}}
+\newcommand{\GELU}{\operatorname{GELU}}
+\newcommand{\softplus}{\operatorname{softplus}}
+\newcommand{\sigm}{\operatorname{sigmoid}}
+\newcommand{\Norm}{\operatorname{Norm}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\KL}{\operatorname{KL}}
+\newcommand{\stopgrad}{\operatorname{stopgrad}}
+\newcommand{\rowcos}{\operatorname{rowcos}}
+\newcommand{\RoiBox}{\operatorname{Box}}
+\newcommand{\Crop}{\operatorname{CropResize}}
+\newcommand{\ind}{\mathbb{1}}
+\newcommand{\balpha}{\bm{\alpha}}
+\newcommand{\bbeta}{\bm{\beta}}
+
+\title{OODKA-OT: Unified Matrix Formulation}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+OODKA-OT learns a prompt-indexed mixture of two complementary feature
+components from a frozen BiomedParse foundation model.  A frozen nnUNet expert
+is used only during training to define component-specific transport teachers:
+balanced transport for the structure-oriented component $P$ and unbalanced
+transport for the task-residual component $S$.  We formulate decomposition,
+decorrelation, prompt-conditioned Beta routing, transport distillation, and LGE
+ROI refinement as one factorize--align--recombine system.  The formulation is
+matrix-based but remains faithful to the current implementation, including
+valid-slice masking, loss reductions, detached transport, cached training ROIs,
+and pure-student deployment.
+\end{abstract}
+
+\section{Unified Problem Formulation}
+
+Let $B_{\phi_b}$ denote the frozen BiomedParse visual encoder and
+$E_{\phi_n}$ the frozen nnUNet expert; the frozen BiomedParse pixel decoder and
+prompt predictor are denoted separately below.  Their parameters
+$\phi_b,\phi_n$ never receive gradients.  The trainable set $\Theta$ contains
+the foundation/expert feature adapters, the two-component factorization
+modules, and the prompt-conditioned router.
+
+Training uses block tuples
+\begin{equation}
+ (\bm x^b,\bm x^n,\bm Y,\bm v)
+ \in
+ \R^{B\times Z\times3\times H\times W}
+ \times\R^{B\times C_n\times Z\times H\times W}
+ \times\{-1,0,1,\ldots\}^{B\times Z\times H\times W}
+ \times\{0,1\}^{B\times Z},
+ \label{eq:block-inputs}
+\end{equation}
+where $\bm v$ marks real versus repeated tail slices.  Both two-dimensional
+encoders process the $BZ$ slices as a flattened batch before their features are
+restored to block form.
+
+We use $d\in\{b,n\}$ for the foundation/expert side,
+$\xi\in\{p,s\}$ for the two components,
+$\ell\in\cI=\{2,3,4,5\}$ for feature level,
+$r\in\cQ=\{\mathrm{mask},5,4,3\}$ for frozen pixel-decoder resolution,
+$c$ for prompt, and $j\in\{A,R\}$ for the LGE anatomy/refinement pass.
+
+For block $b$ with $Z$ slices, channels are placed in columns:
+\begin{equation}
+ \bm X_{\ell b}^{d}
+ =\Mat(\bm Z_{\ell b}^{d})
+ \in\R^{N_\ell\times C_\ell^d},
+ \qquad N_\ell=ZH_\ell W_\ell .
+ \label{eq:token-convention}
+\end{equation}
+Before unfolding, the raw expert feature is trilinearly resized to
+$(Z,H_\ell,W_\ell)$.  A diagonal matrix
+$\bm V_{\ell b}$ repeats $v_{bz}\in\{0,1\}$ over spatial rows and removes padded
+tail slices from segmentation, reconstruction, decorrelation, and OT losses.
+It does not remove them from the forward pass; the router KL has no slice
+factor and is evaluated once per prompt field.
+All instance-normalization operators below act independently per block and
+channel over that block's $ZHW$ sites; no normalization crosses blocks.
+
+Let $\mathcal D_{\Theta,\xi}^b$ denote the foundation factorizer,
+$\Psi_{\phi_b}$ the frozen pixel decoder, $\mathcal M_{\bm\Gamma}$ the
+prompt--spatial mixer, $\mathcal H_{\phi_b}$ the frozen prompt predictor,
+$\mathcal A_{Q_m}$ mask-query averaging, and $\mathcal U$ output-logit resizing.
+The deployed student is the single operator
+\begin{equation}
+\boxed{
+\begin{aligned}
+ \bm F_\xi
+ &=\Psi_{\phi_b}\!\left(
+    \mathcal D_{\Theta,\xi}^b(B_{\phi_b}(\bm x^b))\right),
+ \qquad \xi\in\{p,s\},\\
+ \bm L_\Theta(\bm x^b,\bm T)
+ &=\mathcal U\circ\mathcal A_{Q_m}\circ\mathcal H_{\phi_b}
+   \left(
+   \mathcal M_{\bar{\bm\Gamma}_\Theta(\bm T)}[\bm F_p,\bm F_s],
+   \bm T\right).
+\end{aligned}}
+\label{eq:student-master}
+\end{equation}
+Here $\bm T\in\R^{C_{\mathrm{pr}}\times d_t}$ stacks frozen prompt embeddings.
+The bar denotes the deterministic Beta mean used for validation and deployment;
+during training it is replaced by a reparameterized sample from the same
+router field.  Both cases are formalized in
+Section~\ref{sec:matrix-routing}.
+The expert and all OT/UOT operators are absent from
+Eq.~\eqref{eq:student-master}; they only constrain its representation during
+training.
+
+At training time the shared factors induce two parallel, rather than serial,
+graphs:
+\begin{equation}
+\boxed{
+\begin{aligned}
+ \mathcal B_{\mathrm{pred}}:\quad
+ &(\bm P^b,\bm S^b)
+ \xrightarrow{\ \Psi_{\phi_b}\ }
+ (\bm F_p,\bm F_s)
+ \xrightarrow{\ \bm\Gamma_\Theta(\bm T)\ }
+ \bm L
+ \longrightarrow(\cL_{\mathrm{seg}},\cL_{\mathrm{route}}),\\
+ \mathcal B_{\mathrm{align}}:\quad
+ &(\bm P^b,\bm S^b;\bm P^n,\bm S^n)
+ \longrightarrow
+ \left\{
+ \begin{aligned}
+  &(\cL_{\mathrm{ae}},\cL_{\mathrm{ort}}),\\[-1mm]
+  &(\bm\Pi^p,\bm\Pi^s)
+   \longrightarrow(\widetilde{\bm Y}^p,\widetilde{\bm Y}^s)
+   \longrightarrow(\cL_{P\text{-OT}},\cL_{S\text{-UOT}}).
+ \end{aligned}
+ \right.
+\end{aligned}}
+\label{eq:parallel-training-graph}
+\end{equation}
+The alignment branch terminates in regularizers; no transported teacher is an
+input to the predictive branch.
+
+\section{Complementary Matrix Factorization}
+
+\subsection{Two-sided factorization}
+
+All channel maps in this subsection are bias-free $1\times1\times1$
+convolutions, hence right matrix multiplications under
+Eq.~\eqref{eq:token-convention}.  The foundation decomposition is
+\begin{equation}
+\boxed{
+ \begin{bmatrix}\bm P_{\ell b}^b&\bm S_{\ell b}^b\end{bmatrix}
+ =
+ \bm X_{\ell b}^b
+ \begin{bmatrix}\bm W_{\ell p}^b&\bm W_{\ell s}^b\end{bmatrix}.}
+\label{eq:foundation-factor}
+\end{equation}
+Both outputs retain $C_\ell^b$ channels and receive no activation or
+normalization.
+
+For the expert, define
+\begin{equation}
+\boxed{
+\begin{aligned}
+ \bm U_{\ell b}
+ &=\GELU\!\left(
+   \IN_{\ell}^{\mathrm{blk}}
+   (\bm X_{\ell b}^n\bm W_\ell^0)\right),\\
+ \begin{bmatrix}\bm P_{\ell b}^n&\bm S_{\ell b}^n\end{bmatrix}
+ &=
+ \begin{bmatrix}
+  \mathcal N_{\ell p}(\bm U_{\ell b}\bm W_{\ell p}^n)&
+  \mathcal N_{\ell s}(\bm U_{\ell b}\bm W_{\ell s}^n)
+ \end{bmatrix}.
+\end{aligned}}
+\label{eq:expert-factor}
+\end{equation}
+$\mathcal N_{\ell p},\mathcal N_{\ell s}$ are affine instance normalization at
+levels $2$--$4$ and identities at level $5$; the shared instance normalization
+in the first line remains active at every level.  The branch projections map
+to $C_\ell^b$ channels.  These equations create two components but do not
+guarantee their meanings: balanced $P$-OT and residual $S$-UOT assign the
+operational roles below.
+
+\subsection{Completeness and non-redundancy}
+
+Stack the $B$ block matrices vertically and their row masks block-diagonally,
+for example
+$\bm X_\ell^d=\operatorname{col}_{b=1}^B(\bm X_{\ell b}^d)$ and
+$\bm V_\ell=\operatorname{bdiag}_{b=1}^B(\bm V_{\ell b})$.  For any such
+stacked feature matrix with $C$ columns, define the valid relative energy
+\begin{equation}
+ \mathfrak R(\bm A,\bm X^\star;\bm V)
+ =
+ \frac{\|\bm V(\bm A-\bm X^\star)\|_F^2/n_V}
+      {\|\bm V\bm X^\star\|_F^2/n_V+10^{-8}},
+ \qquad
+ n_V=C\max(\operatorname{tr}\bm V,HW)
+ =CHW\max\!\left(\sum_{b,z} v_{bz},1\right).
+ \label{eq:relative-energy}
+\end{equation}
+Let
+\[
+ \widehat{\bm X}_{\ell}^b=\bm P_{\ell}^b+\bm S_{\ell}^b,\qquad
+ \widehat{\bm X}_{\ell}^n
+ =\mathcal R_{\ell p}(\bm P_{\ell}^n)
+  +\mathcal R_{\ell s}(\bm S_{\ell}^n),
+\]
+where each expert decoder $\mathcal R_{\ell\xi}$ is
+Conv--IN--GELU--Conv.  Applying the frozen pixel decoder to the complete
+level collections gives
+\[
+ \bm F_p^r=\Psi_{\phi_b}^r(\{\bm P_\ell^b\}_{\ell\in\cI}),\quad
+ \bm F_s^r=\Psi_{\phi_b}^r(\{\bm S_\ell^b\}_{\ell\in\cI}),\quad
+ \bm F_{p+s}^r=\Psi_{\phi_b}^r(
+   \{\bm P_\ell^b+\bm S_\ell^b\}_{\ell\in\cI}).
+\]
+These decoder outputs are stacked over blocks in the same way, and $\bm V_r$
+denotes the valid-slice flag broadcast over the spatial rows at decoder
+resolution $r$.  The implemented reconstruction functional is
+\begin{equation}
+\boxed{
+ \cL_{\mathrm{ae}}
+ =\frac{1}{9}\left[
+   \sum_{\ell\in\cI}\sum_{d\in\{b,n\}}
+   \mathfrak R(\widehat{\bm X}_{\ell}^d,\bm X_{\ell}^d;\bm V_{\ell})
+   +\frac{1}{|\cQ|}\sum_{r\in\cQ}
+   \mathfrak R(\bm F_p^r+\bm F_s^r,\bm F_{p+s}^r;\bm V_r)
+ \right].}
+\label{eq:complete-reconstruction}
+\end{equation}
+This preserves the code's unusual but exact reduction: eight level/model terms
+plus one term already averaged across four pixel-decoder outputs, all divided
+by nine.
+
+Let $\operatorname{Std}_{\bm V}(\cdot)$ standardize every channel over valid
+spatial rows using the implementation's sample-standard-deviation path when
+all slices are valid and masked population-RMS path otherwise.  The full
+$P$--$S$ cross-correlation matrix is
+\[
+ \bm C_{\ell b}^{d}
+ =\frac{1}{N_{\ell b}^{\mathrm{valid}}}
+   \operatorname{Std}_{\bm V}(\bm P_{\ell b}^{d})^\top
+   \operatorname{Std}_{\bm V}(\bm S_{\ell b}^{d}).
+\]
+Hence the separation penalty is the matrix norm
+\begin{equation}
+\boxed{
+ \cL_{\mathrm{ort}}
+ =\sum_{\ell\in\cI}\sum_{d\in\{b,n\}}
+  \frac{1}{B(C_\ell^b)^2}
+  \sum_{b=1}^{B}\|\bm C_{\ell b}^{d}\|_{1,1}.}
+\label{eq:matrix-correlation}
+\end{equation}
+All $C_\ell^2$ cross-component channel pairs are penalized in magnitude.  This
+is decorrelation, not strict subspace orthogonality or statistical independence.
+
+\section{Prompt-conditioned Stochastic Matrix Routing}
+\label{sec:matrix-routing}
+
+Let
+\[
+ \bm H=\GELU(\LN(\bm T)\bm W_h+\ones\bm b_h^\top),\qquad
+ \bm A^\alpha=\operatorname{Head}_\alpha(\bm H),\quad
+ \bm A^\beta=\operatorname{Head}_\beta(\bm H).
+\]
+On the mask grid, define the RBF dictionary
+$\bm\Phi\in\R^{N_0\times K}$ by
+$\Phi_{ik}=\exp[-\|\bm u_i-\bm\mu_k\|_2^2/(2\sigma_{\mathrm{rbf}}^2)]$.
+The complete prompt-by-position Beta field is generated by two matrix products:
+\begin{equation}
+\boxed{
+\begin{aligned}
+ \bm\eta^\alpha
+ &=b_\alpha\ones_{C_{\mathrm{pr}}}\ones_{N_0}^\top
+   +K^{-1/2}\bm A^\alpha\bm\Phi^\top,
+ &\balpha&=\ones_{C_{\mathrm{pr}}}\ones_{N_0}^\top
+   +\softplus(\bm\eta^\alpha),\\
+ \bm\eta^\beta
+ &=b_\beta\ones_{C_{\mathrm{pr}}}\ones_{N_0}^\top
+   +K^{-1/2}\bm A^\beta\bm\Phi^\top,
+ &\bbeta&=\ones_{C_{\mathrm{pr}}}\ones_{N_0}^\top
+   +\softplus(\bm\eta^\beta).
+\end{aligned}}
+\label{eq:beta-matrix}
+\end{equation}
+The defaults are $G=8$, $K=G^2=64$ and
+$\sigma_{\mathrm{rbf}}=3/(G-1)$.  Both coefficient heads, including their
+biases, start at zero, while
+$b_\alpha=\softplus^{-1}(6)$ and $b_\beta=\softplus^{-1}(2)$; consequently the
+initial field is exactly $\operatorname{Beta}(7,3)$.
+
+Training samples elementwise
+$\bm\Gamma_b\sim\operatorname{Beta}(\balpha,\bbeta)$ independently across
+blocks, prompts, and positions, and shares that realization across the $Z$
+slices of block $b$.  Validation and deployment use
+\begin{equation}
+ \bar{\bm\Gamma}_\Theta(\bm T)
+ =\mathbb{E}[\bm\Gamma]
+ =\balpha\oslash(\balpha+\bbeta).
+ \label{eq:beta-expectation}
+\end{equation}
+One mask-grid realization is area-resized to every $r\in\cQ$; coarse levels are
+not independently resampled.
+
+For
+$\bm F_{p,bz}^r,\bm F_{s,bz}^r\in\R^{N_r\times C_r}$ and gate vector
+$\bm\gamma_{bc}^r\in\R^{N_r}$, prompt-conditioned fusion is
+\begin{equation}
+\boxed{
+ \widetilde{\bm F}_{bzc}^r
+ =\bm F_{s,bz}^r
+  +\diag(\bm\gamma_{bc}^r)
+   (\bm F_{p,bz}^r-\bm F_{s,bz}^r).}
+\label{eq:diagonal-fusion}
+\end{equation}
+The gate is scalar across channels but varies by prompt and position.  The
+router is not image-conditioned: its distribution depends only on frozen prompt
+semantics and fixed coordinates.
+
+The prior regularizer is the elementwise Beta KL averaged over the
+$C_{\mathrm{pr}}\times N_0$ field,
+\begin{equation}
+ \cL_{\mathrm{route}}
+ =\frac{
+  \langle\ones_{C_{\mathrm{pr}}}\ones_{N_0}^\top,\,
+  \KL[\operatorname{Beta}(\balpha,\bbeta)
+  \,\|\,\operatorname{Beta}(7,3)]\rangle_F}
+ {C_{\mathrm{pr}}N_0}.
+ \label{eq:route-matrix-kl}
+\end{equation}
+It contains no batch or slice factor.  The $BZC_{\mathrm{pr}}$ visual--prompt
+pairs are flattened in $(b,z,c)$ order.  For predictor query tensor
+$\bm Q_{bzc}\in\R^{Q_m\times N_o}$,
+\[
+ \bm L_{bzc}=Q_m^{-1}\ones_{Q_m}^\top\bm Q_{bzc},
+\]
+with no object-existence weighting, followed by trilinear logit resizing to
+$(Z,H,W)$.
+
+\section{Prompt-wise Segmentation as a Matrix Reduction}
+
+For prompt $c$, let
+$\bm y_{bc}=\operatorname{vec}(\ind[\bm Y_b=k_c])$ and let $\bm m_b$ mask
+target $-1$ and invalid slices.  Denote masked BCE-with-logits and soft Dice by
+$\mathfrak B_{bc}$ and $\mathfrak D_{bc}$.  Define
+\begin{equation}
+\begin{aligned}
+ \Delta^{\mathrm{emp}}_{bc}
+ &=\ind\!\left[
+ \bm m_b^\top\bm y_{bc}
+ <5\times10^{-4}\,\ones^\top\bm m_b\right],\\
+ S_{bc}
+ &=\mathfrak B_{bc}
+ +(1-\Delta^{\mathrm{emp}}_{bc})\mathfrak D_{bc},\\
+ W_{bc}
+ &=\Omega_{bc}\left(1-\tfrac12\Delta^{\mathrm{emp}}_{bc}\right),
+\end{aligned}
+\label{eq:pair-matrix}
+\end{equation}
+where $\Omega_{bc}$ is prompt validity.  Thus an empty target uses BCE only and
+retains weight $1/2$ rather than being discarded.
+
+Collecting $S_{bc},W_{bc}$ into matrices
+$\bm S,\bm W\in\R^{B\times C_{\mathrm{pr}}}$ gives
+both executable reductions:
+\begin{equation}
+\boxed{
+\begin{aligned}
+ \cL_{\mathrm{seg}}^{\mathrm{mean}}
+ &=\frac{\langle\bm W,\bm S\rangle_F}
+ {\max(\langle\bm W,
+ \ones_B\ones_{C_{\mathrm{pr}}}^\top\rangle_F,10^{-6})},\\
+ \cL_{\mathrm{seg}}^{\mathrm{LGE}}
+ &=\ones_{C_{\mathrm{pr}}}^\top\left[
+  (\bm W\odot\bm S)^\top\ones_B
+  \oslash\max(\bm W^\top\ones_B,
+  10^{-6}\ones_{C_{\mathrm{pr}}})\right].
+\end{aligned}}
+\label{eq:seg-matrix-reduction}
+\end{equation}
+Generic training averages valid block--prompt pairs globally.  LGE averages
+blocks separately for each prompt and then sums prompts; vector-valued maxima
+and divisions in Eq.~\eqref{eq:seg-matrix-reduction} are elementwise.
+
+\section{Component-aware Transport in One Variational System}
+
+For valid slice $m$ at level $\ell$, adaptive average pooling gives
+\begin{equation}
+ \bm X_{\ell m}^\xi,\bm Y_{\ell m}^\xi
+ \in\R^{N_\ell^{\mathrm{OT}}\times C_\ell},
+ \qquad
+ N_\ell^{\mathrm{OT}}
+ =\min(H_\ell,32)\min(W_\ell,32).
+ \label{eq:ot-tokens}
+\end{equation}
+$\bm X$ and $\bm Y$ are foundation and channel-aligned expert tokens.  Both
+sides share the same grid, and independent slices never share a plan.
+
+\subsection{Branch-specific masses}
+
+For a nonnegative $N$-vector, write
+\[
+ \Norm(\bm q)=
+ \begin{cases}
+  \bm q/(\ones_N^\top\bm q),&\ones_N^\top\bm q>10^{-8},\\
+  \ones_N/N,&\text{otherwise}.
+ \end{cases}
+\]
+For class mask $\bm M_c=\ind[\bm Y=k_c]$, let
+$\bm O,\bm B,\bm M_{\mathrm{res}}$ collect pooled occupancy, boundary, and
+max-pooled rescue maps by class, and let
+\[
+ \bar\pi_c=
+ \begin{cases}|M_c|^{-1/2},&|M_c|>0,\\0,&|M_c|=0,\end{cases}
+ \qquad
+ \bm\pi=\Norm(\bar{\bm\pi}),\qquad
+ \bm h=(\bm O+1.5\bm B+0.2\bm M_{\mathrm{res}})\bm\pi .
+\]
+Define stabilized row magnitude, normalized energy, and $S$ specificity:
+\[
+ \bm\nu(\bm F)_i=\sqrt{\|\bm F_{i:}\|_2^2+\varepsilon_{\mathrm{num}}},
+ \quad
+ \mathcal E(\bm F)=
+ \frac{\bm\nu(\bm F)}
+ {\max(\operatorname{mean}\bm\nu(\bm F),\varepsilon_{\mathrm{num}})},
+ \quad
+ \bm\chi(\bm P,\bm S)=
+ \frac{\bm\nu(\bm S)}
+ {\bm\nu(\bm P)+\bm\nu(\bm S)+\varepsilon_{\mathrm{num}}\ones},
+\]
+where $\varepsilon_{\mathrm{num}}=10^{-8}$.  The structure marginals are
+\begin{equation}
+\boxed{
+\begin{aligned}
+ \bm a^p&=\Norm\!\left(
+  \bm h\odot[\ones+0.1\mathcal E(\bm X^p)]\right),\\
+ \bm b^p&=\Norm\!\left(
+  \bm h\odot[\ones+0.1\mathcal E(\bm Y^p)]\right).
+\end{aligned}}
+\label{eq:p-mass-matrix}
+\end{equation}
+If $\ones^\top\bm h\leq10^{-8}$, each side falls back to its own energy; every
+numerically zero candidate falls back to a uniform mass.
+
+Detached prompt-valid BCE maps are averaged as
+\[
+ \bm d_{\mathrm{pix}}
+ =\frac{\sum_c\Omega_c\bm e_c^b}{\max(\sum_c\Omega_c,1)},\qquad
+ \bm e^n_{\mathrm{pix}}
+ =\frac{\sum_c\Omega_c\bm e_c^n}{\max(\sum_c\Omega_c,1)}
+\]
+and pooled to $\bm d,\bm e^n$.  With
+$\bm\Delta_{\mathrm{adv}}=\bm d-\bm e^n$,
+\[
+ \widehat{\bm d}
+ =\clip\!\left(\bm d/\max(\operatorname{mean}\bm d,10^{-8}),0,3\right),
+ \quad
+ s_\Delta=\max(\operatorname{mean}|\bm\Delta_{\mathrm{adv}}|,10^{-8}),
+ \quad
+ \bm\zeta
+ =\clip\!\left(2\sigm(\bm\Delta_{\mathrm{adv}}/(0.5s_\Delta)),0,3\right).
+\]
+The residual marginals are
+\begin{equation}
+\boxed{
+\begin{aligned}
+ \bm a^s&=\Norm\!\left(
+  \mathcal E(\bm X^s)\odot\bm\chi(\bm X^p,\bm X^s)
+  \odot(0.1\ones+\widehat{\bm d})\right),\\
+ \bm b^s&=\Norm\!\left(
+  \mathcal E(\bm Y^s)\odot\bm\chi(\bm Y^p,\bm Y^s)
+  \odot(0.1\ones+\bm\zeta)\right).
+\end{aligned}}
+\label{eq:s-mass-matrix}
+\end{equation}
+For grouped LGE labels, expert class probabilities are summed within each
+source group, clipped to $[10^{-6},1-10^{-6}]$, and converted to a binary logit
+before its BCE map is formed.
+
+\subsection{Cost, transport, and teacher}
+
+Let $\operatorname{RowNorm}$ be detached stabilized row normalization and
+$\bm U$ the normalized coordinate matrix.  The two costs are one family:
+\begin{equation}
+\boxed{
+\begin{aligned}
+ \bm C^\xi
+ ={}&
+ \left[\ones_{N_\ell^{\mathrm{OT}}}
+ \ones_{N_\ell^{\mathrm{OT}}}^\top-
+ \operatorname{RowNorm}(\bm X^\xi)
+ \operatorname{RowNorm}(\bm Y^\xi)^\top\right]_+\\
+ &+0.25\left[
+ \operatorname{Dist}(\bm U_b,\bm U_n)-0.25\right]_+^{\odot2}
+ +0.25\ind[\xi=p]\left[
+ \ones_{N_\ell^{\mathrm{OT}}}
+ \ones_{N_\ell^{\mathrm{OT}}}^\top
+ -\overline{\bm M}_b\overline{\bm M}_n^\top
+ \right]_+ .
+\end{aligned}}
+\label{eq:unified-cost}
+\end{equation}
+$\overline{\bm M}$ is the stabilized class-wise semantic row normalization.
+Only $P$ uses semantic cost.
+
+For $\xi\in\{p,s\}$, define
+\begin{equation}
+\boxed{
+ \bm\Pi^\xi
+ =\arg\min_{\bm\Pi\geq0}
+ \left\{
+ \langle\bm\Pi,\bm C^\xi\rangle_F
+ +\varepsilon_\xi\sum_{ij}\Pi_{ij}(\log\Pi_{ij}-1)
+ +\mathfrak P_\xi(\bm\Pi)
+ \right\},}
+\label{eq:unified-transport}
+\end{equation}
+where
+\[
+ \mathfrak P_p(\bm\Pi)=
+ \begin{cases}
+  0,&\bm\Pi\ones=\bm a^p\ \text{and}\
+     \bm\Pi^\top\ones=\bm b^p,\\
+  +\infty,&\text{otherwise},
+ \end{cases}
+ \qquad
+ \mathfrak P_s(\bm\Pi)=
+ \rho_b\KL(\bm\Pi\ones\|\bm a^s)
+ +\rho_n\KL(\bm\Pi^\top\ones\|\bm b^s).
+\]
+The first term is zero when both balanced constraints hold and $+\infty$
+otherwise; the latter uses generalized KL.  Thus balanced $P$-OT and
+unbalanced $S$-UOT differ only in masses, semantic cost, and marginal
+regularization.
+
+For $\bm\varrho^\xi=\bm\Pi^\xi\ones$, the raw expert barycentric teacher is
+\[
+ \widetilde{\bm Y}^{\xi}
+ =\diag(\max(\bm\varrho^\xi,10^{-8}))^{-1}
+  \bm\Pi^\xi\bm Y^\xi .
+\]
+Restoring slice indices, both distillation losses are instances of
+\begin{equation}
+\boxed{
+ \cL_{\xi,\ell}
+ =
+ \frac{\displaystyle\sum_{m=1}^{M}
+  \bm w_{\ell m}^{\xi\top}
+  \left[\ones-
+  \rowcos(\bm X_{\ell m}^\xi,
+  \stopgrad(\widetilde{\bm Y}_{\ell m}^\xi))\right]}
+ {\displaystyle\max\!\left(
+  \sum_{m=1}^{M}\ones^\top\bm w_{\ell m}^\xi,10^{-8}\right)},
+ \quad
+ \bm w_{\ell m}^p=\bm a_{\ell m}^p,\quad
+ \bm w_{\ell m}^s=\bm\Pi_{\ell m}^s\ones .}
+\label{eq:transport-distillation}
+\end{equation}
+Finally,
+$\cL_{P\text{-OT}}=\frac14\sum_{\ell}\cL_{p,\ell}$ and
+$\cL_{S\text{-UOT}}=\frac14\sum_{\ell}\cL_{s,\ell}$.  Therefore $P$ weights
+valid slices equally, whereas $S$ weights them by received UOT mass.  A
+layer-wide received mass at most $10^{-6}$ gives zero $S$ loss.
+
+All masses, error maps, normalized cost copies, transport plans, and
+barycentric teachers are detached.  OT gradients reach only the raw
+foundation factor tokens.  Expert adapters receive gradients from
+reconstruction and decorrelation, never through Sinkhorn.
+
+\section{Structured Training Objective}
+
+The six losses operate on three parts of one pipeline:
+\begin{equation}
+\boxed{
+\begin{aligned}
+ \cL(\Theta;e)
+ ={}&
+ \underbrace{
+  \lambda_{\mathrm{seg}}\cL_{\mathrm{seg}}
+  +\lambda_{\mathrm{route}}(e)\cL_{\mathrm{route}}
+ }_{\text{prompt-conditioned prediction}}\\
+ &+\underbrace{
+  \lambda_{\mathrm{ae}}\cL_{\mathrm{ae}}
+  +\lambda_{\mathrm{ort}}\cL_{\mathrm{ort}}
+ }_{\text{complete, non-redundant factorization}}\\
+ &+\underbrace{
+  \lambda_p(e)\cL_{P\text{-OT}}
+  +\lambda_s(e)\cL_{S\text{-UOT}}
+ }_{\text{component-specific expert transfer}} .
+\end{aligned}}
+\label{eq:structured-objective}
+\end{equation}
+The generic target weights are
+$(3,0.2,0.3,10^{-3},0.1,0.1)$.  Router weight reaches $10^{-3}$ linearly over
+five epochs.  $P$-OT starts at epoch $2$, $S$-UOT at epoch $3$, and both reach
+$0.1$ through a five-epoch linear ramp.
+
+\section{LGE as a Composition of One Student}
+
+The source foreground labels are scar $1$, edema $2$, LV $3$, normal myocardium
+$4$, and RV $5$.  The disjoint prompt groups are
+\begin{equation}
+ \cG^A=((3),(5),(1,2,4)),\qquad
+ \cG^R_{\mathrm{split}}=((3),(5),(4),(1),(2)),\qquad
+ \cG^R_{\mathrm{merged}}=((3),(5),(4),(1,2)).
+ \label{eq:lge-groups}
+\end{equation}
+Equivalently, let
+$\bm Y_{\mathrm{src}}\in\{0,1\}^{V\times5}$ be the foreground one-hot source
+label matrix (background/ignored rows are zero), and let
+$\bm G_j\in\{0,1\}^{5\times C_j}$ have entries
+$[\bm G_j]_{kc}=\ind[k\in G_c^j]$.  Then all prompt targets are obtained by the
+single contraction $\bm Y^j=\bm Y_{\mathrm{src}}\bm G_j$.
+
+Let $\mathfrak S_\Theta(\bm x^b;\cG)$ be the pure-student prediction in
+Eq.~\eqref{eq:student-master}.  Validation and deployment use the online
+composition
+\begin{equation}
+\boxed{
+\begin{aligned}
+ \bm L^A
+ &=\mathfrak S_\Theta(\bm x^b;\cG^A),\\
+ \mathcal R_{\mathrm{online}}^A
+ &=\stopgrad\!\left\{
+ \RoiBox_{\gamma=1.25}
+ \bigl(\ind[\sigm(\bm L^A_{\mathrm{MYO}})\geq0.3]\bigr)
+ \right\},\\
+ \bm L^R
+ &=\mathfrak S_\Theta(
+ \Crop(\bm x^b;\mathcal R_{\mathrm{online}}^A);\cG^R).
+\end{aligned}}
+\label{eq:lge-online}
+\end{equation}
+The box has minimum side $8$, uses full-image fallback when empty, and is
+detached.
+
+Training is a different operator because auxiliary losses require aligned
+expert input and target:
+\[
+ \mathfrak J_\Theta(\bm x^b,\bm x^n,\bm Y,\bm V;\cG)
+ =(\bm L,\cL_{\mathrm{seg}},\cL_{\mathrm{aux}}).
+\]
+Epochs $1$--$10$ evaluate only full-image Pass~A.  Before epoch $11$,
+deterministic student predictions create the default fixed ROI cache.  Mixed
+training uses
+\begin{equation}
+ \mathcal R_b^{\mathrm{train}}
+ =\operatorname{Jitter}(\mathcal R_b^{\mathrm{cache}}),
+ \qquad
+ \mathfrak J_\Theta\!\left(
+  \Crop_{\mathcal R_b^{\mathrm{train}}}
+  (\bm x^b,\bm x^n,\bm Y),\bm V;\cG^R\right),
+ \label{eq:lge-cache}
+\end{equation}
+so the current Pass~A prediction does not choose the training crop.
+The image tensors use bilinear interpolation, the target uses nearest-neighbor
+interpolation, and the slice-validity vector $\bm V$ is passed through without
+spatial cropping.
+
+If a refinement group is present in the full target, its prompt is valid only
+when at least $1\%$ of that group lies inside the ROI actually used.  A group
+absent from the full slice remains a valid negative.  With
+\[
+ \cL_{\mathrm{aux}}^j
+ =0.2\cL_{\mathrm{ae}}^j+0.3\cL_{\mathrm{ort}}^j
+ +\lambda_{\mathrm{route}}(e)\cL_{\mathrm{route}}^j
+ +\lambda_p(e)\cL_{P\text{-OT}}^j
+ +\lambda_s(e)\cL_{S\text{-UOT}}^j,
+\]
+the complete two-stage objective is
+\begin{equation}
+\boxed{
+ \cL_{\mathrm{LGE}}(e)=
+ \begin{cases}
+  \cL_{\mathrm{seg}}^A+\cL_{\mathrm{aux}}^A,
+     &e\leq10,\\[1mm]
+  \cL_{\mathrm{seg}}^A+\cL_{\mathrm{seg}}^R
+  +\dfrac12(\cL_{\mathrm{aux}}^A+\cL_{\mathrm{aux}}^R),
+     &e\geq11.
+ \end{cases}}
+\label{eq:lge-loss}
+\end{equation}
+Pass~R is not evaluated in the first case.  In mixed training the two forwards
+accumulate gradients before one optimizer step.
+
+\subsection{Matrix hard switch}
+
+Let $\bm\iota_R\in\{0,1\}^V$ be the rectangular ROI indicator and
+$\bm D_R=\diag(\bm\iota_R)$.  Let $\bm L_\uparrow^R\in\R^{V\times C_R}$ be
+refinement logits resized and inserted into the full model grid.  Define
+$\bm\Lambda_{AR}\in\{0,1\}^{3\times C_R}$ by
+$[\bm\Lambda_{AR}]_{11}=[\bm\Lambda_{AR}]_{22}=1$, and
+$\bm q_{AR}=(1,1,0,\ldots,0)^\top$.  Then
+\begin{equation}
+\boxed{
+\begin{aligned}
+ \bm L^{\mathrm{out}}
+ &=\bm L^A\bm\Lambda_{AR}
+   -20\ones_V(\ones_{C_R}-\bm q_{AR})^\top,\\
+ \bm L^{\mathrm{final}}
+ &=\bm D_R\bm L_\uparrow^R
+   +(\bm I-\bm D_R)\bm L^{\mathrm{out}} .
+\end{aligned}}
+\label{eq:lge-hard-switch}
+\end{equation}
+Thus every refinement class comes from Pass~R inside the rectangular ROI;
+outside it LV/RV come from Pass~A and all other foreground logits are $-20$.
+There is no soft blending.  A zero background column is prepended, logits are
+restored through the aligned nnUNet geometry, and argmax is taken only after
+logit resampling.  The discrete result is then inserted into the saved crop and
+inverse-transposed to raw NIfTI geometry.
+
+\section{Training--Deployment Boundary}
+
+The deployed trainable subset is
+\[
+ \Theta_{\mathrm{deploy}}
+ =\{\bm W_{\ell p}^b,\bm W_{\ell s}^b\}_{\ell\in\cI}
+  \cup\Theta_{\mathrm{router}}.
+\]
+It loads the frozen BiomedParse model but not nnUNet, expert autoencoders,
+expert preprocessing tensors, mass/cost builders, or Sinkhorn solvers.  LGE
+deployment invokes the same pure-student map twice via Eq.~\eqref{eq:lge-online}.
+
+\appendix
+\section{Implementation-exact Details}
+
+\paragraph{Inputs and normalization.}
+Generic 2.5D BiomedParse input uses
+$(x_{z-1},x_z,x_{z+1})$ with boundary replication.  Its CT transform uses
+level $40$, width $400$:
+$x_i^b=255[\clip(x_i,-160,240)+160]/400$.
+LGE uses $Z=1$ and $(x_z,x_z,x_z)$.  It reuses the frozen nnUNet crop/resampling
+geometry but computes first/99th percentiles after removing values at or below
+the volume's $0.1$th percentile, clips to that range, maps to $[0,255]$, and
+stores uint8.  Degenerate percentile ranges use width one.
+
+\paragraph{ROI geometry and augmentation.}
+The myocardium threshold is $0.3$; the smallest axis-aligned box is expanded by
+$1.25$, shifted/clipped to image bounds, and falls back to the full image when
+empty.  Images use bilinear and targets nearest-neighbor resize to $256^2$.
+The same training ROI is applied to nnUNet input, BiomedParse input, and target.
+Mixed-training cache jitter shifts the center by at most $3\%$ of ROI extent and
+enlarges it by a factor in $[1,1.15]$.  Passes receive independent transforms:
+rotation $\pm10^\circ$, scale $[0.95,1.05]$, translation $\pm5\%$,
+horizontal/vertical flip probabilities $0.5/0.2$, and intensity perturbation
+probability $0.8$.  Contrast is $[0.8,1.2]$, shift is $[-0.1,0.1]$ times slice
+standard deviation, noise scale is $[0,0.04]$ times that deviation, and
+BiomedParse gamma is $[0.75,1.35]$.
+
+\paragraph{Transport and optimization.}
+OT uses float32 log-space Sinkhorn for $30$ iterations with
+$\varepsilon_p=\varepsilon_s=0.1$, $\rho_b=1.0$, and $\rho_n=0.2$.
+AdamW uses learning rate $10^{-4}$, weight decay $10^{-4}$, optional AMP, and
+global gradient clipping at $5$.  Generic training keeps a constant learning
+rate; LGE uses epoch-wise cosine decay to $0.05$ of its initial value.
+
+\paragraph{Current LGE instantiation.}
+At $256^2$, feature sizes are $(64,32,16,8)^2$, nnUNet channels are
+$(128,256,512,512)$, BiomedParse channels are $(192,384,768,1536)$, and OT
+grids are $(32,32,16,8)^2$.  All trainable modules contain
+$10{,}140{,}994$ parameters; the deployment subset contains $6{,}432{,}130$.
+
+\end{document}

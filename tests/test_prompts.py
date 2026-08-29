@@ -5,8 +5,14 @@ from oodka.models.prompts import (
     MYOPS_LGE_ROI_V3_REFINEMENT_PROMPTS,
     WHS_CT_ROI_LOCALIZATION_PROMPTS,
     WHS_CT_ROI_REFINEMENT_PROMPTS,
+    WHS_CT_GV_LOCALIZATION_PROMPTS,
+    WHS_CT_GV_REFINEMENT_PROMPTS,
     WHS_MRI_ROI_LOCALIZATION_PROMPTS,
     WHS_MRI_ROI_REFINEMENT_PROMPTS,
+    WHS_MRI_GV_LOCALIZATION_PROMPTS,
+    WHS_MRI_GV_REFINEMENT_PROMPTS,
+    WHS_GV_LOCALIZATION_GROUPS,
+    WHS_GV_OUTSIDE_PROMPT_MAPPING,
     WHS_ROI_LOCALIZATION_GROUPS,
     WHS_ROI_REFINEMENT_GROUPS,
     build_text_prompts_for_dataset,
@@ -51,6 +57,24 @@ def test_whs_two_pass_prompts_localize_union_then_refine_seven_classes():
         assert modality in localization["1"]
         assert "whole heart" in localization["1"]
         assert "pulmonary artery trunk" in localization["1"]
+        assert sorted(refinement) == [str(value) for value in range(1, 8)]
+
+
+def test_whs_gv_prompts_merge_ao_pa_and_preserve_five_global_classes():
+    assert WHS_GV_LOCALIZATION_GROUPS == (
+        (1,), (2,), (3,), (4,), (5,), (6, 7)
+    )
+    assert WHS_GV_OUTSIDE_PROMPT_MAPPING == tuple(
+        (index, index) for index in range(5)
+    )
+    for localization, refinement, modality in (
+        (WHS_CT_GV_LOCALIZATION_PROMPTS, WHS_CT_GV_REFINEMENT_PROMPTS, "CT"),
+        (WHS_MRI_GV_LOCALIZATION_PROMPTS, WHS_MRI_GV_REFINEMENT_PROMPTS, "MRI"),
+    ):
+        assert sorted(localization) == [str(value) for value in range(1, 7)]
+        assert modality in localization["6"]
+        assert "ascending aorta" in localization["6"]
+        assert "pulmonary artery trunk" in localization["6"]
         assert sorted(refinement) == [str(value) for value in range(1, 8)]
 
 

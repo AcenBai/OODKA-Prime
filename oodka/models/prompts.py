@@ -51,6 +51,40 @@ WHS_MRI_ROI_REFINEMENT_PROMPTS = dict(WHS_MRI_PROMPTS)
 WHS_ROI_LOCALIZATION_GROUPS = ((1, 2, 3, 4, 5, 6, 7),)
 WHS_ROI_REFINEMENT_GROUPS = tuple((class_id,) for class_id in range(1, 8))
 
+# Great-vessel bridge strategy: preserve five global anatomical classes and
+# use the AO+PA union only as an auxiliary ROI-producing class. Inside that
+# ROI, all seven prompts compete so nearby chambers/myocardium remain valid
+# alternatives to AO and PA.
+WHS_CT_GV_LOCALIZATION_PROMPTS = {
+    "1": WHS_CT_PROMPTS["1"],
+    "2": WHS_CT_PROMPTS["2"],
+    "3": WHS_CT_PROMPTS["3"],
+    "4": WHS_CT_PROMPTS["4"],
+    "5": WHS_CT_PROMPTS["5"],
+    "6": (
+        "CT imaging of the combined great-vessel region of the heart, "
+        "consisting of the ascending aorta and pulmonary artery trunk"
+    ),
+}
+
+WHS_MRI_GV_LOCALIZATION_PROMPTS = {
+    "1": WHS_MRI_PROMPTS["1"],
+    "2": WHS_MRI_PROMPTS["2"],
+    "3": WHS_MRI_PROMPTS["3"],
+    "4": WHS_MRI_PROMPTS["4"],
+    "5": WHS_MRI_PROMPTS["5"],
+    "6": (
+        "MRI of the combined great-vessel region of the heart, "
+        "consisting of the ascending aorta and pulmonary artery trunk"
+    ),
+}
+
+WHS_CT_GV_REFINEMENT_PROMPTS = dict(WHS_CT_PROMPTS)
+WHS_MRI_GV_REFINEMENT_PROMPTS = dict(WHS_MRI_PROMPTS)
+WHS_GV_LOCALIZATION_GROUPS = ((1,), (2,), (3,), (4,), (5,), (6, 7))
+WHS_GV_REFINEMENT_GROUPS = WHS_ROI_REFINEMENT_GROUPS
+WHS_GV_OUTSIDE_PROMPT_MAPPING = tuple((index, index) for index in range(5))
+
 MYOPS_LGE_PROMPTS = {
     "1": (
         "LGE short-axis cardiac MRI showing scar tissue within the "
