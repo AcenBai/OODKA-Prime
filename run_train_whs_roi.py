@@ -199,7 +199,9 @@ def main() -> None:
         val_case_limit=args.val_case_limit,
         max_train_batches=args.max_train_batches,
         max_val_batches=args.max_val_batches,
-        resume_checkpoint=args.init_checkpoint,
+        # ``init_checkpoint`` is weights-only initialization. Keep the engine's
+        # resume field empty so epoch/optimizer/history always start fresh.
+        resume_checkpoint="",
     )
     cfg.resolve_paths()
     _source_metadata(cfg)
