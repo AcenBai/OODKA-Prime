@@ -14,6 +14,10 @@ from oodka.data.lge_roi import (
     roi_prompt_visibility,
 )
 from run_eval_lge_roi import _hierarchical_foreground_logits
+from oodka.eval.selective_refinement import (
+    keep_largest_component_per_class,
+    selective_prompt_overwrite,
+)
 
 
 def test_roi_generation_expands_about_center_and_clips():
@@ -84,9 +88,7 @@ def test_z4_block_roi_uses_one_coherent_cuboid():
     restored = restore_roi_logits(logits, rois, (16, 16))
     assert restored.shape == logits.shape
     assert torch.all(restored[0, :, :, :4] < 0)
-    assert torch.allclose(
-        restored[0, :, :, 4:12, 3:11], torch.ones(3, 4, 8, 8)
-    )
+    assert torch.allclose(restored[0, :, :, 4:12, 3:11], torch.ones(3, 4, 8, 8))
 
 
 def test_roi_cache_roundtrip(tmp_path):
@@ -156,11 +158,87 @@ def test_gv_hard_switch_preserves_five_global_classes_outside_roi():
         [roi],
         tuple((index, index) for index in range(5)),
     )
-    labels = torch.cat(
-        [torch.zeros_like(foreground[:, :1]), foreground], dim=1
-    ).argmax(dim=1)[0]
+    labels = torch.cat([torch.zeros_like(foreground[:, :1]), foreground], dim=1).argmax(
+        dim=1
+    )[0]
     assert torch.all(labels[:, 0, 0] == 5)
     assert torch.all(labels[:, 1:5, 2:5] == 7)
+
+
+def test_selective_overwrite_retains_global_when_local_is_not_confident():
+    global_labels = torch.tensor([[1, 2], [3, 4]])
+    local_logits = torch.full((2, 2, 2), -4.0)
+    output, stats = selective_prompt_overwrite(
+        global_labels,
+        local_logits,
+        (6, 7),
+        confidence_threshold=0.8,
+    )
+    assert torch.equal(output, global_labels)
+    assert stats.accepted_voxels == 0
+    assert stats.changed_voxels == 0
+
+
+def test_selective_overwrite_uses_winning_child_and_preserves_other_voxels():
+    global_labels = torch.tensor([[1, 2], [3, 4]])
+    local_logits = torch.full((2, 2, 2), -5.0)
+    local_logits[0, 0, 0] = 4.0
+    local_logits[1, 1, 1] = 5.0
+    output, stats = selective_prompt_overwrite(
+        global_labels,
+        local_logits,
+        (6, 7),
+        confidence_threshold=0.8,
+    )
+    assert output.tolist() == [[6, 2], [3, 7]]
+    assert stats.accepted_voxels == 2
+    assert stats.changed_voxels == 2
+
+
+def test_selective_overwrite_rejects_ambiguous_children_and_respects_roi():
+    global_labels = torch.tensor([[1, 2], [3, 4]])
+    local_logits = torch.full((2, 2, 2), -5.0)
+    local_logits[:, 0, 0] = torch.tensor([3.0, 2.9])
+    local_logits[0, 1, 1] = 5.0
+    roi_mask = torch.tensor([[True, True], [True, False]])
+    output, stats = selective_prompt_overwrite(
+        global_labels,
+        local_logits,
+        (6, 7),
+        confidence_threshold=0.8,
+        ambiguity_margin=0.05,
+        roi_mask=roi_mask,
+    )
+    assert torch.equal(output, global_labels)
+    assert stats.ambiguous_voxels == 1
+    assert stats.accepted_voxels == 0
+
+
+def test_selective_overwrite_can_protect_non_child_global_classes():
+    global_labels = torch.tensor([[0, 1], [6, 7]])
+    local_logits = torch.full((2, 2, 2), -5.0)
+    local_logits[0] = 5.0
+    output, stats = selective_prompt_overwrite(
+        global_labels,
+        local_logits,
+        (6, 7),
+        confidence_threshold=0.8,
+        eligible_global_class_ids=(0, 6, 7),
+    )
+    assert output.tolist() == [[6, 1], [6, 6]]
+    assert stats.accepted_voxels == 3
+    assert stats.ineligible_voxels == 1
+
+
+def test_keep_largest_component_per_class_is_class_specific():
+    segmentation = torch.zeros((3, 5, 5), dtype=torch.int16).numpy()
+    segmentation[0, 0, 0] = 6
+    segmentation[1:, 2:4, 2:4] = 6
+    segmentation[0, 4, 4] = 7
+    result = keep_largest_component_per_class(segmentation, (6, 7))
+    assert result[0, 0, 0] == 0
+    assert int((result == 6).sum()) == 8
+    assert int((result == 7).sum()) == 1
 
 
 def test_roi_visibility_skips_truncated_positive_but_keeps_true_negative():

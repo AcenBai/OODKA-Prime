@@ -65,9 +65,12 @@ def _source_metadata(cfg: TrainConfig) -> None:
         cfg.source_branch = subprocess.check_output(
             ["git", "branch", "--show-current"], cwd=repo_dir, text=True
         ).strip()
-        cfg.source_tracked_dirty = subprocess.run(
-            ["git", "diff", "--quiet"], cwd=repo_dir, check=False
-        ).returncode != 0
+        cfg.source_tracked_dirty = (
+            subprocess.run(
+                ["git", "diff", "--quiet"], cwd=repo_dir, check=False
+            ).returncode
+            != 0
+        )
     except (OSError, subprocess.CalledProcessError):
         pass
 
@@ -79,6 +82,14 @@ def main() -> None:
         "--roi_strategy",
         choices=("whole_heart", "great_vessel"),
         default="whole_heart",
+    )
+    parser.add_argument(
+        "--selective_children_only",
+        action="store_true",
+        help=(
+            "For great-vessel ROI training, supervise only the GV-union "
+            "localizer and the AO/PA child prompts."
+        ),
     )
     parser.add_argument("--device", required=True)
     parser.add_argument("--output_dir", required=True)
@@ -112,7 +123,16 @@ def main() -> None:
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--no_augment", action="store_true")
     parser.add_argument("--biomedparse_preproc_dir", default="")
+    parser.add_argument(
+        "--init_checkpoint",
+        default="",
+        help="Optional ROI checkpoint used to initialize fusion modules only.",
+    )
     args = parser.parse_args()
+    if args.selective_children_only and args.roi_strategy != "great_vessel":
+        raise ValueError(
+            "--selective_children_only requires --roi_strategy great_vessel"
+        )
 
     spec = DATASET_SPECS[args.dataset_name]
     image_size = args.image_size or int(spec["default_image_size"])
@@ -179,6 +199,7 @@ def main() -> None:
         val_case_limit=args.val_case_limit,
         max_train_batches=args.max_train_batches,
         max_val_batches=args.max_val_batches,
+        resume_checkpoint=args.init_checkpoint,
     )
     cfg.resolve_paths()
     _source_metadata(cfg)
@@ -189,20 +210,29 @@ def main() -> None:
         cfg.nnunet_model_dir, cfg.fold, device
     )
     great_vessel = args.roi_strategy == "great_vessel"
-    localization_prompts = spec[
-        "gv_localization_prompts" if great_vessel else "localization_prompts"
-    ]
-    refinement_prompts = spec[
-        "gv_refinement_prompts" if great_vessel else "refinement_prompts"
-    ]
-    localization_groups = (
-        WHS_GV_LOCALIZATION_GROUPS
-        if great_vessel else WHS_ROI_LOCALIZATION_GROUPS
-    )
-    refinement_groups = (
-        WHS_GV_REFINEMENT_GROUPS
-        if great_vessel else WHS_ROI_REFINEMENT_GROUPS
-    )
+    if args.selective_children_only:
+        gv_localization = spec["gv_localization_prompts"]
+        gv_refinement = spec["gv_refinement_prompts"]
+        localization_prompts = {"1": gv_localization["6"]}
+        refinement_prompts = {
+            "1": gv_refinement["6"],
+            "2": gv_refinement["7"],
+        }
+        localization_groups = ((6, 7),)
+        refinement_groups = ((6,), (7,))
+    else:
+        localization_prompts = spec[
+            "gv_localization_prompts" if great_vessel else "localization_prompts"
+        ]
+        refinement_prompts = spec[
+            "gv_refinement_prompts" if great_vessel else "refinement_prompts"
+        ]
+        localization_groups = (
+            WHS_GV_LOCALIZATION_GROUPS if great_vessel else WHS_ROI_LOCALIZATION_GROUPS
+        )
+        refinement_groups = (
+            WHS_GV_REFINEMENT_GROUPS if great_vessel else WHS_ROI_REFINEMENT_GROUPS
+        )
     localization_features = build_prompt_features(
         model_biomedparse, localization_prompts, device
     )
@@ -233,6 +263,18 @@ def main() -> None:
         ot_max_grid_size=cfg.ot_max_grid_size,
         remove_res5_expert_branch_norm=cfg.remove_res5_expert_branch_norm,
     )
+    if args.init_checkpoint:
+        initialization = torch.load(args.init_checkpoint, map_location=device)
+        missing_modules = [
+            name for name in fusion_modules if name not in initialization
+        ]
+        if missing_modules:
+            raise KeyError(
+                f"Initialization checkpoint misses modules: {missing_modules}"
+            )
+        for name, module in fusion_modules.items():
+            module.load_state_dict(initialization[name], strict=True)
+        print(f"Initialized fusion modules from {args.init_checkpoint}")
     trainer = LGEROIMixedTrainer(
         cfg=cfg,
         model_nnunet=model_nnunet,
@@ -246,23 +288,38 @@ def main() -> None:
             "localization": localization_prompts,
             "refinement": refinement_prompts,
         },
-        roi_prompt_index=5 if great_vessel else 0,
+        roi_prompt_index=(
+            0 if args.selective_children_only else 5 if great_vessel else 0
+        ),
         roi_source_labels=(6, 7) if great_vessel else tuple(range(1, 8)),
-        refinement_only_output=not great_vessel,
+        refinement_only_output=args.selective_children_only or not great_vessel,
         outside_prompt_mapping=(
-            WHS_GV_OUTSIDE_PROMPT_MAPPING
-            if great_vessel else ((0, 0), (1, 1))
+            ()
+            if args.selective_children_only
+            else WHS_GV_OUTSIDE_PROMPT_MAPPING if great_vessel else ((0, 0), (1, 1))
         ),
         experiment_name=(
-            f"WHS-{str(spec['modality']).upper()}-GV"
-            if great_vessel else f"WHS-{str(spec['modality']).upper()}"
+            f"WHS-{str(spec['modality']).upper()}-GV-SELECTIVE"
+            if args.selective_children_only
+            else (
+                f"WHS-{str(spec['modality']).upper()}-GV"
+                if great_vessel
+                else f"WHS-{str(spec['modality']).upper()}"
+            )
         ),
         checkpoint_format=(
-            "oodka_whs_gv_roi_v1" if great_vessel else "oodka_whs_roi_v1"
+            "oodka_whs_gv_selective_v1"
+            if args.selective_children_only
+            else "oodka_whs_gv_roi_v1" if great_vessel else "oodka_whs_roi_v1"
         ),
         checkpoint_prefix=(
-            f"fusion_whs_{spec['modality']}_gv_roi"
-            if great_vessel else f"fusion_whs_{spec['modality']}_roi"
+            f"fusion_whs_{spec['modality']}_gv_selective"
+            if args.selective_children_only
+            else (
+                f"fusion_whs_{spec['modality']}_gv_roi"
+                if great_vessel
+                else f"fusion_whs_{spec['modality']}_roi"
+            )
         ),
     )
     trainer.train()

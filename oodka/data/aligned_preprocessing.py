@@ -117,9 +117,9 @@ class AlignedBiomedParsePreprocessor:
         seg_zyx = None
         if seg is not None:
             seg_array = np.asarray(seg)
-            seg_zyx = (
-                seg_array[0] if seg_array.ndim == 4 else seg_array
-            ).astype(np.int16, copy=False)
+            seg_zyx = (seg_array[0] if seg_array.ndim == 4 else seg_array).astype(
+                np.int16, copy=False
+            )
         return bp_u8, seg_zyx, properties
 
     def prompt_logits_to_raw_segmentation(
@@ -160,3 +160,52 @@ class AlignedBiomedParsePreprocessor:
             num_threads_torch=1,
         )
         return np.asarray(restored, dtype=np.int16)
+
+    def prompt_values_to_raw_geometry(
+        self,
+        prompt_values: np.ndarray,
+        properties: dict,
+    ) -> np.ndarray:
+        """Restore continuous ``[P,Z,H,W]`` values without a task nonlinearity.
+
+        This follows nnUNet's probability-resampling and geometry restoration
+        path but deliberately does not apply softmax. It is therefore suitable
+        for independent open-vocabulary prompt logits.
+        """
+        if prompt_values.ndim != 4:
+            raise ValueError(
+                f"prompt_values must be [P,Z,H,W], got {prompt_values.shape}"
+            )
+        spacing_transposed = [
+            properties["spacing"][index]
+            for index in self.plans_manager.transpose_forward
+        ]
+        target_shape = properties["shape_after_cropping_and_before_resampling"]
+        configured_spacing = self.configuration_manager.spacing
+        current_spacing = (
+            configured_spacing
+            if len(configured_spacing) == len(target_shape)
+            else [spacing_transposed[0], *configured_spacing]
+        )
+        restored = self.configuration_manager.resampling_fn_probabilities(
+            prompt_values,
+            target_shape,
+            current_spacing,
+            spacing_transposed,
+        )
+        if not hasattr(restored, "device"):
+            import torch
+
+            restored = torch.as_tensor(restored)
+        label_manager = self.plans_manager.get_label_manager(self.dataset_json)
+        restored = label_manager.revert_cropping_on_probabilities(
+            restored,
+            properties["bbox_used_for_cropping"],
+            properties["shape_before_cropping"],
+        )
+        if hasattr(restored, "detach"):
+            restored = restored.detach().cpu().numpy()
+        else:
+            restored = np.asarray(restored)
+        axes = [0] + [index + 1 for index in self.plans_manager.transpose_backward]
+        return restored.transpose(axes).astype(np.float32, copy=False)
