@@ -242,6 +242,14 @@ def main() -> None:
         action="store_true",
         help="Save fused NIfTIs; requires a single threshold and ambiguity margin.",
     )
+    parser.add_argument(
+        "--selective_save_evidence_dir",
+        default="",
+        help=(
+            "Optional directory for raw-space float16 AO/PA logits, GV-union "
+            "logits, and fallback masks used by correction-gate experiments."
+        ),
+    )
     args = parser.parse_args()
     if not 0.0 < args.independent_threshold < 1.0:
         raise ValueError("--independent_threshold must be in (0,1)")
@@ -268,6 +276,8 @@ def main() -> None:
     is_v2 = checkpoint_format in {"oodka_lge_roi_v2", "oodka_lge_roi_v3_split5"}
     is_flat = checkpoint_format == "oodka_lge_flat_v1"
     selective_enabled = bool(args.selective_global_pred_dir)
+    evidence_enabled = bool(args.selective_save_evidence_dir)
+    needs_selective_evidence = selective_enabled or evidence_enabled
     selective_thresholds = _parse_float_grid(
         args.selective_thresholds, name="--selective_thresholds"
     )
@@ -299,8 +309,12 @@ def main() -> None:
         args.selective_gv_write_dilations,
         name="--selective_gv_write_dilations",
     )
-    if selective_enabled and not uses_gv_roi:
-        raise ValueError("Selective AO/PA fusion requires a WHS-GV checkpoint")
+    if needs_selective_evidence and not uses_gv_roi:
+        raise ValueError("Selective AO/PA evidence requires a WHS-GV checkpoint")
+    if args.selective_save_predictions and not selective_enabled:
+        raise ValueError(
+            "--selective_save_predictions requires --selective_global_pred_dir"
+        )
     for threshold in selective_thresholds:
         if not 0.0 < threshold < 1.0:
             raise ValueError("Selective thresholds must be in (0,1)")
@@ -517,6 +531,8 @@ def main() -> None:
         fallback=str(saved.get("roi_fallback", "full")),
     )
     maybe_mkdir_p(args.out_dir)
+    if args.selective_save_evidence_dir:
+        maybe_mkdir_p(args.selective_save_evidence_dir)
     pred_dir = os.path.join(args.out_dir, "pred_nii")
     maybe_mkdir_p(pred_dir)
     independent_dirs = {}
@@ -601,11 +617,13 @@ def main() -> None:
         final_prompt_logits = np.zeros((final_count, *spatial_shape), dtype=np.float32)
         final_localizer_logits = (
             np.zeros((1, *spatial_shape), dtype=np.float32)
-            if selective_enabled
+            if needs_selective_evidence
             else None
         )
         final_fallback_mask = (
-            np.zeros(spatial_shape, dtype=np.float32) if selective_enabled else None
+            np.zeros(spatial_shape, dtype=np.float32)
+            if needs_selective_evidence
+            else None
         )
         block_starts = list(range(0, spatial_shape[0], cfg.block_z))
         for block_batch_start in range(0, len(block_starts), args.batch_size):
@@ -767,7 +785,7 @@ def main() -> None:
                     .cpu()
                     .numpy()
                 )
-                if selective_enabled:
+                if needs_selective_evidence:
                     localizer_index = int(checkpoint.get("roi_prompt_index", 2))
                     localizer_resized = (
                         F.interpolate(
@@ -793,7 +811,7 @@ def main() -> None:
                 final_prompt_logits[:, z_start : z_start + valid_count] = resized[
                     block_index, :valid_count
                 ].transpose(1, 0, 2, 3)
-                if selective_enabled:
+                if needs_selective_evidence:
                     final_localizer_logits[0, z_start : z_start + valid_count] = (
                         localizer_resized[block_index, :valid_count]
                     )
@@ -853,7 +871,7 @@ def main() -> None:
 
         gt_raw, spacing = read_nifti_as_zyx_with_spacing(label_path)
         target = _remap_gt(gt_raw, final_groups)
-        if selective_enabled:
+        if needs_selective_evidence:
             local_raw_logits = preprocessor.prompt_values_to_raw_geometry(
                 final_prompt_logits[list(selective_local_prompt_indices)],
                 properties,
@@ -869,6 +887,17 @@ def main() -> None:
                 )[0]
                 >= 0.5
             )
+            if evidence_enabled:
+                np.savez_compressed(
+                    os.path.join(
+                        args.selective_save_evidence_dir,
+                        f"{case_id}.npz",
+                    ),
+                    local_logits=local_raw_logits.astype(np.float16),
+                    gv_logit=localizer_raw_logits.astype(np.float16),
+                    fallback_mask=fallback_raw_mask.astype(np.uint8),
+                )
+        if selective_enabled:
             gv_probability = 1.0 / (
                 1.0 + np.exp(-np.clip(localizer_raw_logits, -30.0, 30.0))
             )

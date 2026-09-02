@@ -197,7 +197,63 @@ the loose-crop/tight-write principle, while also showing that a fixed union
 mask alone is unlikely to create the desired large gap.  A learned reject gate
 or proposal-level anchored connectivity is the next conservative extension.
 
+## Learned correction-gate ablation
+
+The next experiment froze both segmentation models and trained a small
+per-voxel MLP to predict whether the local AO/PA winner was correct.  The gate
+does not consume the global predicted class.  Its 16 bounded inputs contain
+only local AO/PA confidence and margin, GV-union confidence, in-plane
+neighborhood means, distance and position relative to confident GV support,
+the ROI fallback flag, and normalized coordinates.  Global labels enter only
+afterward as a hard write-protection mask for `{background, AO, PA}`; the other
+five semantic classes remain bit-for-bit unchanged.
+
+The training set contained the 16 fold-0 MRI training cases.  Positive samples
+were correct AO/PA proposals, balanced across the two children; high-confidence
+background and fallback proposals were emphasized as hard negatives.  Four
+MLP/loss variants were trained for 15 epochs.  Selection on the four in-domain
+validation cases chose the `(32, 16)` base MLP, gate threshold `0.05`, and an
+intersection with the already locked GV-veto.  This changed validation raw Dice
+from `0.819319` for GV-veto alone to `0.819385`.
+
+### Locked OOD result
+
+| MRI OOD metric | Global | GV-veto | Learned intersection |
+| --- | ---: | ---: | ---: |
+| Seven-class mean Dice | 0.662654 | **0.667394** | 0.667239 |
+| AO mean Dice | 0.449620 | **0.461615** | 0.460522 |
+| PA mean Dice | 0.400927 | 0.422113 | **0.422119** |
+| Changed voxels | - | 568,468 | 573,632 |
+| Beneficial changes | - | 162,132 | 160,987 |
+| Harmful changes | - | **282,887** | 287,094 |
+
+Relative to global, the locked learned result gains `+0.004585`, improves
+21/26 cases, and has paired bootstrap 95% CI
+`[+0.002626, +0.006896]` with Wilcoxon `p=0.0000269`.  It nevertheless loses
+`0.000155` to the existing GV-veto, winning only 6/26 paired cases; the paired
+CI is `[-0.000288, -0.000033]` and Wilcoxon `p=0.0140`.
+
+An exact matched-evidence diagnostic explains the discrepancy.  Because gate
+evidence was saved as float16 logits, the fixed threshold decisions near the
+boundary differ slightly from the original float32 GV-veto run.  On the same
+float16 evidence, GV-veto without a learned rejection scores `0.6672393`; the
+locked gate scores `0.6672388` and rejects only 132 additional candidates.
+Thus the selected gate itself is effectively neutral, while evidence
+quantization accounts for almost all of the difference from `0.667394`.
+
+A test-label-only post-hoc threshold diagnostic (not a valid selectable result)
+peaks at `0.667285` with threshold `0.3`, only `+0.000045` over the matched
+float16 no-gate control and still below the original GV-veto.  The failure is
+therefore not merely the validation threshold: per-voxel gate ranking adds too
+little information beyond the hand-designed GV/fallback constraints.  A next
+attempt should operate on connected AO/PA proposals with anchored topology and
+component-level evidence, or train the rejector with genuinely shifted or
+strongly spatially augmented examples rather than more ID voxels.
+
 All child-only artifacts are under
 `experiments/selective_refinement_20260902/child_only_pipeline_finetune10/`.
 The veto validation and locked OOD artifacts are under
 `experiments/selective_refinement_20260902/veto_ablation/`.
+The learned-gate evidence, checkpoints, validation sweep, locked OOD output,
+and post-hoc diagnostic are under
+`experiments/selective_refinement_20260902/correction_gate/`.
