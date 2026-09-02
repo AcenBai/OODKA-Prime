@@ -36,6 +36,7 @@ class MultiScaleOTDistillation(nn.Module):
         min_received_mass: float = 1e-6,
         relative_kd: bool = False,
         relative_kd_expert_weight: float = 1.0,
+        relative_kd_branches: str = "both",
     ) -> None:
         super().__init__()
         self.levels = tuple(int(level) for level in levels)
@@ -80,6 +81,15 @@ class MultiScaleOTDistillation(nn.Module):
         self.relative_kd_expert_weight = float(relative_kd_expert_weight)
         if self.relative_kd_expert_weight < 0.0:
             raise ValueError("relative_kd_expert_weight must be non-negative")
+        if relative_kd_branches not in {"both", "p", "s"}:
+            raise ValueError(
+                "relative_kd_branches must be 'both', 'p', or 's', got "
+                f"{relative_kd_branches!r}"
+            )
+        self.relative_kd_branches = relative_kd_branches
+
+    def _reverse_enabled(self, branch: str) -> bool:
+        return self.relative_kd and self.relative_kd_branches in {"both", branch}
 
     @staticmethod
     def _valid_feature_slices(
@@ -258,7 +268,7 @@ class MultiScaleOTDistillation(nn.Module):
                     p_cost["base_tokens"], p_teacher["teacher"], p_mass["a"]
                 )
                 p_losses.append(p_loss)
-                if self.relative_kd:
+                if self._reverse_enabled("p"):
                     # The same fixed correspondence is reused in reverse:
                     # base/student values teach expert tokens, while neither
                     # the transport nor the teacher values receive gradients.
@@ -320,7 +330,7 @@ class MultiScaleOTDistillation(nn.Module):
                 else:
                     s_loss = s_cost["base_tokens"].sum() * 0.0
                 s_losses.append(s_loss)
-                if self.relative_kd and received_total.detach().item() > self.min_received_mass:
+                if self._reverse_enabled("s") and received_total.detach().item() > self.min_received_mass:
                     s_reverse_teacher = self.projector(
                         s_transport["transport"].transpose(1, 2),
                         s_cost["base_tokens"],

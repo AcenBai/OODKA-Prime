@@ -265,6 +265,24 @@ def test_relative_kd_reuses_detached_transport_and_backpropagates_both_sides():
         assert features[key].grad.abs().sum().item() > 0.0
 
 
+def test_relative_kd_can_be_limited_to_p_branch():
+    objective = MultiScaleOTDistillation(
+        relative_kd=True,
+        relative_kd_branches="p",
+    )
+    assert objective._reverse_enabled("p")
+    assert not objective._reverse_enabled("s")
+
+
+def test_relative_kd_branch_selector_is_validated():
+    try:
+        MultiScaleOTDistillation(relative_kd_branches="invalid")
+    except ValueError as error:
+        assert "relative_kd_branches" in str(error)
+    else:
+        raise AssertionError("invalid reverse-KD branch selector was accepted")
+
+
 def test_multiscale_grid_caps_native_size_without_upsampling():
     objective = MultiScaleOTDistillation(max_grid_size=32)
     assert objective._target_size(torch.empty(1, 1, 128, 96)) == (32, 32)

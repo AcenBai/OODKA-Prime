@@ -65,6 +65,12 @@ def main():
     parser.add_argument("--w_seg", type=float, default=3.0)
     parser.add_argument("--w_ae", type=float, default=0.2)
     parser.add_argument("--w_ort", type=float, default=0.3)
+    parser.add_argument(
+        "--expert_ortho_weight",
+        type=float,
+        default=1.0,
+        help="Multiplier on only the Expert-side P/S orthogonality term",
+    )
     parser.add_argument("--w_route", type=float, default=1e-3)
     parser.add_argument("--route_warmup_epochs", type=int, default=5)
     parser.add_argument("--w_p_ot", type=float, default=0.1)
@@ -86,6 +92,12 @@ def main():
         type=float,
         default=1.0,
         help="Multiplier on the reverse student-to-expert KD term",
+    )
+    parser.add_argument(
+        "--relative_kd_branches",
+        choices=("both", "p", "s"),
+        default="both",
+        help="Reverse-KD branches to enable when --relative_kd is set",
     )
     parser.add_argument(
         "--expert_adapter_variant",
@@ -132,6 +144,7 @@ def main():
         w_seg=args.w_seg,
         w_ae=args.w_ae,
         w_ort=args.w_ort,
+        expert_ortho_weight=args.expert_ortho_weight,
         w_route=args.w_route,
         route_warmup_epochs=args.route_warmup_epochs,
         w_p_ot=args.w_p_ot,
@@ -142,6 +155,7 @@ def main():
         ot_max_grid_size=args.ot_max_grid_size,
         relative_kd=args.relative_kd,
         relative_kd_expert_weight=args.relative_kd_expert_weight,
+        relative_kd_branches=args.relative_kd_branches,
         expert_adapter_variant=args.expert_adapter_variant,
         amp=not args.no_amp,
         resume_checkpoint=args.resume_checkpoint,
@@ -199,6 +213,12 @@ def main():
         )
         cfg.expert_adapter_variant = str(
             resume_cfg.get("expert_adapter_variant", "legacy")
+        )
+        cfg.expert_ortho_weight = float(
+            resume_cfg.get("expert_ortho_weight", 1.0)
+        )
+        cfg.relative_kd_branches = str(
+            resume_cfg.get("relative_kd_branches", "both")
         )
         if "route_prior_p_mean" not in resume_cfg:
             raise ValueError(
@@ -286,6 +306,7 @@ def main():
         ot_max_grid_size=cfg.ot_max_grid_size,
         relative_kd=cfg.relative_kd,
         relative_kd_expert_weight=cfg.relative_kd_expert_weight,
+        relative_kd_branches=cfg.relative_kd_branches,
         expert_adapter_variant=cfg.expert_adapter_variant,
         remove_res5_expert_branch_norm=cfg.remove_res5_expert_branch_norm,
     )

@@ -123,13 +123,15 @@ def _normalized_mse_flat_z(
 def _compute_reconstruction_separation_losses(
     feats: Dict,
     valid_z: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    expert_ortho_weight: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute reconstruction and P/S separation across all levels."""
     eps = 1e-8
     levels = [2, 3, 4, 5]
 
     ae_losses = []
-    ortho_losses = []
+    student_ortho_losses = []
+    expert_ortho_losses = []
 
     for i in levels:
         Z_n = feats[f"Z_n{i}"]
@@ -145,14 +147,17 @@ def _compute_reconstruction_separation_losses(
         ae_losses.extend([ae_n, ae_b])
 
         with torch.autocast(device_type=Zb_p.device.type, enabled=False):
-            ortho_losses.append(
+            student_ortho_losses.append(
                 ortho_corr_loss(Zb_p.float(), Zb_s.float(), valid_z=valid_z)
             )
-            ortho_losses.append(
+            expert_ortho_losses.append(
                 ortho_corr_loss(Zn_p.float(), Zn_s.float(), valid_z=valid_z)
             )
 
-    return sum(ae_losses), sum(ortho_losses)
+    student_ortho = sum(student_ortho_losses)
+    expert_ortho = sum(expert_ortho_losses)
+    combined = student_ortho + float(expert_ortho_weight) * expert_ortho
+    return sum(ae_losses), combined, student_ortho, expert_ortho
 
 
 def _run_pixel_decoder(
@@ -494,6 +499,7 @@ def forward_one_batch(
     model_biomedparse: nn.Module,
     fusion_modules: Dict[str, nn.Module],
     device: torch.device,
+    expert_ortho_weight: float = 1.0,
     w_route: float = 0.0,
     w_p_ot: float = 0.0,
     w_s_ot: float = 0.0,
@@ -559,8 +565,12 @@ def forward_one_batch(
     feats = _disentangle_and_inject(enc_feats, res3d, img_embeds_base, ae_mods, dis_mods, device)
 
     # Reconstruction and P/S separation losses.
-    loss_ae_z, loss_ortho = _compute_reconstruction_separation_losses(
-        feats, valid_z
+    loss_ae_z, loss_ortho, loss_ortho_student, loss_ortho_expert = (
+        _compute_reconstruction_separation_losses(
+            feats,
+            valid_z,
+            expert_ortho_weight=expert_ortho_weight,
+        )
     )
 
     # Pixel decoder for p and s branches
@@ -718,6 +728,8 @@ def forward_one_batch(
         "loss_seg": float(loss_seg.detach().item()),
         "loss_ae": float(loss_ae.detach().item()),
         "loss_ortho": float(loss_ortho.detach().item()),
+        "loss_ortho_student": float(loss_ortho_student.detach().item()),
+        "loss_ortho_expert": float(loss_ortho_expert.detach().item()),
         "loss_route": float(loss_route.detach().item()),
         "loss_p_ot": float(loss_p_ot.detach().item()),
         "loss_s_ot": float(loss_s_ot.detach().item()),

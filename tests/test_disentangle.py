@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from oodka.models.disentangle import DirectSharedDecoderExpertAdapter
 from oodka.train import model_builder
+from oodka.train.forward import _compute_reconstruction_separation_losses
 
 
 def test_direct_shared_expert_adapter_is_exactly_three_bias_free_convs():
@@ -58,3 +59,26 @@ def test_builder_selects_direct_shared_expert_adapter(monkeypatch):
             modules[f"ae_enc{level}_to_res{level}"],
             DirectSharedDecoderExpertAdapter,
         )
+
+
+def test_expert_orthogonality_can_be_disabled_without_disabling_student_term():
+    torch.manual_seed(11)
+    features = {}
+    for level in range(2, 6):
+        shape = (1, 4, 2, 3, 3)
+        features[f"Z_n{level}"] = torch.randn(shape)
+        features[f"Zn{level}_rec"] = torch.randn(shape)
+        features[f"Zb_res{level}"] = torch.randn(shape)
+        for prefix in ("Zn", "Zb"):
+            features[f"{prefix}{level}_p"] = torch.randn(shape)
+            features[f"{prefix}{level}_s"] = torch.randn(shape)
+    valid_z = torch.ones(1, 2, dtype=torch.bool)
+
+    _ae, combined, student, expert = _compute_reconstruction_separation_losses(
+        features,
+        valid_z,
+        expert_ortho_weight=0.0,
+    )
+    torch.testing.assert_close(combined, student)
+    assert student.item() > 0.0
+    assert expert.item() > 0.0

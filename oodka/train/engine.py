@@ -111,12 +111,14 @@ class OODKATrainer:
             "epochs": [],
             "train_loss_total": [], "train_loss_seg": [],
             "train_loss_ae": [], "train_loss_ortho": [],
+            "train_loss_ortho_student": [], "train_loss_ortho_expert": [],
             "train_loss_route": [],
             "train_loss_p_ot": [], "train_loss_s_ot": [],
             "train_loss_p_ot_forward": [], "train_loss_s_ot_forward": [],
             "train_loss_p_ot_reverse": [], "train_loss_s_ot_reverse": [],
             "val_loss_total": [], "val_loss_seg": [],
             "val_loss_ae": [], "val_loss_ortho": [],
+            "val_loss_ortho_student": [], "val_loss_ortho_expert": [],
             "val_loss_route": [],
             "val_loss_p_ot": [], "val_loss_s_ot": [],
             "val_loss_p_ot_forward": [], "val_loss_s_ot_forward": [],
@@ -196,6 +198,7 @@ class OODKATrainer:
             key: 0.0
             for key in [
                 "loss_total", "loss_seg", "loss_ae", "loss_ortho",
+                "loss_ortho_student", "loss_ortho_expert",
                 "loss_route",
                 "loss_p_ot", "loss_s_ot",
                 "loss_p_ot_forward", "loss_s_ot_forward",
@@ -244,6 +247,7 @@ class OODKATrainer:
                         model_biomedparse=self.model_biomedparse,
                         fusion_modules=self.fusion_modules,
                         device=self.device,
+                        expert_ortho_weight=cfg.expert_ortho_weight,
                         w_route=w_route,
                         w_p_ot=w_p_ot,
                         w_s_ot=w_s_ot,
@@ -321,6 +325,7 @@ class OODKATrainer:
         log(f"Batch contract: B={cfg.batch_size}, Z={cfg.block_z}, "
             f"C_nn=dataset, C_bp=3, H=W={cfg.image_size}")
         log(f"Expert adapter: {cfg.expert_adapter_variant}")
+        log(f"Expert orthogonality multiplier: {cfg.expert_ortho_weight:g}")
         log(
             f"OT grid rule: each native feature dimension is capped at "
             f"{cfg.ot_max_grid_size}"
@@ -328,7 +333,8 @@ class OODKATrainer:
         log(
             "Relative KD: "
             f"enabled={cfg.relative_kd} "
-            f"expert_weight={cfg.relative_kd_expert_weight:g}"
+            f"expert_weight={cfg.relative_kd_expert_weight:g} "
+            f"branches={cfg.relative_kd_branches}"
         )
         log(f"Output: {cfg.output_dir}")
 
@@ -410,6 +416,7 @@ class OODKATrainer:
             self.history["epochs"].append(epoch)
             for key in [
                 "loss_total", "loss_seg", "loss_ae", "loss_ortho",
+                "loss_ortho_student", "loss_ortho_expert",
                 "loss_route",
                 "loss_p_ot", "loss_s_ot",
                 "loss_p_ot_forward", "loss_s_ot_forward",

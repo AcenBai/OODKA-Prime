@@ -129,6 +129,9 @@ class TrainConfig:
     w_seg: float = 3.0
     w_ae: float = 0.2
     w_ort: float = 0.3
+    # Scale only the Expert-side P/S correlation penalty.  Student separation
+    # remains controlled by ``w_ort`` so the two roles can be ablated cleanly.
+    expert_ortho_weight: float = 1.0
     w_route: float = 1e-3
     route_warmup_epochs: int = 5
     # One finest prompt-specific spatial gate is downsampled to every level.
@@ -160,6 +163,9 @@ class TrainConfig:
     # expert->student KD remains unchanged; this scales only student->expert.
     relative_kd: bool = False
     relative_kd_expert_weight: float = 1.0
+    # Select which reverse (student -> expert) branches are active whenever
+    # ``relative_kd`` is enabled.
+    relative_kd_branches: str = "both"
     # ``legacy`` uses Conv-IN-GELU, two normalized branch heads, and two
     # branch-specific decoders. ``direct_shared`` uses only two direct 1x1x1
     # projections and one shared 1x1x1 decoder on P+S.
