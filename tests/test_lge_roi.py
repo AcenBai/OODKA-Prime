@@ -15,6 +15,7 @@ from oodka.data.lge_roi import (
 )
 from run_eval_lge_roi import _hierarchical_foreground_logits
 from oodka.eval.selective_refinement import (
+    dilate_mask_in_plane,
     keep_largest_component_per_class,
     selective_prompt_overwrite,
 )
@@ -228,6 +229,40 @@ def test_selective_overwrite_can_protect_non_child_global_classes():
     assert output.tolist() == [[6, 1], [6, 6]]
     assert stats.accepted_voxels == 3
     assert stats.ineligible_voxels == 1
+
+
+def test_selective_overwrite_applies_stricter_background_policy_only_to_additions():
+    global_labels = torch.tensor([[0, 0], [6, 7]])
+    local_logits = torch.full((2, 2, 2), -5.0)
+    local_logits[0] = torch.tensor([[2.9, 5.0], [0.0, 5.0]])
+    local_logits[1] = torch.tensor([[-5.0, -5.0], [5.0, 0.0]])
+    write_mask = torch.tensor([[True, False], [False, False]])
+    output, stats = selective_prompt_overwrite(
+        global_labels,
+        local_logits,
+        (6, 7),
+        confidence_threshold=0.9,
+        ambiguity_margin=0.1,
+        eligible_global_class_ids=(0, 6, 7),
+        background_confidence_threshold=0.95,
+        background_ambiguity_margin=0.2,
+        background_write_mask=write_mask,
+    )
+    # The first background proposal misses the stricter confidence threshold;
+    # the second passes confidence but is vetoed by anatomical support. Existing
+    # child labels can still be corrected under the original policy.
+    assert output.tolist() == [[0, 0], [7, 6]]
+    assert stats.background_vetoed_voxels == 1
+    assert stats.changed_voxels == 2
+
+
+def test_dilate_mask_in_plane_does_not_cross_slices():
+    mask = torch.zeros((3, 5, 5), dtype=torch.bool).numpy()
+    mask[1, 2, 2] = True
+    result = dilate_mask_in_plane(mask, iterations=1)
+    assert int(result.sum()) == 9
+    assert not result[0].any()
+    assert not result[2].any()
 
 
 def test_keep_largest_component_per_class_is_class_specific():

@@ -15,6 +15,11 @@ import numpy as np
 CONFIG_KEYS = (
     "confidence_threshold",
     "ambiguity_margin",
+    "background_confidence_threshold",
+    "background_ambiguity_margin",
+    "gv_write_threshold",
+    "gv_write_dilation",
+    "forbid_background_fallback",
     "overwrite_scope",
     "postprocess",
 )
@@ -24,6 +29,7 @@ COUNT_KEYS = (
     "changed_voxels",
     "ambiguous_voxels",
     "ineligible_voxels",
+    "background_vetoed_voxels",
     "beneficial_changes",
     "harmful_changes",
 )
@@ -102,6 +108,17 @@ def main() -> None:
         aggregate = dict(zip(CONFIG_KEYS, key))
         aggregate["confidence_threshold"] = float(aggregate["confidence_threshold"])
         aggregate["ambiguity_margin"] = float(aggregate["ambiguity_margin"])
+        aggregate["background_confidence_threshold"] = float(
+            aggregate["background_confidence_threshold"]
+        )
+        aggregate["background_ambiguity_margin"] = float(
+            aggregate["background_ambiguity_margin"]
+        )
+        aggregate["gv_write_threshold"] = float(aggregate["gv_write_threshold"])
+        aggregate["gv_write_dilation"] = int(aggregate["gv_write_dilation"])
+        aggregate["forbid_background_fallback"] = (
+            aggregate["forbid_background_fallback"] == "True"
+        )
         aggregate["n_cases"] = len(rows)
         aggregate["mean_dice_gt_present"] = _optional_mean(rows, "dice_mean_gt")
         for count_key in COUNT_KEYS:

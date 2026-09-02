@@ -47,6 +47,7 @@ from oodka.models.prompts import (
     WHS_ROI_REFINEMENT_GROUPS,
 )
 from oodka.eval.selective_refinement import (
+    dilate_mask_in_plane,
     keep_largest_component_per_class,
     selective_prompt_overwrite,
 )
@@ -119,6 +120,16 @@ def _parse_float_grid(value: str, *, name: str) -> tuple[float, ...]:
     return values
 
 
+def _parse_int_grid(value: str, *, name: str) -> tuple[int, ...]:
+    try:
+        values = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as error:
+        raise ValueError(f"{name} must be a comma-separated integer list") from error
+    if not values:
+        raise ValueError(f"{name} must not be empty")
+    return values
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
@@ -176,6 +187,43 @@ def main() -> None:
         help="Comma-separated minimum top1-minus-top2 probability margins.",
     )
     parser.add_argument(
+        "--selective_background_thresholds",
+        default="",
+        help=(
+            "Comma-separated stricter local confidence thresholds used only "
+            "when changing global background into AO/PA."
+        ),
+    )
+    parser.add_argument(
+        "--selective_background_ambiguity_margins",
+        default="",
+        help=(
+            "Comma-separated AO/PA margins used only when changing global "
+            "background into AO/PA."
+        ),
+    )
+    parser.add_argument(
+        "--selective_gv_write_thresholds",
+        default="0.0",
+        help=(
+            "Comma-separated GV-union probabilities defining where global "
+            "background may be changed. Zero disables the write mask."
+        ),
+    )
+    parser.add_argument(
+        "--selective_gv_write_dilations",
+        default="0",
+        help="Comma-separated in-plane dilation iterations for the GV write mask.",
+    )
+    parser.add_argument(
+        "--selective_forbid_background_fallback",
+        action="store_true",
+        help=(
+            "Do not create AO/PA from global background in slices belonging "
+            "to a fallback ROI block."
+        ),
+    )
+    parser.add_argument(
         "--selective_postprocess",
         choices=("none", "keep_largest_per_class", "both"),
         default="both",
@@ -227,6 +275,30 @@ def main() -> None:
         args.selective_ambiguity_margins,
         name="--selective_ambiguity_margins",
     )
+    selective_background_thresholds = (
+        _parse_float_grid(
+            args.selective_background_thresholds,
+            name="--selective_background_thresholds",
+        )
+        if args.selective_background_thresholds.strip()
+        else (None,)
+    )
+    selective_background_ambiguity_margins = (
+        _parse_float_grid(
+            args.selective_background_ambiguity_margins,
+            name="--selective_background_ambiguity_margins",
+        )
+        if args.selective_background_ambiguity_margins.strip()
+        else (None,)
+    )
+    selective_gv_write_thresholds = _parse_float_grid(
+        args.selective_gv_write_thresholds,
+        name="--selective_gv_write_thresholds",
+    )
+    selective_gv_write_dilations = _parse_int_grid(
+        args.selective_gv_write_dilations,
+        name="--selective_gv_write_dilations",
+    )
     if selective_enabled and not uses_gv_roi:
         raise ValueError("Selective AO/PA fusion requires a WHS-GV checkpoint")
     for threshold in selective_thresholds:
@@ -235,11 +307,32 @@ def main() -> None:
     for margin in selective_ambiguity_margins:
         if not 0.0 <= margin < 1.0:
             raise ValueError("Selective ambiguity margins must be in [0,1)")
+    for threshold in selective_background_thresholds:
+        if threshold is None:
+            continue
+        if not 0.0 < threshold < 1.0:
+            raise ValueError("Selective background thresholds must be in (0,1)")
+    for margin in selective_background_ambiguity_margins:
+        if margin is None:
+            continue
+        if not 0.0 <= margin < 1.0:
+            raise ValueError("Selective background ambiguity margins must be in [0,1)")
+    for threshold in selective_gv_write_thresholds:
+        if not 0.0 <= threshold < 1.0:
+            raise ValueError("Selective GV write thresholds must be in [0,1)")
+    for dilation in selective_gv_write_dilations:
+        if dilation < 0:
+            raise ValueError("Selective GV write dilations must be non-negative")
     if args.selective_save_predictions and (
-        len(selective_thresholds) != 1 or len(selective_ambiguity_margins) != 1
+        len(selective_thresholds) != 1
+        or len(selective_ambiguity_margins) != 1
+        or len(selective_background_thresholds) != 1
+        or len(selective_background_ambiguity_margins) != 1
+        or len(selective_gv_write_thresholds) != 1
+        or len(selective_gv_write_dilations) != 1
     ):
         raise ValueError(
-            "--selective_save_predictions requires one threshold and one margin"
+            "--selective_save_predictions requires one value for every fusion grid"
         )
     decision = args.decision
     if decision == "auto":
@@ -457,6 +550,35 @@ def main() -> None:
         if args.selective_overwrite_scope == "both"
         else (args.selective_overwrite_scope,)
     )
+    selective_fusion_configs = [
+        {
+            "confidence_threshold": confidence_threshold,
+            "ambiguity_margin": ambiguity_margin,
+            "background_confidence_threshold": (
+                confidence_threshold
+                if background_confidence_threshold is None
+                else background_confidence_threshold
+            ),
+            "background_ambiguity_margin": (
+                ambiguity_margin
+                if background_ambiguity_margin is None
+                else background_ambiguity_margin
+            ),
+            "gv_write_threshold": gv_write_threshold,
+            "gv_write_dilation": gv_write_dilation,
+            "forbid_background_fallback": bool(
+                args.selective_forbid_background_fallback
+            ),
+            "overwrite_scope": scope,
+        }
+        for confidence_threshold in selective_thresholds
+        for ambiguity_margin in selective_ambiguity_margins
+        for background_confidence_threshold in selective_background_thresholds
+        for background_ambiguity_margin in selective_background_ambiguity_margins
+        for gv_write_threshold in selective_gv_write_thresholds
+        for gv_write_dilation in selective_gv_write_dilations
+        for scope in selective_scopes
+    ]
     if selective_enabled and args.selective_save_predictions:
         for scope in selective_scopes:
             for postprocess in selective_postprocesses:
@@ -477,6 +599,14 @@ def main() -> None:
         )
         spatial_shape = bp_u8.shape
         final_prompt_logits = np.zeros((final_count, *spatial_shape), dtype=np.float32)
+        final_localizer_logits = (
+            np.zeros((1, *spatial_shape), dtype=np.float32)
+            if selective_enabled
+            else None
+        )
+        final_fallback_mask = (
+            np.zeros(spatial_shape, dtype=np.float32) if selective_enabled else None
+        )
         block_starts = list(range(0, spatial_shape[0], cfg.block_z))
         for block_batch_start in range(0, len(block_starts), args.batch_size):
             current_starts = block_starts[
@@ -637,6 +767,25 @@ def main() -> None:
                     .cpu()
                     .numpy()
                 )
+                if selective_enabled:
+                    localizer_index = int(checkpoint.get("roi_prompt_index", 2))
+                    localizer_resized = (
+                        F.interpolate(
+                            anatomy[:, localizer_index].reshape(
+                                block_count * block_z,
+                                1,
+                                cfg.image_size,
+                                cfg.image_size,
+                            ),
+                            size=spatial_shape[1:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        .reshape(block_count, block_z, *spatial_shape[1:])
+                        .float()
+                        .cpu()
+                        .numpy()
+                    )
             for block_index, (z_start, block_valid) in enumerate(
                 zip(current_starts, valid)
             ):
@@ -644,6 +793,13 @@ def main() -> None:
                 final_prompt_logits[:, z_start : z_start + valid_count] = resized[
                     block_index, :valid_count
                 ].transpose(1, 0, 2, 3)
+                if selective_enabled:
+                    final_localizer_logits[0, z_start : z_start + valid_count] = (
+                        localizer_resized[block_index, :valid_count]
+                    )
+                    final_fallback_mask[z_start : z_start + valid_count] = float(
+                        rois[block_index].fallback
+                    )
                 if is_flat:
                     continue
                 roi = rois[block_index]
@@ -702,6 +858,39 @@ def main() -> None:
                 final_prompt_logits[list(selective_local_prompt_indices)],
                 properties,
             )
+            localizer_raw_logits = preprocessor.prompt_values_to_raw_geometry(
+                final_localizer_logits,
+                properties,
+            )[0]
+            fallback_raw_mask = (
+                preprocessor.prompt_values_to_raw_geometry(
+                    final_fallback_mask[None],
+                    properties,
+                )[0]
+                >= 0.5
+            )
+            gv_probability = 1.0 / (
+                1.0 + np.exp(-np.clip(localizer_raw_logits, -30.0, 30.0))
+            )
+            background_write_masks = {}
+            for fusion_config in selective_fusion_configs:
+                write_key = (
+                    fusion_config["gv_write_threshold"],
+                    fusion_config["gv_write_dilation"],
+                    fusion_config["forbid_background_fallback"],
+                )
+                if write_key in background_write_masks:
+                    continue
+                if fusion_config["gv_write_threshold"] == 0.0:
+                    write_mask = np.ones(raw_shape, dtype=bool)
+                else:
+                    write_mask = dilate_mask_in_plane(
+                        gv_probability >= fusion_config["gv_write_threshold"],
+                        fusion_config["gv_write_dilation"],
+                    )
+                if fusion_config["forbid_background_fallback"]:
+                    write_mask &= ~fallback_raw_mask
+                background_write_masks[write_key] = torch.from_numpy(write_mask)
             selective_target = _remap_gt(gt_raw, WHS_ROI_REFINEMENT_GROUPS)
             if tuple(local_raw_logits.shape[1:]) != raw_shape:
                 raise ValueError(
@@ -743,76 +932,82 @@ def main() -> None:
                 for class_id in range(1, selective_class_count + 1):
                     global_row[f"dice_{class_id}"] = global_dice_pc.get(class_id)
                 selective_global_rows.append(global_row)
-            for confidence_threshold in selective_thresholds:
-                for ambiguity_margin in selective_ambiguity_margins:
-                    for scope in selective_scopes:
-                        eligible_ids = (
-                            (0, 6, 7) if scope == "background_children" else None
+            for fusion_config in selective_fusion_configs:
+                scope = fusion_config["overwrite_scope"]
+                eligible_ids = (0, 6, 7) if scope == "background_children" else None
+                write_key = (
+                    fusion_config["gv_write_threshold"],
+                    fusion_config["gv_write_dilation"],
+                    fusion_config["forbid_background_fallback"],
+                )
+                fused_tensor, overwrite_stats = selective_prompt_overwrite(
+                    global_tensor,
+                    local_tensor,
+                    (6, 7),
+                    confidence_threshold=fusion_config["confidence_threshold"],
+                    ambiguity_margin=fusion_config["ambiguity_margin"],
+                    eligible_global_class_ids=eligible_ids,
+                    background_confidence_threshold=fusion_config[
+                        "background_confidence_threshold"
+                    ],
+                    background_ambiguity_margin=fusion_config[
+                        "background_ambiguity_margin"
+                    ],
+                    background_write_mask=background_write_masks[write_key],
+                )
+                fused_unprocessed = fused_tensor.numpy().astype(np.int16, copy=False)
+                changed = fused_tensor != global_tensor
+                before_correct = global_tensor == target_tensor
+                after_correct = fused_tensor == target_tensor
+                beneficial = int(
+                    (changed & ~before_correct & after_correct).sum().item()
+                )
+                harmful = int((changed & before_correct & ~after_correct).sum().item())
+                for postprocess in selective_postprocesses:
+                    fused = (
+                        keep_largest_component_per_class(
+                            fused_unprocessed,
+                            tuple(range(1, selective_class_count + 1)),
                         )
-                        fused_tensor, overwrite_stats = selective_prompt_overwrite(
-                            global_tensor,
-                            local_tensor,
-                            (6, 7),
-                            confidence_threshold=confidence_threshold,
-                            ambiguity_margin=ambiguity_margin,
-                            eligible_global_class_ids=eligible_ids,
+                        if postprocess == "keep_largest_per_class"
+                        else fused_unprocessed
+                    )
+                    dice_pc_selective, dice_mean_selective, _ = dice_no_ignore(
+                        fused,
+                        selective_target,
+                        tuple(range(1, selective_class_count + 1)),
+                    )
+                    selective_row = {
+                        "case_id": case_id,
+                        **fusion_config,
+                        "postprocess": postprocess,
+                        "dice_mean_gt": dice_mean_selective,
+                        "proposed_voxels": overwrite_stats.proposed_voxels,
+                        "accepted_voxels": overwrite_stats.accepted_voxels,
+                        "changed_voxels": overwrite_stats.changed_voxels,
+                        "ambiguous_voxels": overwrite_stats.ambiguous_voxels,
+                        "ineligible_voxels": overwrite_stats.ineligible_voxels,
+                        "background_vetoed_voxels": (
+                            overwrite_stats.background_vetoed_voxels
+                        ),
+                        "beneficial_changes": beneficial,
+                        "harmful_changes": harmful,
+                    }
+                    for class_id in range(1, selective_class_count + 1):
+                        selective_row[f"dice_{class_id}"] = dice_pc_selective.get(
+                            class_id
                         )
-                        fused_unprocessed = fused_tensor.numpy().astype(
-                            np.int16, copy=False
+                    selective_rows.append(selective_row)
+                    if args.selective_save_predictions:
+                        output = sitk.GetImageFromArray(fused)
+                        output.CopyInformation(sitk.ReadImage(label_path))
+                        sitk.WriteImage(
+                            output,
+                            os.path.join(
+                                selective_pred_dirs[(scope, postprocess)],
+                                case_id + ending,
+                            ),
                         )
-                        changed = fused_tensor != global_tensor
-                        before_correct = global_tensor == target_tensor
-                        after_correct = fused_tensor == target_tensor
-                        beneficial = int(
-                            (changed & ~before_correct & after_correct).sum().item()
-                        )
-                        harmful = int(
-                            (changed & before_correct & ~after_correct).sum().item()
-                        )
-                        for postprocess in selective_postprocesses:
-                            fused = (
-                                keep_largest_component_per_class(
-                                    fused_unprocessed,
-                                    tuple(range(1, selective_class_count + 1)),
-                                )
-                                if postprocess == "keep_largest_per_class"
-                                else fused_unprocessed
-                            )
-                            dice_pc_selective, dice_mean_selective, _ = dice_no_ignore(
-                                fused,
-                                selective_target,
-                                tuple(range(1, selective_class_count + 1)),
-                            )
-                            selective_row = {
-                                "case_id": case_id,
-                                "confidence_threshold": confidence_threshold,
-                                "ambiguity_margin": ambiguity_margin,
-                                "overwrite_scope": scope,
-                                "postprocess": postprocess,
-                                "dice_mean_gt": dice_mean_selective,
-                                "proposed_voxels": overwrite_stats.proposed_voxels,
-                                "accepted_voxels": overwrite_stats.accepted_voxels,
-                                "changed_voxels": overwrite_stats.changed_voxels,
-                                "ambiguous_voxels": overwrite_stats.ambiguous_voxels,
-                                "ineligible_voxels": overwrite_stats.ineligible_voxels,
-                                "beneficial_changes": beneficial,
-                                "harmful_changes": harmful,
-                            }
-                            for class_id in range(1, selective_class_count + 1):
-                                selective_row[f"dice_{class_id}"] = (
-                                    dice_pc_selective.get(class_id)
-                                )
-                            selective_rows.append(selective_row)
-                            if args.selective_save_predictions:
-                                output = sitk.GetImageFromArray(fused)
-                                output.CopyInformation(sitk.ReadImage(label_path))
-                                sitk.WriteImage(
-                                    output,
-                                    os.path.join(
-                                        selective_pred_dirs[(scope, postprocess)],
-                                        case_id + ending,
-                                    ),
-                                )
         if decision == "independent":
             threshold_logit = float(
                 np.log(args.independent_threshold / (1.0 - args.independent_threshold))
@@ -969,59 +1164,56 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(selective_global_rows)
         sweep_summary = []
-        for confidence_threshold in selective_thresholds:
-            for ambiguity_margin in selective_ambiguity_margins:
-                for scope in selective_scopes:
-                    for postprocess in selective_postprocesses:
-                        selected = [
-                            row
-                            for row in selective_rows
-                            if row["confidence_threshold"] == confidence_threshold
-                            and row["ambiguity_margin"] == ambiguity_margin
-                            and row["overwrite_scope"] == scope
-                            and row["postprocess"] == postprocess
-                        ]
-                        aggregate = {
-                            "confidence_threshold": confidence_threshold,
-                            "ambiguity_margin": ambiguity_margin,
-                            "overwrite_scope": scope,
-                            "postprocess": postprocess,
-                            "n_cases": len(selected),
-                            "mean_dice_gt_present": float(
-                                np.mean([row["dice_mean_gt"] for row in selected])
-                            ),
-                            "proposed_voxels": int(
-                                sum(row["proposed_voxels"] for row in selected)
-                            ),
-                            "accepted_voxels": int(
-                                sum(row["accepted_voxels"] for row in selected)
-                            ),
-                            "changed_voxels": int(
-                                sum(row["changed_voxels"] for row in selected)
-                            ),
-                            "ambiguous_voxels": int(
-                                sum(row["ambiguous_voxels"] for row in selected)
-                            ),
-                            "ineligible_voxels": int(
-                                sum(row["ineligible_voxels"] for row in selected)
-                            ),
-                            "beneficial_changes": int(
-                                sum(row["beneficial_changes"] for row in selected)
-                            ),
-                            "harmful_changes": int(
-                                sum(row["harmful_changes"] for row in selected)
-                            ),
-                        }
-                        for class_id in range(1, selective_class_count + 1):
-                            values = [
-                                row[f"dice_{class_id}"]
-                                for row in selected
-                                if row[f"dice_{class_id}"] is not None
-                            ]
-                            aggregate[f"dice_{class_id}_mean"] = (
-                                float(np.mean(values)) if values else None
-                            )
-                        sweep_summary.append(aggregate)
+        for fusion_config in selective_fusion_configs:
+            for postprocess in selective_postprocesses:
+                selected = [
+                    row
+                    for row in selective_rows
+                    if all(row[key] == value for key, value in fusion_config.items())
+                    and row["postprocess"] == postprocess
+                ]
+                aggregate = {
+                    **fusion_config,
+                    "postprocess": postprocess,
+                    "n_cases": len(selected),
+                    "mean_dice_gt_present": float(
+                        np.mean([row["dice_mean_gt"] for row in selected])
+                    ),
+                    "proposed_voxels": int(
+                        sum(row["proposed_voxels"] for row in selected)
+                    ),
+                    "accepted_voxels": int(
+                        sum(row["accepted_voxels"] for row in selected)
+                    ),
+                    "changed_voxels": int(
+                        sum(row["changed_voxels"] for row in selected)
+                    ),
+                    "ambiguous_voxels": int(
+                        sum(row["ambiguous_voxels"] for row in selected)
+                    ),
+                    "ineligible_voxels": int(
+                        sum(row["ineligible_voxels"] for row in selected)
+                    ),
+                    "background_vetoed_voxels": int(
+                        sum(row["background_vetoed_voxels"] for row in selected)
+                    ),
+                    "beneficial_changes": int(
+                        sum(row["beneficial_changes"] for row in selected)
+                    ),
+                    "harmful_changes": int(
+                        sum(row["harmful_changes"] for row in selected)
+                    ),
+                }
+                for class_id in range(1, selective_class_count + 1):
+                    values = [
+                        row[f"dice_{class_id}"]
+                        for row in selected
+                        if row[f"dice_{class_id}"] is not None
+                    ]
+                    aggregate[f"dice_{class_id}_mean"] = (
+                        float(np.mean(values)) if values else None
+                    )
+                sweep_summary.append(aggregate)
         sweep_summary.sort(
             key=lambda value: value["mean_dice_gt_present"], reverse=True
         )

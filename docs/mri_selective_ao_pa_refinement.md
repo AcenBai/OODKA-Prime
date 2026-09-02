@@ -148,5 +148,56 @@ but AO background suppression remains the main limitation. The next change
 should add an explicit background veto or connected anatomical support rather
 than adding more foreground prompts.
 
+## Low-intrusion background-veto ablation
+
+The next ablation changed only the fusion rule; the trained child-only model
+and global seven-class predictions were frozen.  The ROI remains block-wise
+2.5-D: the maximum GV-union probability over each contiguous four-slice block
+defines one shared XY crop.  It is therefore a four-slice cuboid rather than a
+single full-volume 3-D ROI.
+
+The wide crop remains unchanged, but additions from global background require
+a tighter GV-union write mask.  Background additions also use their own local
+confidence and AO/PA ambiguity thresholds, and fallback blocks cannot create
+new child foreground.  Existing AO/PA labels retain the original correction
+threshold; LV/RV/LA/RA/Myo remain protected by construction.
+
+Using only the four in-domain validation cases, a 36-configuration raw-Dice
+sweep selected:
+
+- child confidence `0.9`, AO/PA margin `0.1`;
+- background confidence `0.95`, background margin `0.2`;
+- GV-union write threshold `0.7`, dilated by five in-plane raw voxels;
+- no background additions in fallback blocks;
+- `background_children` overwrite scope.
+
+The locked 26-case OOD raw result was:
+
+| MRI OOD metric | Global | Original protected | GV-veto protected |
+| --- | ---: | ---: | ---: |
+| Seven-class mean Dice | 0.662654 | 0.666945 | **0.667394** |
+| AO mean Dice | 0.449620 | 0.463572 | 0.461615 |
+| PA mean Dice | 0.400927 | 0.417013 | **0.422113** |
+| Changed voxels | - | 777,773 | **568,468** |
+| Beneficial changes | - | 201,329 | 162,132 |
+| Harmful changes | - | 442,957 | **282,887** |
+
+Relative to global, the veto result gains `+0.004740` mean Dice and improves
+21/26 cases.  The paired bootstrap 95% CI is
+`[+0.002729, +0.007106]`; Wilcoxon `p=0.0000319`.  Relative to the original
+protected result it gains `+0.000449`, with 22/26 case wins.  This smaller
+paired gain has bootstrap CI `[-0.000457, +0.001254]` and Wilcoxon `p=0.02043`,
+so it should be interpreted as a useful but modest ablation rather than a
+large breakthrough.
+
+The veto removes 36.1% of harmful overwrites while sacrificing 19.5% of
+beneficial corrections.  Its gain comes mainly from PA; AO gives back about
+0.002 Dice relative to the original protected rule.  The experiment validates
+the loose-crop/tight-write principle, while also showing that a fixed union
+mask alone is unlikely to create the desired large gap.  A learned reject gate
+or proposal-level anchored connectivity is the next conservative extension.
+
 All child-only artifacts are under
 `experiments/selective_refinement_20260902/child_only_pipeline_finetune10/`.
+The veto validation and locked OOD artifacts are under
+`experiments/selective_refinement_20260902/veto_ablation/`.
