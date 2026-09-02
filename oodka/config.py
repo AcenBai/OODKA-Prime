@@ -158,6 +158,10 @@ class TrainConfig:
     s_ot_epsilon: float = 0.1
     s_ot_rho_base: float = 1.0
     s_ot_rho_expert: float = 0.2
+    # ``capacity_partial`` gives S transport an explicit accepted mass and
+    # guarantees both row and column marginals do not exceed their capacities.
+    s_transport_mode: str = "unbalanced"
+    s_partial_mass_fraction: float = 0.5
     # Reuse each detached OT correspondence in the reverse direction so the
     # student representation also supervises the expert adapter.  The forward
     # expert->student KD remains unchanged; this scales only student->expert.

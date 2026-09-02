@@ -4,12 +4,17 @@ from .cost import OTCostBuilder, pool_feature_map
 from .losses import WeightedCosineDistillation, WeightedLogRMSAlignment
 from .mass import ResidualMassBuilder, StructureMassBuilder
 from .objective import MultiScaleOTDistillation
-from .sinkhorn import BalancedSinkhorn, UnbalancedSinkhorn
+from .sinkhorn import (
+    BalancedSinkhorn,
+    CapacityConstrainedPartialSinkhorn,
+    UnbalancedSinkhorn,
+)
 from .transport import BarycentricProjector
 
 __all__ = [
     "BalancedSinkhorn",
     "BarycentricProjector",
+    "CapacityConstrainedPartialSinkhorn",
     "OTCostBuilder",
     "MultiScaleOTDistillation",
     "ResidualMassBuilder",

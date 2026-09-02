@@ -222,6 +222,7 @@ class OODKATrainer:
                 "p_cost", "p_row_error", "p_col_error", "p_entropy",
                 "p_reverse_loss",
                 "s_cost", "s_received", "s_transported", "s_rejected",
+                "s_overused",
                 "s_accept_ratio", "s_entropy", "s_gain", "s_reverse_loss",
             ]
         ]
@@ -339,6 +340,10 @@ class OODKATrainer:
         log(
             f"OT grid rule: each native feature dimension is capped at "
             f"{cfg.ot_max_grid_size}"
+        )
+        log(
+            f"S transport: mode={cfg.s_transport_mode} "
+            f"partial_mass={cfg.s_partial_mass_fraction:g}"
         )
         log(
             "Relative KD: "

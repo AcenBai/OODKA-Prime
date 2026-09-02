@@ -106,6 +106,7 @@ class UnbalancedSinkhorn(nn.Module):
             received = transport.sum(dim=-1)
             transported = transport.sum(dim=-2)
             rejected = (b - transported).clamp_min(0.0)
+            overused = (transported - b).clamp_min(0.0)
             accepted = torch.minimum(transported, b)
             entropy = -(transport.clamp_min(self.eps) * transport.clamp_min(self.eps).log()).sum(
                 dim=(-2, -1)
@@ -121,7 +122,92 @@ class UnbalancedSinkhorn(nn.Module):
             "transported": transported,
             "accepted": accepted,
             "rejected": rejected,
+            "overused": overused,
             "accept_ratio": accept_ratio,
             "entropy": entropy,
             "cost": transport_cost,
+        }
+
+
+class CapacityConstrainedPartialSinkhorn(nn.Module):
+    """Entropic partial OT with explicit row/column capacity constraints.
+
+    A dummy row and column absorb unmatched Student demand and rejected Expert
+    supply.  Penalizing dummy-to-dummy transport makes the real-to-real plan
+    carry the configured mass while satisfying ``row <= a`` and ``col <= b``.
+    """
+
+    def __init__(
+        self,
+        epsilon: float = 0.1,
+        transported_mass_fraction: float = 0.5,
+        iterations: int = 50,
+        eps: float = 1e-8,
+    ) -> None:
+        super().__init__()
+        self.epsilon = float(epsilon)
+        self.transported_mass_fraction = float(transported_mass_fraction)
+        self.iterations = int(iterations)
+        self.eps = float(eps)
+        if not 0.0 < self.transported_mass_fraction <= 1.0:
+            raise ValueError("transported_mass_fraction must be in (0, 1]")
+        self.solver = BalancedSinkhorn(
+            epsilon=self.epsilon,
+            iterations=self.iterations,
+            eps=self.eps,
+        )
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor, cost: torch.Tensor) -> dict:
+        with torch.no_grad(), torch.autocast(
+            device_type=cost.device.type, enabled=False
+        ):
+            a, b, cost = a.float(), b.float(), cost.float()
+            _validate(a, b, cost)
+            total_a = a.sum(dim=-1)
+            total_b = b.sum(dim=-1)
+            target = (
+                self.transported_mass_fraction * torch.minimum(total_a, total_b)
+            )
+            unmatched_a = total_a - target
+            unmatched_b = total_b - target
+
+            batch, rows, cols = cost.shape
+            augmented_cost = cost.new_zeros(batch, rows + 1, cols + 1)
+            augmented_cost[:, :rows, :cols] = cost
+            # Any dummy-to-dummy mass raises real transported mass above the
+            # requested target.  A large finite penalty suppresses that route
+            # while retaining log-domain numerical stability.
+            dummy_penalty = cost.amax(dim=(-2, -1)) + 50.0 * self.epsilon
+            augmented_cost[:, rows, cols] = dummy_penalty
+            augmented_a = torch.cat((a, unmatched_b[:, None]), dim=-1)
+            augmented_b = torch.cat((b, unmatched_a[:, None]), dim=-1)
+            augmented = self.solver(augmented_a, augmented_b, augmented_cost)
+
+            transport = augmented["transport"][:, :rows, :cols]
+            received = transport.sum(dim=-1)
+            transported = transport.sum(dim=-2)
+            row_unused = (a - received).clamp_min(0.0)
+            rejected = (b - transported).clamp_min(0.0)
+            overused = (transported - b).clamp_min(0.0)
+            transported_total = transport.sum(dim=(-2, -1))
+            accept_ratio = transported_total / total_b.clamp_min(self.eps)
+            entropy = -(
+                transport.clamp_min(self.eps)
+                * transport.clamp_min(self.eps).log()
+            ).sum(dim=(-2, -1))
+            transport_cost = (transport * cost).sum(dim=(-2, -1))
+
+        return {
+            "transport": transport,
+            "received": received,
+            "transported": transported,
+            "accepted": transported,
+            "rejected": rejected,
+            "overused": overused,
+            "row_unused": row_unused,
+            "accept_ratio": accept_ratio,
+            "entropy": entropy,
+            "cost": transport_cost,
+            "target_transport_mass": target,
+            "transport_mass_error": (transported_total - target).abs(),
         }

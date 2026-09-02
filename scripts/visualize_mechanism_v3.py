@@ -1650,9 +1650,19 @@ def _plot_s_ot(
     received_map = _mass_image(output["received"], grid)
     transported_map = _mass_image(output["transported"], grid)
     rejected_map = _mass_image(output["rejected"], grid)
+    overused = output.get(
+        "overused", (output["transported"] - mass["b"]).clamp_min(0.0)
+    )
+    overused_map = _mass_image(overused, grid)
     rejection_ratio = (
         output["rejected"] / mass["b"].clamp_min(1e-8)
     )[0].clamp(0.0, 1.0).detach().cpu().numpy().reshape(grid)
+    overuse_ratio = (
+        overused / mass["b"].clamp_min(1e-8)
+    )[0].detach().cpu().numpy().reshape(grid)
+    usage_ratio = (
+        output["transported"] / mass["b"].clamp_min(1e-8)
+    )[0].detach().cpu().numpy().reshape(grid)
     difficulty = mass["difficulty"][0].detach().cpu().numpy().reshape(grid)
     gain = mass["gain"][0].detach().cpu().numpy().reshape(grid)
     gain_mode = str(mass.get("gain_mode", "hard_positive"))
@@ -1718,7 +1728,7 @@ def _plot_s_ot(
         vmax=mass_vmax,
     )
     rejection_image = _share(
-        axes[1, 3], rejection_ratio, title="Expert rejection ratio"
+        axes[1, 3], rejection_ratio, title="Expert under-supply / rejection ratio"
     )
 
     energy_image = _heat(
@@ -1775,6 +1785,7 @@ def _plot_s_ot(
         f"transport total = {transport.sum().item():.4f}\n"
         f"accept ratio = {output['accept_ratio'].mean().item():.4f}\n"
         f"rejected total = {output['rejected'].sum().item():.4f}\n"
+        f"overused total = {overused.sum().item():.4f}\n"
         f"received total = {output['received'].sum().item():.4f}\n"
         f"mean residual = {residual.mean():.4f}"
     )
@@ -1841,6 +1852,32 @@ def _plot_s_ot(
     )
     figure.savefig(path, dpi=180)
     plt.close(figure)
+
+    marginal_figure, marginal_axes = plt.subplots(
+        1, 5, figsize=(19, 4), constrained_layout=True
+    )
+    marginal_values = (
+        (b_map, "Supply $b_j$ × N", "magma", 0.0, mass_vmax),
+        (transported_map, "Used $m_j$ × N", "magma", 0.0, mass_vmax),
+        (rejection_ratio, "Underfill $[b_j-m_j]_+/b_j$", "viridis", 0.0, 1.0),
+        (np.log2(1.0 + overuse_ratio), "Overuse $\\log_2(1+[m_j-b_j]_+/b_j)$", "inferno", 0.0, None),
+        (np.log2(np.maximum(usage_ratio, 1e-8)), "Usage $\\log_2(m_j/b_j)$", "coolwarm", -4.0, 4.0),
+    )
+    for axis, (value, title, cmap, vmin, vmax) in zip(
+        marginal_axes, marginal_values
+    ):
+        shown = axis.imshow(value, cmap=cmap, vmin=vmin, vmax=vmax)
+        axis.set_title(title, fontsize=10)
+        axis.axis("off")
+        marginal_figure.colorbar(shown, ax=axis, shrink=0.72)
+    marginal_figure.suptitle(
+        f"res{level} S transport marginal audit: underfill and overuse are distinct",
+        fontsize=14,
+    )
+    marginal_figure.savefig(
+        path.with_name(f"{path.stem}_marginals.png"), dpi=190
+    )
+    plt.close(marginal_figure)
     return {
         "student_energy": student_energy,
         "expert_energy": expert_energy,
@@ -1856,7 +1893,10 @@ def _plot_s_ot(
         "received_density": received_map,
         "transported_density": transported_map,
         "rejected_density": rejected_map,
+        "overused_density": overused_map,
         "rejection_ratio": rejection_ratio,
+        "overuse_ratio": overuse_ratio,
+        "usage_ratio": usage_ratio,
         "transport_log_density": log_density,
         "transport_log_conditional": log_conditional,
     }
@@ -2229,6 +2269,12 @@ def main() -> None:
     s_gain_temperature = float(
         checkpoint_cfg.get("s_gain_temperature", cfg.s_gain_temperature)
     )
+    s_transport_mode = str(
+        checkpoint_cfg.get("s_transport_mode", "unbalanced")
+    )
+    s_partial_mass_fraction = float(
+        checkpoint_cfg.get("s_partial_mass_fraction", 0.5)
+    )
     expert_adapter_variant = str(
         checkpoint_cfg.get("expert_adapter_variant", "legacy")
     )
@@ -2338,6 +2384,8 @@ def main() -> None:
         s_ot_rho_expert=cfg.s_ot_rho_expert,
         ot_sinkhorn_iterations=cfg.ot_sinkhorn_iterations,
         ot_max_grid_size=cfg.ot_max_grid_size,
+        s_transport_mode=s_transport_mode,
+        s_partial_mass_fraction=s_partial_mass_fraction,
         expert_adapter_variant=expert_adapter_variant,
         remove_res5_expert_branch_norm=remove_res5_expert_branch_norm,
     )
@@ -2805,6 +2853,16 @@ def main() -> None:
                     "rejected_total": float(
                         s_transport["rejected"].sum().item()
                     ),
+                    "overused_total": float(
+                        s_transport.get(
+                            "overused",
+                            (
+                                s_transport["transported"] - s_mass["b"]
+                            ).clamp_min(0.0),
+                        ).sum().item()
+                    ),
+                    "transport_mode": s_transport_mode,
+                    "partial_mass_fraction": s_partial_mass_fraction,
                     "transport_cost": float(
                         s_transport["cost"].mean().item()
                     ),

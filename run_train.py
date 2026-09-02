@@ -80,6 +80,17 @@ def main():
     parser.add_argument("--ot_warmup_epochs", type=int, default=5)
     parser.add_argument("--ot_max_grid_size", type=int, default=32)
     parser.add_argument(
+        "--s_transport_mode",
+        choices=("unbalanced", "capacity_partial"),
+        default="unbalanced",
+    )
+    parser.add_argument(
+        "--s_partial_mass_fraction",
+        type=float,
+        default=0.5,
+        help="Real transported mass fraction for capacity-constrained S partial OT",
+    )
+    parser.add_argument(
         "--relative_kd",
         action="store_true",
         help=(
@@ -162,6 +173,8 @@ def main():
         s_ot_start_epoch=args.s_ot_start_epoch,
         ot_warmup_epochs=args.ot_warmup_epochs,
         ot_max_grid_size=args.ot_max_grid_size,
+        s_transport_mode=args.s_transport_mode,
+        s_partial_mass_fraction=args.s_partial_mass_fraction,
         relative_kd=args.relative_kd,
         relative_kd_expert_weight=args.relative_kd_expert_weight,
         relative_kd_rms_weight=args.relative_kd_rms_weight,
@@ -232,6 +245,12 @@ def main():
         )
         cfg.relative_kd_rms_weight = float(
             resume_cfg.get("relative_kd_rms_weight", 0.0)
+        )
+        cfg.s_transport_mode = str(
+            resume_cfg.get("s_transport_mode", "unbalanced")
+        )
+        cfg.s_partial_mass_fraction = float(
+            resume_cfg.get("s_partial_mass_fraction", 0.5)
         )
         if "route_prior_p_mean" not in resume_cfg:
             raise ValueError(
@@ -317,6 +336,8 @@ def main():
         s_ot_rho_expert=cfg.s_ot_rho_expert,
         ot_sinkhorn_iterations=cfg.ot_sinkhorn_iterations,
         ot_max_grid_size=cfg.ot_max_grid_size,
+        s_transport_mode=cfg.s_transport_mode,
+        s_partial_mass_fraction=cfg.s_partial_mass_fraction,
         relative_kd=cfg.relative_kd,
         relative_kd_expert_weight=cfg.relative_kd_expert_weight,
         relative_kd_rms_weight=cfg.relative_kd_rms_weight,

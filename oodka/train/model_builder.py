@@ -156,6 +156,8 @@ def build_fusion_modules(
     s_ot_rho_expert: float = 0.2,
     ot_sinkhorn_iterations: int = 30,
     ot_max_grid_size: int = 32,
+    s_transport_mode: str = "unbalanced",
+    s_partial_mass_fraction: float = 0.5,
     relative_kd: bool = False,
     relative_kd_expert_weight: float = 1.0,
     relative_kd_rms_weight: float = 0.0,
@@ -220,6 +222,8 @@ def build_fusion_modules(
     if model_nnunet is not None:
         modules["ot_distillation"] = MultiScaleOTDistillation(
             max_grid_size=ot_max_grid_size,
+            s_transport_mode=s_transport_mode,
+            s_partial_mass_fraction=s_partial_mass_fraction,
             feature_weight=ot_feature_weight,
             coordinate_weight=ot_coordinate_weight,
             coordinate_radius=ot_coordinate_radius,

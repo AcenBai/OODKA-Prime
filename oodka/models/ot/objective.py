@@ -10,7 +10,11 @@ import torch.nn as nn
 from .cost import OTCostBuilder, _coordinates
 from .losses import WeightedCosineDistillation, WeightedLogRMSAlignment
 from .mass import ResidualMassBuilder, StructureMassBuilder
-from .sinkhorn import BalancedSinkhorn, UnbalancedSinkhorn
+from .sinkhorn import (
+    BalancedSinkhorn,
+    CapacityConstrainedPartialSinkhorn,
+    UnbalancedSinkhorn,
+)
 from .transport import BarycentricProjector
 
 
@@ -22,6 +26,8 @@ class MultiScaleOTDistillation(nn.Module):
         *,
         levels: Sequence[int] = (2, 3, 4, 5),
         max_grid_size: int = 32,
+        s_transport_mode: str = "unbalanced",
+        s_partial_mass_fraction: float = 0.5,
         feature_weight: float = 1.0,
         coordinate_weight: float = 0.25,
         coordinate_radius: float = 0.25,
@@ -69,12 +75,26 @@ class MultiScaleOTDistillation(nn.Module):
         self.balanced = BalancedSinkhorn(
             epsilon=p_epsilon, iterations=sinkhorn_iterations
         )
-        self.unbalanced = UnbalancedSinkhorn(
-            epsilon=s_epsilon,
-            rho_base=rho_base,
-            rho_expert=rho_expert,
-            iterations=sinkhorn_iterations,
-        )
+        if s_transport_mode == "unbalanced":
+            self.unbalanced = UnbalancedSinkhorn(
+                epsilon=s_epsilon,
+                rho_base=rho_base,
+                rho_expert=rho_expert,
+                iterations=sinkhorn_iterations,
+            )
+        elif s_transport_mode == "capacity_partial":
+            self.unbalanced = CapacityConstrainedPartialSinkhorn(
+                epsilon=s_epsilon,
+                transported_mass_fraction=s_partial_mass_fraction,
+                iterations=sinkhorn_iterations,
+            )
+        else:
+            raise ValueError(
+                "s_transport_mode must be 'unbalanced' or "
+                f"'capacity_partial', got {s_transport_mode!r}"
+            )
+        self.s_transport_mode = s_transport_mode
+        self.s_partial_mass_fraction = float(s_partial_mass_fraction)
         self.projector = BarycentricProjector()
         self.distillation = WeightedCosineDistillation()
         self.rms_alignment = WeightedLogRMSAlignment()
@@ -389,6 +409,7 @@ class MultiScaleOTDistillation(nn.Module):
                     s_received=s_transport["received"].sum(dim=-1).mean(),
                     s_transported=s_transport["transported"].sum(dim=-1).mean(),
                     s_rejected=s_transport["rejected"].sum(dim=-1).mean(),
+                    s_overused=s_transport["overused"].sum(dim=-1).mean(),
                     s_accept_ratio=s_transport["accept_ratio"].mean(),
                     s_entropy=s_transport["entropy"].mean(),
                     s_gain=s_mass["gain"].mean(),

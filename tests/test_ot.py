@@ -5,6 +5,7 @@ from oodka.models.disentangle import DualBranchAutoEncoder
 from oodka.models.ot import (
     BalancedSinkhorn,
     BarycentricProjector,
+    CapacityConstrainedPartialSinkhorn,
     OTCostBuilder,
     MultiScaleOTDistillation,
     ResidualMassBuilder,
@@ -65,6 +66,38 @@ def test_uot_acceptance_decreases_under_controlled_global_cost_shift():
     assert all(
         right < left for left, right in zip(acceptance, acceptance[1:])
     )
+
+
+def test_capacity_partial_ot_respects_both_marginal_caps_and_target_mass():
+    torch.manual_seed(19)
+    a = torch.rand(2, 7)
+    b = torch.rand(2, 5)
+    a = a / a.sum(-1, keepdim=True)
+    b = b / b.sum(-1, keepdim=True)
+    cost = torch.rand(2, 7, 5)
+    output = CapacityConstrainedPartialSinkhorn(
+        epsilon=0.1,
+        transported_mass_fraction=0.45,
+        iterations=200,
+    )(a, b, cost)
+
+    row = output["transport"].sum(dim=-1)
+    col = output["transport"].sum(dim=-2)
+    assert torch.all(row <= a + 2e-4)
+    assert torch.all(col <= b + 2e-4)
+    torch.testing.assert_close(
+        output["transport"].sum(dim=(-2, -1)),
+        torch.full((2,), 0.45),
+        atol=2e-4,
+        rtol=2e-4,
+    )
+    torch.testing.assert_close(
+        output["rejected"].sum(dim=-1),
+        torch.full((2,), 0.55),
+        atol=2e-4,
+        rtol=2e-4,
+    )
+    assert output["overused"].max().item() < 2e-4
 
 
 def test_cost_barycentric_and_weighted_distillation_shapes():
