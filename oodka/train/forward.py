@@ -52,14 +52,23 @@ def _disentangle_and_inject(
         ae = ae_modules[f"ae_enc{i}_to_res{i}"]
         dis = dis_modules[f"dis_b_res{i}"]
 
-        Zn_p, Zn_s, Zn_p_rec, Zn_s_rec = ae(Z_n)
+        expert_outputs = ae(Z_n)
+        if len(expert_outputs) == 4:
+            Zn_p, Zn_s, Zn_p_rec, Zn_s_rec = expert_outputs
+            Zn_rec = Zn_p_rec + Zn_s_rec
+        elif len(expert_outputs) == 3:
+            Zn_p, Zn_s, Zn_rec = expert_outputs
+        else:
+            raise RuntimeError(
+                "Expert adapter must return (P,S,reconstruction) or "
+                "(P,S,P_reconstruction,S_reconstruction)"
+            )
         Zb_p, Zb_s = dis(Zb_res)
 
         out[f"Z_n{i}"] = Z_n
         out[f"Zn{i}_p"] = Zn_p
         out[f"Zn{i}_s"] = Zn_s
-        out[f"Zn{i}_p_rec"] = Zn_p_rec
-        out[f"Zn{i}_s_rec"] = Zn_s_rec
+        out[f"Zn{i}_rec"] = Zn_rec
         out[f"Zb_res{i}"] = Zb_res
         out[f"Zb{i}_p"] = Zb_p
         out[f"Zb{i}_s"] = Zb_s
@@ -124,15 +133,14 @@ def _compute_reconstruction_separation_losses(
 
     for i in levels:
         Z_n = feats[f"Z_n{i}"]
-        Zn_p_rec = feats[f"Zn{i}_p_rec"]
-        Zn_s_rec = feats[f"Zn{i}_s_rec"]
+        Zn_rec = feats[f"Zn{i}_rec"]
         Zb_res = feats[f"Zb_res{i}"]
         Zn_p = feats[f"Zn{i}_p"]
         Zn_s = feats[f"Zn{i}_s"]
         Zb_p = feats[f"Zb{i}_p"]
         Zb_s = feats[f"Zb{i}_s"]
 
-        ae_n = _normalized_mse_5d(Zn_p_rec + Zn_s_rec, Z_n, valid_z, eps)
+        ae_n = _normalized_mse_5d(Zn_rec, Z_n, valid_z, eps)
         ae_b = _normalized_mse_5d(Zb_p + Zb_s, Zb_res, valid_z, eps)
         ae_losses.extend([ae_n, ae_b])
 

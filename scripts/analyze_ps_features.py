@@ -184,6 +184,9 @@ def main() -> None:
         len(prompts),
         device,
         text_dim=int(prompt_features["class_emb"].shape[-1]),
+        expert_adapter_variant=str(
+            checkpoint_cfg.get("expert_adapter_variant", "legacy")
+        ),
         remove_res5_expert_branch_norm=bool(
             checkpoint_cfg.get("remove_res5_expert_branch_norm", False)
         ),

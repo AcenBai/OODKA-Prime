@@ -160,6 +160,10 @@ class TrainConfig:
     # expert->student KD remains unchanged; this scales only student->expert.
     relative_kd: bool = False
     relative_kd_expert_weight: float = 1.0
+    # ``legacy`` uses Conv-IN-GELU, two normalized branch heads, and two
+    # branch-specific decoders. ``direct_shared`` uses only two direct 1x1x1
+    # projections and one shared 1x1x1 decoder on P+S.
+    expert_adapter_variant: str = "legacy"
     # Targeted res5 mitigation: retain all other expert-side normalizers.
     remove_res5_expert_branch_norm: bool = True
 

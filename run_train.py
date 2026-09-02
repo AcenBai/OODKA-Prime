@@ -87,6 +87,15 @@ def main():
         default=1.0,
         help="Multiplier on the reverse student-to-expert KD term",
     )
+    parser.add_argument(
+        "--expert_adapter_variant",
+        choices=("legacy", "direct_shared"),
+        default="legacy",
+        help=(
+            "Expert decomposition architecture. direct_shared uses two "
+            "direct Conv3d projections and one shared Conv3d decoder on P+S"
+        ),
+    )
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--resume_checkpoint", type=str, default="")
     parser.add_argument("--val_every_epochs", type=int, default=5)
@@ -133,6 +142,7 @@ def main():
         ot_max_grid_size=args.ot_max_grid_size,
         relative_kd=args.relative_kd,
         relative_kd_expert_weight=args.relative_kd_expert_weight,
+        expert_adapter_variant=args.expert_adapter_variant,
         amp=not args.no_amp,
         resume_checkpoint=args.resume_checkpoint,
         val_every_epochs=args.val_every_epochs,
@@ -186,6 +196,9 @@ def main():
         )
         cfg.remove_res5_expert_branch_norm = bool(
             resume_cfg.get("remove_res5_expert_branch_norm", False)
+        )
+        cfg.expert_adapter_variant = str(
+            resume_cfg.get("expert_adapter_variant", "legacy")
         )
         if "route_prior_p_mean" not in resume_cfg:
             raise ValueError(
@@ -273,6 +286,7 @@ def main():
         ot_max_grid_size=cfg.ot_max_grid_size,
         relative_kd=cfg.relative_kd,
         relative_kd_expert_weight=cfg.relative_kd_expert_weight,
+        expert_adapter_variant=cfg.expert_adapter_variant,
         remove_res5_expert_branch_norm=cfg.remove_res5_expert_branch_norm,
     )
     n_params = sum(p.numel() for m in fusion_modules.values() for p in m.parameters() if p.requires_grad)

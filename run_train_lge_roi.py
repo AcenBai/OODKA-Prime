@@ -52,6 +52,11 @@ def main() -> None:
     parser.add_argument("--max_val_batches", type=int, default=0)
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument(
+        "--expert_adapter_variant",
+        choices=("legacy", "direct_shared"),
+        default="legacy",
+    )
+    parser.add_argument(
         "--v2",
         action="store_true",
         help="ROI predicts LV/RV/normal/scar-edema with hard spatial switching.",
@@ -131,6 +136,7 @@ def main() -> None:
         best_test_device=args.best_test_device,
         best_test_batch_size=args.batch_size,
         amp=not args.no_amp,
+        expert_adapter_variant=args.expert_adapter_variant,
         device=args.device,
         output_dir=args.output_dir,
         val_every_epochs=args.val_every_epochs,
@@ -206,6 +212,7 @@ def main() -> None:
         s_ot_rho_expert=cfg.s_ot_rho_expert,
         ot_sinkhorn_iterations=cfg.ot_sinkhorn_iterations,
         ot_max_grid_size=cfg.ot_max_grid_size,
+        expert_adapter_variant=cfg.expert_adapter_variant,
         remove_res5_expert_branch_norm=cfg.remove_res5_expert_branch_norm,
     )
     prompt_texts = (

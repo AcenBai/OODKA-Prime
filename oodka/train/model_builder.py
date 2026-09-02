@@ -14,7 +14,11 @@ from ..config import (
     BIOMEDPARSE_DIR,
     BIOMEDPARSE_CKPT,
 )
-from ..models.disentangle import TwoBranchDisentangle, DualBranchAutoEncoder
+from ..models.disentangle import (
+    DirectSharedDecoderExpertAdapter,
+    DualBranchAutoEncoder,
+    TwoBranchDisentangle,
+)
 from ..models.beta_router import PromptBetaRouter
 from ..models.ot import MultiScaleOTDistillation
 
@@ -154,6 +158,7 @@ def build_fusion_modules(
     ot_max_grid_size: int = 32,
     relative_kd: bool = False,
     relative_kd_expert_weight: float = 1.0,
+    expert_adapter_variant: str = "legacy",
     remove_res5_expert_branch_norm: bool = True,
 ) -> Dict[str, nn.Module]:
     """
@@ -170,6 +175,11 @@ def build_fusion_modules(
     """
     if P <= 0:
         raise ValueError(f"P must be positive, got {P}")
+    if expert_adapter_variant not in {"legacy", "direct_shared"}:
+        raise ValueError(
+            "expert_adapter_variant must be 'legacy' or 'direct_shared', "
+            f"got {expert_adapter_variant!r}"
+        )
     res_ch = _detect_biomedparse_res_channels(model_biomedparse, device)
     modules = {}
 
@@ -183,15 +193,19 @@ def build_fusion_modules(
         modules[f"dis_b_res{si}"] = TwoBranchDisentangle(c_out).to(device)
         if model_nnunet is not None:
             c_in = enc_ch.get(f"enc{si}", 64)
-            c_mid = min(max(c_in, c_out) // 2, 256)
-            modules[f"ae_enc{si}_to_res{si}"] = DualBranchAutoEncoder(
-                c_in,
-                c_mid,
-                c_out,
-                branch_output_norm=not (
-                    remove_res5_expert_branch_norm and si == 5
-                ),
-            ).to(device)
+            if expert_adapter_variant == "direct_shared":
+                expert_adapter = DirectSharedDecoderExpertAdapter(c_in, c_out)
+            else:
+                c_mid = min(max(c_in, c_out) // 2, 256)
+                expert_adapter = DualBranchAutoEncoder(
+                    c_in,
+                    c_mid,
+                    c_out,
+                    branch_output_norm=not (
+                        remove_res5_expert_branch_norm and si == 5
+                    ),
+                )
+            modules[f"ae_enc{si}_to_res{si}"] = expert_adapter.to(device)
 
     modules["beta_router"] = PromptBetaRouter(
         text_dim=text_dim,

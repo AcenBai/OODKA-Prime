@@ -90,6 +90,9 @@ def main() -> None:
         s_gain_temperature=float(
             checkpoint_cfg.get("s_gain_temperature", cfg.s_gain_temperature)
         ),
+        expert_adapter_variant=str(
+            checkpoint_cfg.get("expert_adapter_variant", "legacy")
+        ),
         remove_res5_expert_branch_norm=bool(
             checkpoint_cfg.get("remove_res5_expert_branch_norm", False)
         ),

@@ -79,3 +79,25 @@ class DualBranchAutoEncoder(nn.Module):
         Zp_rec = self.dec_p(Zp)
         Zs_rec = self.dec_s(Zs)
         return Zp, Zs, Zp_rec, Zs_rec
+
+
+class DirectSharedDecoderExpertAdapter(nn.Module):
+    """Minimal expert split with direct projections and one shared decoder.
+
+    The expert feature is mapped directly into the BiomedParse channel space
+    by two bias-free 1x1x1 convolutions.  Their sum is reconstructed through a
+    single bias-free 1x1x1 convolution, eliminating the legacy mid-layer,
+    branch normalization, nonlinearities, and branch-specific decoders.
+    """
+
+    def __init__(self, c_in: int, c_out: int):
+        super().__init__()
+        self.proj_p = nn.Conv3d(c_in, c_out, 1, bias=False)
+        self.proj_s = nn.Conv3d(c_in, c_out, 1, bias=False)
+        self.decoder = nn.Conv3d(c_out, c_in, 1, bias=False)
+
+    def forward(self, feature: torch.Tensor):
+        p_feature = self.proj_p(feature)
+        s_feature = self.proj_s(feature)
+        reconstruction = self.decoder(p_feature + s_feature)
+        return p_feature, s_feature, reconstruction

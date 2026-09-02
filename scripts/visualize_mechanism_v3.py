@@ -32,6 +32,7 @@ sys.path.insert(0, str(ROOT))
 import matplotlib.pyplot as plt
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize, TwoSlopeNorm
+from matplotlib.patches import FancyArrowPatch
 from matplotlib.lines import Line2D
 import numpy as np
 import SimpleITK as sitk
@@ -348,6 +349,643 @@ def _shared_pca_rgb(
     count = expert_tokens.shape[1]
     arrays = projected.reshape(3, count, 3).numpy()
     return tuple(array.reshape(*grid, 3) for array in arrays)
+
+
+def _normalized_joint_pca_rgb(
+    token_groups: Sequence[torch.Tensor],
+    grids: Sequence[tuple[int, int]],
+) -> tuple[np.ndarray, ...]:
+    """Project normalized token directions through one shared PCA basis."""
+    if len(token_groups) != len(grids) or not token_groups:
+        raise ValueError("token_groups and grids must be non-empty and aligned")
+    normalized = []
+    counts = []
+    for tokens, grid in zip(token_groups, grids):
+        if tokens.ndim != 3 or tokens.shape[0] != 1:
+            raise ValueError(f"Expected token tensor [1,N,C], got {tokens.shape}")
+        if tokens.shape[1] != grid[0] * grid[1]:
+            raise ValueError(f"Token count {tokens.shape[1]} does not match {grid}")
+        value = F.normalize(tokens[0].float(), dim=-1, eps=1e-8)
+        normalized.append(value.detach().cpu())
+        counts.append(value.shape[0])
+    values = torch.cat(normalized, dim=0)
+    centered = values - values.mean(dim=0, keepdim=True)
+    torch.manual_seed(0)
+    _u, _s, vectors = torch.pca_lowrank(
+        centered, q=3, center=False, niter=4
+    )
+    projected = centered @ vectors[:, :3]
+    lo = torch.quantile(projected, 0.01, dim=0)
+    hi = torch.quantile(projected, 0.99, dim=0)
+    projected = ((projected - lo) / (hi - lo).clamp_min(1e-8)).clamp(0.0, 1.0)
+    arrays = torch.split(projected, counts, dim=0)
+    return tuple(
+        array.numpy().reshape(*grid, 3)
+        for array, grid in zip(arrays, grids)
+    )
+
+
+def _transport_direction_diagnostics(
+    *,
+    student_tokens: torch.Tensor,
+    expert_tokens: torch.Tensor,
+    transport: torch.Tensor,
+    projector,
+    grid: tuple[int, int],
+) -> dict:
+    """Return the exact forward/reverse cosine-KD objects and diagnostics."""
+    forward = projector(transport, expert_tokens)
+    reverse = projector(transport.transpose(1, 2), student_tokens)
+    student_norm = F.normalize(student_tokens.float(), dim=-1, eps=1e-8)
+    expert_norm = F.normalize(expert_tokens.float(), dim=-1, eps=1e-8)
+    forward_norm = F.normalize(forward["teacher"].float(), dim=-1, eps=1e-8)
+    reverse_norm = F.normalize(reverse["teacher"].float(), dim=-1, eps=1e-8)
+    forward_cos = (student_norm * forward_norm).sum(dim=-1)
+    reverse_cos = (expert_norm * reverse_norm).sum(dim=-1)
+    same_position_cos = (student_norm * expert_norm).sum(dim=-1)
+
+    received = transport.sum(dim=-1).float()
+    sent = transport.sum(dim=-2).float()
+    conditional = transport.float() / received.unsqueeze(-1).clamp_min(1e-12)
+    entropy = -(conditional.clamp_min(1e-12) * conditional.clamp_min(1e-12).log()).sum(
+        dim=-1
+    )
+    entropy = entropy / max(float(np.log(transport.shape[-1])), 1e-8)
+    positive = received[received > 0]
+    mass_scale = (
+        torch.quantile(positive, 0.99).clamp_min(1e-12)
+        if positive.numel()
+        else received.new_tensor(1.0)
+    )
+    mass_visibility = (received / mass_scale).clamp(0.0, 1.0)
+    confidence = mass_visibility * (1.0 - entropy).clamp(0.0, 1.0)
+
+    def weighted_mean(value: torch.Tensor, weight: torch.Tensor) -> float:
+        return float(
+            ((value * weight).sum() / weight.sum().clamp_min(1e-8)).item()
+        )
+
+    def summarize(value: torch.Tensor, weight: torch.Tensor) -> dict:
+        flat = value[0].detach().float().cpu()
+        return {
+            "weighted_mean": weighted_mean(value, weight),
+            "p10": float(torch.quantile(flat, 0.10).item()),
+            "median": float(torch.quantile(flat, 0.50).item()),
+            "p90": float(torch.quantile(flat, 0.90).item()),
+            "fraction_ge_0p8": float((flat >= 0.8).float().mean().item()),
+            "fraction_ge_0p9": float((flat >= 0.9).float().mean().item()),
+        }
+
+    pca = _normalized_joint_pca_rgb(
+        (student_tokens, expert_tokens, forward["teacher"], reverse["teacher"]),
+        (grid, grid, grid, grid),
+    )
+    return {
+        "pca": pca,
+        "forward_cos": forward_cos[0].detach().cpu().numpy().reshape(grid),
+        "reverse_cos": reverse_cos[0].detach().cpu().numpy().reshape(grid),
+        "same_position_cos": same_position_cos[0].detach().cpu().numpy().reshape(grid),
+        "received_mass": received[0].detach().cpu().numpy().reshape(grid),
+        "normalized_entropy": entropy[0].detach().cpu().numpy().reshape(grid),
+        "confidence": confidence[0].detach().cpu().numpy().reshape(grid),
+        "summary": {
+            "forward_cosine": summarize(forward_cos, received),
+            "reverse_cosine": summarize(reverse_cos, sent),
+            "same_position_cosine": summarize(
+                same_position_cos, torch.ones_like(received)
+            ),
+            "mean_normalized_entropy": weighted_mean(entropy, received),
+            "mean_confidence": weighted_mean(confidence, received),
+            "received_mass_p99": float(mass_scale.item()),
+        },
+    }
+
+
+def _plot_kd_direction_alignment(
+    output_dir: Path,
+    *,
+    level: int,
+    branch_diagnostics: dict[str, dict],
+) -> None:
+    """Plot exact OT-cosine agreement and shared normalized-token PCA-RGB."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    figure, axes = plt.subplots(2, 7, figsize=(25, 8), constrained_layout=True)
+    labels = (
+        "Student normalized\ntoken PCA",
+        "Raw Expert normalized\ntoken PCA",
+        "Transported Expert PCA\n$T:E\\rightarrow B$",
+        "Forward cosine\n$\\cos(B,\\widetilde E)$",
+        "Transported Student PCA\n$T^\\top:B\\rightarrow E$",
+        "Reverse cosine\n$\\cos(E,\\widetilde B)$",
+        "Transport confidence\nreceived mass × (1−entropy)",
+    )
+    for row, branch in enumerate(("p", "s")):
+        diag = branch_diagnostics[branch]
+        values = (
+            diag["pca"][0],
+            diag["pca"][1],
+            diag["pca"][2],
+            diag["forward_cos"],
+            diag["pca"][3],
+            diag["reverse_cos"],
+            diag["confidence"],
+        )
+        for col, (axis, value, label) in enumerate(zip(axes[row], values, labels)):
+            if col in (3, 5):
+                shown = axis.imshow(value, cmap="magma", vmin=0.0, vmax=1.0)
+            elif col == 6:
+                shown = axis.imshow(value, cmap="viridis", vmin=0.0, vmax=1.0)
+            else:
+                shown = axis.imshow(value)
+            axis.set_title(label, fontsize=10)
+            axis.axis("off")
+        axes[row, 0].set_ylabel(f"{branch.upper()} branch", fontsize=13)
+        summary = diag["summary"]
+        axes[row, 3].text(
+            0.02,
+            0.02,
+            f"weighted mean={summary['forward_cosine']['weighted_mean']:.3f}",
+            transform=axes[row, 3].transAxes,
+            color="white",
+            fontsize=9,
+            bbox={"facecolor": "black", "alpha": 0.65, "pad": 2},
+        )
+        axes[row, 5].text(
+            0.02,
+            0.02,
+            f"weighted mean={summary['reverse_cosine']['weighted_mean']:.3f}",
+            transform=axes[row, 5].transAxes,
+            color="white",
+            fontsize=9,
+            bbox={"facecolor": "black", "alpha": 0.65, "pad": 2},
+        )
+    cosine_scalar = ScalarMappable(norm=Normalize(0.0, 1.0), cmap="magma")
+    cosine_scalar.set_array([])
+    figure.colorbar(cosine_scalar, ax=axes[:, (3, 5)], shrink=0.55, label="Cosine similarity")
+    confidence_scalar = ScalarMappable(norm=Normalize(0.0, 1.0), cmap="viridis")
+    confidence_scalar.set_array([])
+    figure.colorbar(confidence_scalar, ax=axes[:, 6], shrink=0.55, label="Transport confidence")
+    figure.suptitle(
+        f"res{level}: bidirectional OT-KD channel-direction agreement",
+        fontsize=16,
+    )
+    figure.savefig(output_dir / f"res{level}_kd_direction_alignment.png", dpi=190)
+    plt.close(figure)
+
+    pca_figure, pca_axes = plt.subplots(2, 4, figsize=(14, 7), constrained_layout=True)
+    pca_labels = (
+        "Student normalized tokens",
+        "Raw Expert normalized tokens",
+        "Expert transported to Student",
+        "Student transported to Expert",
+    )
+    for row, branch in enumerate(("p", "s")):
+        for axis, value, label in zip(
+            pca_axes[row], branch_diagnostics[branch]["pca"], pca_labels
+        ):
+            axis.imshow(value)
+            axis.set_title(label, fontsize=10)
+            axis.axis("off")
+        pca_axes[row, 0].set_ylabel(f"{branch.upper()} branch", fontsize=13)
+    pca_figure.suptitle(
+        f"res{level}: shared PCA-RGB of L2-normalized channel tokens",
+        fontsize=15,
+    )
+    pca_figure.savefig(output_dir / f"res{level}_shared_pca_rgb.png", dpi=190)
+    plt.close(pca_figure)
+
+    standalone_dir = output_dir / "standalone"
+    standalone_dir.mkdir(parents=True, exist_ok=True)
+
+    def locally_stretch_rgb(value: np.ndarray) -> tuple[np.ndarray, list[dict]]:
+        stretched = np.empty_like(value)
+        channel_stats = []
+        for channel in range(3):
+            plane = value[..., channel]
+            lo, hi = np.quantile(plane, (0.01, 0.99))
+            stretched[..., channel] = np.clip(
+                (plane - lo) / max(float(hi - lo), 1e-8), 0.0, 1.0
+            )
+            channel_stats.append(
+                {
+                    "p01": float(lo),
+                    "p99": float(hi),
+                    "range": float(hi - lo),
+                }
+            )
+        return stretched, channel_stats
+
+    def save_rgb(
+        path: Path,
+        value: np.ndarray,
+        *,
+        title: str,
+    ) -> None:
+        stretched, stats = locally_stretch_rgb(value)
+        figure, axis = plt.subplots(figsize=(7, 7), constrained_layout=True)
+        axis.imshow(stretched)
+        axis.set_title(
+            f"{title}\nlocal per-channel P1–P99 RGB stretch",
+            fontsize=14,
+        )
+        axis.axis("off")
+        ranges = " / ".join(f"{item['range']:.3g}" for item in stats)
+        figure.text(
+            0.5,
+            0.01,
+            f"Original shared-PCA RGB P1–P99 ranges (R/G/B): {ranges}. "
+            "Locally stretched colors are not cross-panel comparable.",
+            ha="center",
+            fontsize=9,
+        )
+        figure.savefig(path, dpi=220)
+        plt.close(figure)
+
+    def save_cosine(
+        path: Path,
+        value: np.ndarray,
+        *,
+        title: str,
+    ) -> None:
+        finite = value[np.isfinite(value)]
+        lo, hi = np.quantile(finite, (0.01, 0.99))
+        if hi - lo < 1e-6:
+            lo, hi = float(finite.min()), float(finite.max())
+        if hi - lo < 1e-6:
+            lo, hi = lo - 5e-7, hi + 5e-7
+        figure, axis = plt.subplots(figsize=(7.8, 7), constrained_layout=True)
+        shown = axis.imshow(value, cmap="magma", vmin=float(lo), vmax=float(hi))
+        axis.set_title(
+            f"{title}\nlocal P1–P99 cosine scale [{lo:.4f}, {hi:.4f}]",
+            fontsize=14,
+        )
+        axis.axis("off")
+        figure.colorbar(shown, ax=axis, shrink=0.78, label="Cosine similarity")
+        figure.text(
+            0.5,
+            0.01,
+            f"min={finite.min():.4f}, median={np.median(finite):.4f}, "
+            f"mean={finite.mean():.4f}, max={finite.max():.4f}",
+            ha="center",
+            fontsize=10,
+        )
+        figure.savefig(path, dpi=220)
+        plt.close(figure)
+
+    for branch in ("p", "s"):
+        diag = branch_diagnostics[branch]
+        prefix = standalone_dir / f"res{level}_{branch}"
+        save_rgb(
+            Path(f"{prefix}_transported_expert_pca.png"),
+            diag["pca"][2],
+            title=f"res{level} {branch.upper()}: Transported Expert PCA  T:E→B",
+        )
+        save_cosine(
+            Path(f"{prefix}_forward_cosine.png"),
+            diag["forward_cos"],
+            title=f"res{level} {branch.upper()}: Forward cosine  cos(B,Ẽ)",
+        )
+        save_rgb(
+            Path(f"{prefix}_transported_student_pca.png"),
+            diag["pca"][3],
+            title=f"res{level} {branch.upper()}: Transported Student PCA  Tᵀ:B→E",
+        )
+        save_cosine(
+            Path(f"{prefix}_reverse_cosine.png"),
+            diag["reverse_cos"],
+            title=f"res{level} {branch.upper()}: Reverse cosine  cos(E,B̃)",
+        )
+
+
+def _morton_order(height: int, width: int) -> np.ndarray:
+    """Return raster indices ordered by a 2D Morton/Z-order curve."""
+    entries = []
+    bits = max(height, width).bit_length()
+    for y in range(height):
+        for x in range(width):
+            code = 0
+            for bit in range(bits):
+                code |= ((x >> bit) & 1) << (2 * bit)
+                code |= ((y >> bit) & 1) << (2 * bit + 1)
+            entries.append((code, y * width + x))
+    return np.asarray([index for _code, index in sorted(entries)], dtype=np.int64)
+
+
+def _conditional_transport(transport: torch.Tensor) -> np.ndarray:
+    value = transport[0].detach().float().cpu().numpy()
+    return value / np.maximum(value.sum(axis=1, keepdims=True), 1e-12)
+
+
+def _transport_entropy(conditional: np.ndarray) -> np.ndarray:
+    count = conditional.shape[1]
+    return -(
+        conditional * np.log(np.maximum(conditional, 1e-12))
+    ).sum(axis=1) / max(float(np.log(count)), 1e-8)
+
+
+def _select_transport_queries(
+    labels: np.ndarray,
+    demand: np.ndarray,
+    *,
+    max_queries: int = 8,
+) -> tuple[list[int], list[str]]:
+    """Select semantic centroids, then spatially separated hard-demand tokens."""
+    height, width = labels.shape
+    selected: list[int] = []
+    names: list[str] = []
+    for class_id in sorted(int(v) for v in np.unique(labels) if int(v) > 0):
+        positions = np.argwhere(labels == class_id)
+        centroid = positions.mean(axis=0)
+        y, x = positions[np.square(positions - centroid).sum(axis=1).argmin()]
+        selected.append(int(y * width + x))
+        names.append(f"class {class_id} centroid")
+        if len(selected) >= max_queries:
+            return selected, names
+
+    ranked = np.argsort(demand.reshape(-1))[::-1]
+    for index in ranked:
+        y, x = divmod(int(index), width)
+        if any(
+            (y - divmod(existing, width)[0]) ** 2
+            + (x - divmod(existing, width)[1]) ** 2
+            < 16
+            for existing in selected
+        ):
+            continue
+        selected.append(int(index))
+        names.append(f"high-demand {len(selected)}")
+        if len(selected) >= max_queries:
+            break
+    return selected, names
+
+
+def _plot_semantic_sorted_transport(
+    path: Path,
+    *,
+    level: int,
+    labels: np.ndarray,
+    label_names: dict[int, str],
+    transports: dict[str, torch.Tensor],
+) -> None:
+    height, width = labels.shape
+    morton = _morton_order(height, width)
+    flat_labels = labels.reshape(-1)
+    order = np.asarray(
+        sorted(morton.tolist(), key=lambda index: int(flat_labels[index])),
+        dtype=np.int64,
+    )
+    ordered_labels = flat_labels[order]
+    segments = []
+    start = 0
+    for class_id in np.unique(ordered_labels):
+        end = start + int((ordered_labels == class_id).sum())
+        segments.append((int(class_id), start, end))
+        start = end
+
+    figure, axes = plt.subplots(1, 2, figsize=(17, 8), constrained_layout=True)
+    shown = None
+    for axis, branch in zip(axes, ("p", "s")):
+        conditional = _conditional_transport(transports[branch])
+        conditional = conditional[np.ix_(order, order)]
+        log_relative = np.log10(
+            conditional * conditional.shape[1] + 1e-6
+        )
+        shown = axis.imshow(
+            log_relative,
+            cmap="coolwarm",
+            vmin=-3.0,
+            vmax=2.0,
+            interpolation="nearest",
+            rasterized=True,
+        )
+        centers = []
+        tick_labels = []
+        for class_id, seg_start, seg_end in segments:
+            axis.axhline(seg_start - 0.5, color="black", lw=0.45, alpha=0.7)
+            axis.axvline(seg_start - 0.5, color="black", lw=0.45, alpha=0.7)
+            centers.append((seg_start + seg_end - 1) / 2)
+            tick_labels.append(label_names.get(class_id, "background" if class_id == 0 else str(class_id)))
+        axis.set_xticks(centers, tick_labels, rotation=45, ha="right", fontsize=8)
+        axis.set_yticks(centers, tick_labels, fontsize=8)
+        axis.set_xlabel("Expert/source tokens grouped by anatomy")
+        axis.set_ylabel("Student/query tokens grouped by anatomy")
+        axis.set_title(f"res{level} {branch.upper()}: row-conditional coupling")
+    figure.colorbar(
+        shown,
+        ax=axes,
+        shrink=0.78,
+        label=r"$\log_{10}[N_E\,P(\mathrm{expert}\mid\mathrm{student})]$",
+    )
+    figure.suptitle(
+        "Semantic-grouped OT matrices; within each group tokens follow Morton/Z-order",
+        fontsize=15,
+    )
+    figure.savefig(path, dpi=210)
+    plt.close(figure)
+
+
+def _plot_query_transport_atlas(
+    path: Path,
+    *,
+    level: int,
+    image: np.ndarray,
+    gt: np.ndarray,
+    label_names: dict[int, str],
+    grid: tuple[int, int],
+    transports: dict[str, torch.Tensor],
+    demand: np.ndarray,
+) -> None:
+    labels = F.interpolate(
+        torch.from_numpy(gt)[None, None].float(), size=grid, mode="nearest"
+    )[0, 0].numpy().astype(np.int16)
+    queries, query_names = _select_transport_queries(labels, demand)
+    conditionals = {
+        branch: _conditional_transport(transport)
+        for branch, transport in transports.items()
+    }
+    entropies = {
+        branch: _transport_entropy(value)
+        for branch, value in conditionals.items()
+    }
+
+    figure = plt.figure(figsize=(16, 19), constrained_layout=True)
+    spec = figure.add_gridspec(5, 4, height_ratios=(1.25, 1, 1, 1, 1))
+    overview = figure.add_subplot(spec[0, :2])
+    _draw_gt(overview, image, gt, label_names, legend=True)
+    overview.set_title(f"res{level}: shared Student query locations")
+    h_img, w_img = image.shape
+    for number, index in enumerate(queries, start=1):
+        y, x = divmod(index, grid[1])
+        px = (x + 0.5) / grid[1] * w_img
+        py = (y + 0.5) / grid[0] * h_img
+        overview.scatter(px, py, s=90, c="white", edgecolors="black", linewidths=1.2)
+        overview.text(px, py, str(number), ha="center", va="center", fontsize=9, weight="bold")
+    legend_axis = figure.add_subplot(spec[0, 2:])
+    legend_axis.axis("off")
+    legend_axis.text(
+        0.0,
+        1.0,
+        "\n".join(f"q{i}: {name}" for i, name in enumerate(query_names, start=1)),
+        va="top",
+        fontsize=12,
+    )
+
+    shown = None
+    for branch_row, branch in enumerate(("p", "s")):
+        for local_index, query in enumerate(queries):
+            row = 1 + branch_row * 2 + local_index // 4
+            col = local_index % 4
+            axis = figure.add_subplot(spec[row, col])
+            conditional = conditionals[branch][query]
+            log_relative = np.log10(conditional * conditional.size + 1e-6).reshape(grid)
+            shown = axis.imshow(log_relative, cmap="coolwarm", vmin=-3.0, vmax=2.0)
+            qy, qx = divmod(query, grid[1])
+            axis.scatter(qx, qy, marker="x", s=50, c="black", linewidths=1.6)
+            entropy = entropies[branch][query]
+            effective = float(conditional.size ** entropy)
+            top8 = float(np.partition(conditional, -8)[-8:].sum())
+            axis.set_title(
+                f"{branch.upper()} q{local_index + 1}: H={entropy:.2f}, "
+                f"N_eff={effective:.0f}, top8={top8:.2f}",
+                fontsize=10,
+            )
+            axis.axis("off")
+    figure.colorbar(
+        shown,
+        ax=figure.axes,
+        shrink=0.35,
+        label=r"$\log_{10}[N_E\,P(\mathrm{source}\mid q)]$",
+    )
+    figure.suptitle(
+        f"res{level}: query-conditioned 2D transport atlas (same queries for P and S)",
+        fontsize=17,
+    )
+    figure.savefig(path, dpi=210)
+    plt.close(figure)
+
+
+def _plot_barycentric_flow(
+    path: Path,
+    *,
+    level: int,
+    image: np.ndarray,
+    gt: np.ndarray,
+    label_names: dict[int, str],
+    grid: tuple[int, int],
+    transports: dict[str, torch.Tensor],
+    masses: dict[str, torch.Tensor],
+) -> None:
+    coordinates = _coordinates(
+        *grid, device=torch.device("cpu"), dtype=torch.float32
+    ).numpy()
+    h_img, w_img = image.shape
+    figure, axes = plt.subplots(1, 2, figsize=(15, 7), constrained_layout=True)
+    flow_data = {}
+    all_magnitudes = []
+    for branch in ("p", "s"):
+        conditional = _conditional_transport(transports[branch])
+        expected = conditional @ coordinates
+        delta = expected - coordinates
+        magnitude = np.linalg.norm(delta, axis=1)
+        entropy = _transport_entropy(conditional)
+        demand = masses[branch][0].detach().float().cpu().numpy()
+        positive = demand[demand > 0]
+        mass_scale = np.quantile(positive, 0.99) if positive.size else 1.0
+        score = np.clip(demand / max(float(mass_scale), 1e-12), 0, 1) * (1 - entropy)
+        flow_data[branch] = (expected, delta, magnitude, score)
+        all_magnitudes.append(magnitude)
+    magnitude_max = max(float(np.quantile(np.concatenate(all_magnitudes), 0.99)), 1e-6)
+    color_norm = Normalize(0.0, magnitude_max)
+
+    for axis, branch in zip(axes, ("p", "s")):
+        _draw_gt(axis, image, gt, label_names, legend=(branch == "p"))
+        expected, delta, magnitude, score = flow_data[branch]
+        candidates = np.argsort(score)[::-1][:72]
+        for index in candidates:
+            if score[index] <= 0:
+                continue
+            y0, x0 = coordinates[index]
+            y1, x1 = expected[index]
+            start = ((x0 + 1) * 0.5 * w_img, (y0 + 1) * 0.5 * h_img)
+            end = ((x1 + 1) * 0.5 * w_img, (y1 + 1) * 0.5 * h_img)
+            color = plt.cm.plasma(color_norm(magnitude[index]))
+            arrow = FancyArrowPatch(
+                start,
+                end,
+                arrowstyle="-|>",
+                mutation_scale=7,
+                linewidth=0.5 + 1.8 * score[index],
+                color=color,
+                alpha=0.25 + 0.7 * score[index],
+            )
+            axis.add_patch(arrow)
+        axis.set_title(
+            f"res{level} {branch.upper()}: barycentric flow\n"
+            "top 72 demand×concentration tokens",
+            fontsize=13,
+        )
+    scalar = ScalarMappable(norm=color_norm, cmap="plasma")
+    scalar.set_array([])
+    figure.colorbar(
+        scalar,
+        ax=axes,
+        shrink=0.72,
+        label="Expected displacement in normalized coordinates",
+    )
+    figure.savefig(path, dpi=210)
+    plt.close(figure)
+
+
+def _plot_spatial_transport_suite(
+    output_dir: Path,
+    *,
+    level: int,
+    image: np.ndarray,
+    gt: np.ndarray,
+    label_names: dict[int, str],
+    grid: tuple[int, int],
+    p_transport: torch.Tensor,
+    s_transport: torch.Tensor,
+    p_mass: torch.Tensor,
+    s_mass: torch.Tensor,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    transports = {"p": p_transport, "s": s_transport}
+    masses = {"p": p_mass, "s": s_mass}
+    labels = F.interpolate(
+        torch.from_numpy(gt)[None, None].float(), size=grid, mode="nearest"
+    )[0, 0].numpy().astype(np.int16)
+    combined_demand = np.maximum(
+        p_mass[0].detach().float().cpu().numpy(),
+        s_mass[0].detach().float().cpu().numpy(),
+    ).reshape(grid)
+    _plot_semantic_sorted_transport(
+        output_dir / f"res{level}_ps_semantic_sorted_transport.png",
+        level=level,
+        labels=labels,
+        label_names=label_names,
+        transports=transports,
+    )
+    _plot_query_transport_atlas(
+        output_dir / f"res{level}_ps_query_transport_atlas.png",
+        level=level,
+        image=image,
+        gt=gt,
+        label_names=label_names,
+        grid=grid,
+        transports=transports,
+        demand=combined_demand,
+    )
+    _plot_barycentric_flow(
+        output_dir / f"res{level}_ps_barycentric_flow.png",
+        level=level,
+        image=image,
+        gt=gt,
+        label_names=label_names,
+        grid=grid,
+        transports=transports,
+        masses=masses,
+    )
 
 
 def _received_weighted_pca_rgb(
@@ -1591,6 +2229,9 @@ def main() -> None:
     s_gain_temperature = float(
         checkpoint_cfg.get("s_gain_temperature", cfg.s_gain_temperature)
     )
+    expert_adapter_variant = str(
+        checkpoint_cfg.get("expert_adapter_variant", "legacy")
+    )
     remove_res5_expert_branch_norm = bool(
         checkpoint_cfg.get("remove_res5_expert_branch_norm", False)
     )
@@ -1697,6 +2338,7 @@ def main() -> None:
         s_ot_rho_expert=cfg.s_ot_rho_expert,
         ot_sinkhorn_iterations=cfg.ot_sinkhorn_iterations,
         ot_max_grid_size=cfg.ot_max_grid_size,
+        expert_adapter_variant=expert_adapter_variant,
         remove_res5_expert_branch_norm=remove_res5_expert_branch_norm,
     )
     required = [
@@ -1830,9 +2472,18 @@ def main() -> None:
                     mode="trilinear",
                     align_corners=False,
                 )
-            expert_p, expert_s, _p_rec, _s_rec = modules[
-                f"ae_enc{level}_to_res{level}"
-            ](expert_aligned)
+            expert_outputs = modules[f"ae_enc{level}_to_res{level}"](
+                expert_aligned
+            )
+            if len(expert_outputs) == 4:
+                expert_p, expert_s, _p_rec, _s_rec = expert_outputs
+            elif len(expert_outputs) == 3:
+                expert_p, expert_s, _reconstruction = expert_outputs
+            else:
+                raise RuntimeError(
+                    "Unexpected Expert adapter output count: "
+                    f"{len(expert_outputs)}"
+                )
             student_p, student_s = modules[f"dis_b_res{level}"](student)
             features[f"Zn{level}_p"] = expert_p
             features[f"Zn{level}_s"] = expert_s
@@ -1961,6 +2612,7 @@ def main() -> None:
     )
     ot_module = modules["ot_distillation"]
     ot_dir.mkdir(parents=True, exist_ok=True)
+    kd_alignment_dir = ot_dir / "kd_alignment"
     ot_summary = {
         "case_id": args.case_id,
         "z": center,
@@ -2062,6 +2714,40 @@ def main() -> None:
             s_teacher = ot_module.projector(
                 s_transport["transport"], s_cost["expert_tokens"]
             )
+            if level == 2:
+                _plot_spatial_transport_suite(
+                    ot_dir / "spatial_transport",
+                    level=level,
+                    image=image,
+                    gt=gt,
+                    label_names=label_names,
+                    grid=grid,
+                    p_transport=p_transport["transport"],
+                    s_transport=s_transport["transport"],
+                    p_mass=p_mass["a"],
+                    s_mass=s_mass["a"],
+                )
+            branch_diagnostics = {
+                "p": _transport_direction_diagnostics(
+                    student_tokens=p_cost["base_tokens"],
+                    expert_tokens=p_cost["expert_tokens"],
+                    transport=p_transport["transport"],
+                    projector=ot_module.projector,
+                    grid=grid,
+                ),
+                "s": _transport_direction_diagnostics(
+                    student_tokens=s_cost["base_tokens"],
+                    expert_tokens=s_cost["expert_tokens"],
+                    transport=s_transport["transport"],
+                    projector=ot_module.projector,
+                    grid=grid,
+                ),
+            }
+            _plot_kd_direction_alignment(
+                kd_alignment_dir,
+                level=level,
+                branch_diagnostics=branch_diagnostics,
+            )
             s_maps = _plot_s_ot(
                 ot_dir / f"res{level}_s_transport.png",
                 level=level,
@@ -2128,7 +2814,21 @@ def main() -> None:
                     "received_signal_definition": "U_i = sum_j pi_ij E_j",
                     "token_layout": s_pca_info,
                 },
+                "kd_direction_alignment": {
+                    branch: diagnostics["summary"]
+                    for branch, diagnostics in branch_diagnostics.items()
+                },
             }
+            for branch, diagnostics in branch_diagnostics.items():
+                for name in (
+                    "forward_cos",
+                    "reverse_cos",
+                    "same_position_cos",
+                    "received_mass",
+                    "normalized_entropy",
+                    "confidence",
+                ):
+                    ot_npz[f"res{level}_{branch}_kd_{name}"] = diagnostics[name]
             for name, value in p_maps.items():
                 ot_npz[f"res{level}_p_{name}"] = value
             for name, value in s_maps.items():
