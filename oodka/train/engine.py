@@ -116,6 +116,10 @@ class OODKATrainer:
             "train_loss_p_ot": [], "train_loss_s_ot": [],
             "train_loss_p_ot_forward": [], "train_loss_s_ot_forward": [],
             "train_loss_p_ot_reverse": [], "train_loss_s_ot_reverse": [],
+            "train_loss_p_ot_reverse_cosine": [],
+            "train_loss_s_ot_reverse_cosine": [],
+            "train_loss_p_ot_reverse_rms": [],
+            "train_loss_s_ot_reverse_rms": [],
             "val_loss_total": [], "val_loss_seg": [],
             "val_loss_ae": [], "val_loss_ortho": [],
             "val_loss_ortho_student": [], "val_loss_ortho_expert": [],
@@ -123,6 +127,10 @@ class OODKATrainer:
             "val_loss_p_ot": [], "val_loss_s_ot": [],
             "val_loss_p_ot_forward": [], "val_loss_s_ot_forward": [],
             "val_loss_p_ot_reverse": [], "val_loss_s_ot_reverse": [],
+            "val_loss_p_ot_reverse_cosine": [],
+            "val_loss_s_ot_reverse_cosine": [],
+            "val_loss_p_ot_reverse_rms": [],
+            "val_loss_s_ot_reverse_rms": [],
             "train_dice_mean": [], "val_dice_mean": [],
             "train_dice_per_class": [], "val_dice_per_class": [],
             "train_gate_per_class": [],
@@ -203,6 +211,8 @@ class OODKATrainer:
                 "loss_p_ot", "loss_s_ot",
                 "loss_p_ot_forward", "loss_s_ot_forward",
                 "loss_p_ot_reverse", "loss_s_ot_reverse",
+                "loss_p_ot_reverse_cosine", "loss_s_ot_reverse_cosine",
+                "loss_p_ot_reverse_rms", "loss_s_ot_reverse_rms",
             ]
         }
         ot_keys = [
@@ -334,7 +344,8 @@ class OODKATrainer:
             "Relative KD: "
             f"enabled={cfg.relative_kd} "
             f"expert_weight={cfg.relative_kd_expert_weight:g} "
-            f"branches={cfg.relative_kd_branches}"
+            f"branches={cfg.relative_kd_branches} "
+            f"rms_weight={cfg.relative_kd_rms_weight:g}"
         )
         log(f"Output: {cfg.output_dir}")
 
@@ -421,6 +432,8 @@ class OODKATrainer:
                 "loss_p_ot", "loss_s_ot",
                 "loss_p_ot_forward", "loss_s_ot_forward",
                 "loss_p_ot_reverse", "loss_s_ot_reverse",
+                "loss_p_ot_reverse_cosine", "loss_s_ot_reverse_cosine",
+                "loss_p_ot_reverse_rms", "loss_s_ot_reverse_rms",
             ]:
                 self.history[f"train_{key}"].append(train_meter[key])
                 self.history[f"val_{key}"].append(val_meter[key])

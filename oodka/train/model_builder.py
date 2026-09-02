@@ -158,6 +158,7 @@ def build_fusion_modules(
     ot_max_grid_size: int = 32,
     relative_kd: bool = False,
     relative_kd_expert_weight: float = 1.0,
+    relative_kd_rms_weight: float = 0.0,
     relative_kd_branches: str = "both",
     expert_adapter_variant: str = "legacy",
     remove_res5_expert_branch_norm: bool = True,
@@ -232,6 +233,7 @@ def build_fusion_modules(
             sinkhorn_iterations=ot_sinkhorn_iterations,
             relative_kd=relative_kd,
             relative_kd_expert_weight=relative_kd_expert_weight,
+            relative_kd_rms_weight=relative_kd_rms_weight,
             relative_kd_branches=relative_kd_branches,
         ).to(device)
 

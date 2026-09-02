@@ -163,6 +163,9 @@ class TrainConfig:
     # expert->student KD remains unchanged; this scales only student->expert.
     relative_kd: bool = False
     relative_kd_expert_weight: float = 1.0
+    # Scale alignment is applied only on the reverse transported Student
+    # teacher; zero preserves the original cosine-only Relative KD.
+    relative_kd_rms_weight: float = 0.0
     # Select which reverse (student -> expert) branches are active whenever
     # ``relative_kd`` is enabled.
     relative_kd_branches: str = "both"

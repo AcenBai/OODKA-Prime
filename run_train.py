@@ -100,6 +100,15 @@ def main():
         help="Reverse-KD branches to enable when --relative_kd is set",
     )
     parser.add_argument(
+        "--relative_kd_rms_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of transported reverse log-RMS alignment, in addition "
+            "to reverse cosine KD"
+        ),
+    )
+    parser.add_argument(
         "--expert_adapter_variant",
         choices=("legacy", "direct_shared"),
         default="legacy",
@@ -155,6 +164,7 @@ def main():
         ot_max_grid_size=args.ot_max_grid_size,
         relative_kd=args.relative_kd,
         relative_kd_expert_weight=args.relative_kd_expert_weight,
+        relative_kd_rms_weight=args.relative_kd_rms_weight,
         relative_kd_branches=args.relative_kd_branches,
         expert_adapter_variant=args.expert_adapter_variant,
         amp=not args.no_amp,
@@ -219,6 +229,9 @@ def main():
         )
         cfg.relative_kd_branches = str(
             resume_cfg.get("relative_kd_branches", "both")
+        )
+        cfg.relative_kd_rms_weight = float(
+            resume_cfg.get("relative_kd_rms_weight", 0.0)
         )
         if "route_prior_p_mean" not in resume_cfg:
             raise ValueError(
@@ -306,6 +319,7 @@ def main():
         ot_max_grid_size=cfg.ot_max_grid_size,
         relative_kd=cfg.relative_kd,
         relative_kd_expert_weight=cfg.relative_kd_expert_weight,
+        relative_kd_rms_weight=cfg.relative_kd_rms_weight,
         relative_kd_branches=cfg.relative_kd_branches,
         expert_adapter_variant=cfg.expert_adapter_variant,
         remove_res5_expert_branch_norm=cfg.remove_res5_expert_branch_norm,

@@ -11,6 +11,7 @@ from oodka.models.ot import (
     StructureMassBuilder,
     UnbalancedSinkhorn,
     WeightedCosineDistillation,
+    WeightedLogRMSAlignment,
 )
 
 
@@ -91,6 +92,21 @@ def test_cost_barycentric_and_weighted_distillation_shapes():
     assert loss.ndim == 0 and torch.isfinite(loss)
     loss.backward()
     assert base.grad is not None
+
+
+def test_log_rms_alignment_detects_scale_when_cosine_does_not():
+    student = torch.tensor([[[1.0, 2.0, 3.0]]], requires_grad=True)
+    teacher = student.detach() * 4.0
+    weight = torch.ones(1, 1)
+
+    cosine = WeightedCosineDistillation()(student, teacher, weight)
+    rms = WeightedLogRMSAlignment()(student, teacher, weight)
+
+    torch.testing.assert_close(cosine, torch.tensor(0.0), atol=1e-6, rtol=0.0)
+    assert rms.item() > 0.0
+    rms.backward()
+    assert student.grad is not None
+    assert student.grad.abs().sum().item() > 0.0
 
 
 def test_coordinate_cost_has_a_zero_cost_radius():

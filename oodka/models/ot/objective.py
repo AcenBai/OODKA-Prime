@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from .cost import OTCostBuilder, _coordinates
-from .losses import WeightedCosineDistillation
+from .losses import WeightedCosineDistillation, WeightedLogRMSAlignment
 from .mass import ResidualMassBuilder, StructureMassBuilder
 from .sinkhorn import BalancedSinkhorn, UnbalancedSinkhorn
 from .transport import BarycentricProjector
@@ -36,6 +36,7 @@ class MultiScaleOTDistillation(nn.Module):
         min_received_mass: float = 1e-6,
         relative_kd: bool = False,
         relative_kd_expert_weight: float = 1.0,
+        relative_kd_rms_weight: float = 0.0,
         relative_kd_branches: str = "both",
     ) -> None:
         super().__init__()
@@ -76,11 +77,15 @@ class MultiScaleOTDistillation(nn.Module):
         )
         self.projector = BarycentricProjector()
         self.distillation = WeightedCosineDistillation()
+        self.rms_alignment = WeightedLogRMSAlignment()
         self.min_received_mass = float(min_received_mass)
         self.relative_kd = bool(relative_kd)
         self.relative_kd_expert_weight = float(relative_kd_expert_weight)
         if self.relative_kd_expert_weight < 0.0:
             raise ValueError("relative_kd_expert_weight must be non-negative")
+        self.relative_kd_rms_weight = float(relative_kd_rms_weight)
+        if self.relative_kd_rms_weight < 0.0:
+            raise ValueError("relative_kd_rms_weight must be non-negative")
         if relative_kd_branches not in {"both", "p", "s"}:
             raise ValueError(
                 "relative_kd_branches must be 'both', 'p', or 's', got "
@@ -192,6 +197,10 @@ class MultiScaleOTDistillation(nn.Module):
         s_losses = []
         p_reverse_losses = []
         s_reverse_losses = []
+        p_reverse_cosine_losses = []
+        s_reverse_cosine_losses = []
+        p_reverse_rms_losses = []
+        s_reverse_rms_losses = []
         level_logs = {}
         for level in sorted(self.levels):
             controlled_s_cost_offsets = {
@@ -276,17 +285,32 @@ class MultiScaleOTDistillation(nn.Module):
                         p_transport["transport"].transpose(1, 2),
                         p_cost["base_tokens"],
                     )
-                    p_reverse_loss = self.distillation(
+                    p_reverse_cosine = self.distillation(
                         p_cost["expert_tokens"],
                         p_reverse_teacher["teacher"],
                         p_reverse_teacher["received"],
                     )
+                    p_reverse_rms = self.rms_alignment(
+                        p_cost["expert_tokens"],
+                        p_reverse_teacher["teacher"],
+                        p_reverse_teacher["received"],
+                    )
+                    p_reverse_loss = (
+                        p_reverse_cosine
+                        + self.relative_kd_rms_weight * p_reverse_rms
+                    )
                     p_reverse_losses.append(p_reverse_loss)
+                    p_reverse_cosine_losses.append(p_reverse_cosine)
+                    p_reverse_rms_losses.append(p_reverse_rms)
                 else:
                     p_reverse_loss = zero
+                    p_reverse_cosine = zero
+                    p_reverse_rms = zero
                 logs.update(
                     p_loss=p_loss.detach(),
                     p_reverse_loss=p_reverse_loss.detach(),
+                    p_reverse_cosine=p_reverse_cosine.detach(),
+                    p_reverse_rms=p_reverse_rms.detach(),
                     p_cost=p_transport["cost"].mean(),
                     p_row_error=p_transport["row_error"].mean(),
                     p_col_error=p_transport["col_error"].mean(),
@@ -335,17 +359,32 @@ class MultiScaleOTDistillation(nn.Module):
                         s_transport["transport"].transpose(1, 2),
                         s_cost["base_tokens"],
                     )
-                    s_reverse_loss = self.distillation(
+                    s_reverse_cosine = self.distillation(
                         s_cost["expert_tokens"],
                         s_reverse_teacher["teacher"],
                         s_reverse_teacher["received"],
                     )
+                    s_reverse_rms = self.rms_alignment(
+                        s_cost["expert_tokens"],
+                        s_reverse_teacher["teacher"],
+                        s_reverse_teacher["received"],
+                    )
+                    s_reverse_loss = (
+                        s_reverse_cosine
+                        + self.relative_kd_rms_weight * s_reverse_rms
+                    )
                     s_reverse_losses.append(s_reverse_loss)
+                    s_reverse_cosine_losses.append(s_reverse_cosine)
+                    s_reverse_rms_losses.append(s_reverse_rms)
                 else:
                     s_reverse_loss = zero
+                    s_reverse_cosine = zero
+                    s_reverse_rms = zero
                 logs.update(
                     s_loss=s_loss.detach(),
                     s_reverse_loss=s_reverse_loss.detach(),
+                    s_reverse_cosine=s_reverse_cosine.detach(),
+                    s_reverse_rms=s_reverse_rms.detach(),
                     s_cost=s_transport["cost"].mean(),
                     s_received=s_transport["received"].sum(dim=-1).mean(),
                     s_transported=s_transport["transported"].sum(dim=-1).mean(),
@@ -372,6 +411,22 @@ class MultiScaleOTDistillation(nn.Module):
         loss_s_reverse = (
             torch.stack(s_reverse_losses).mean() if s_reverse_losses else zero
         )
+        loss_p_reverse_cosine = (
+            torch.stack(p_reverse_cosine_losses).mean()
+            if p_reverse_cosine_losses else zero
+        )
+        loss_s_reverse_cosine = (
+            torch.stack(s_reverse_cosine_losses).mean()
+            if s_reverse_cosine_losses else zero
+        )
+        loss_p_reverse_rms = (
+            torch.stack(p_reverse_rms_losses).mean()
+            if p_reverse_rms_losses else zero
+        )
+        loss_s_reverse_rms = (
+            torch.stack(s_reverse_rms_losses).mean()
+            if s_reverse_rms_losses else zero
+        )
         reverse_scale = self.relative_kd_expert_weight if self.relative_kd else 0.0
         loss_p = loss_p_forward + reverse_scale * loss_p_reverse
         loss_s = loss_s_forward + reverse_scale * loss_s_reverse
@@ -382,5 +437,9 @@ class MultiScaleOTDistillation(nn.Module):
             "loss_s_forward": loss_s_forward,
             "loss_p_reverse": loss_p_reverse,
             "loss_s_reverse": loss_s_reverse,
+            "loss_p_reverse_cosine": loss_p_reverse_cosine,
+            "loss_s_reverse_cosine": loss_s_reverse_cosine,
+            "loss_p_reverse_rms": loss_p_reverse_rms,
+            "loss_s_reverse_rms": loss_s_reverse_rms,
             "levels": level_logs,
         }

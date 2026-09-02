@@ -1,7 +1,7 @@
 """Dynamic optimal-transport teachers used only during OODKA training."""
 
 from .cost import OTCostBuilder, pool_feature_map
-from .losses import WeightedCosineDistillation
+from .losses import WeightedCosineDistillation, WeightedLogRMSAlignment
 from .mass import ResidualMassBuilder, StructureMassBuilder
 from .objective import MultiScaleOTDistillation
 from .sinkhorn import BalancedSinkhorn, UnbalancedSinkhorn
@@ -16,5 +16,6 @@ __all__ = [
     "StructureMassBuilder",
     "UnbalancedSinkhorn",
     "WeightedCosineDistillation",
+    "WeightedLogRMSAlignment",
     "pool_feature_map",
 ]

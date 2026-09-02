@@ -745,6 +745,22 @@ def forward_one_batch(
         "loss_s_ot_reverse": float(
             ot_output.get("loss_s_reverse", loss_s_ot * 0.0).detach().item()
         ),
+        "loss_p_ot_reverse_cosine": float(
+            ot_output.get(
+                "loss_p_reverse_cosine", loss_p_ot * 0.0
+            ).detach().item()
+        ),
+        "loss_s_ot_reverse_cosine": float(
+            ot_output.get(
+                "loss_s_reverse_cosine", loss_s_ot * 0.0
+            ).detach().item()
+        ),
+        "loss_p_ot_reverse_rms": float(
+            ot_output.get("loss_p_reverse_rms", loss_p_ot * 0.0).detach().item()
+        ),
+        "loss_s_ot_reverse_rms": float(
+            ot_output.get("loss_s_reverse_rms", loss_s_ot * 0.0).detach().item()
+        ),
         "dice_mean": dice_mean,
         "dice_per_class": dice_per_class,
         "gate_mean": float(gate.detach().mean().item()),
