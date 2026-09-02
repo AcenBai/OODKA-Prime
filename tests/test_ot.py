@@ -332,6 +332,50 @@ def test_relative_kd_branch_selector_is_validated():
         raise AssertionError("invalid reverse-KD branch selector was accepted")
 
 
+def test_capacity_partial_objective_backpropagates_with_relative_kd():
+    torch.manual_seed(29)
+    features = {}
+    for domain in ("Zb", "Zn"):
+        for branch in ("p", "s"):
+            features[f"{domain}2_{branch}"] = torch.randn(
+                1, 4, 1, 3, 3, requires_grad=True
+            )
+    gt = torch.zeros(1, 1, 12, 12, dtype=torch.long)
+    gt[:, :, 3:9, 3:9] = 1
+    base_error = torch.rand(1, 1, 12, 12)
+    expert_error = torch.rand(1, 1, 12, 12)
+    objective = MultiScaleOTDistillation(
+        levels=(2,),
+        max_grid_size=3,
+        sinkhorn_iterations=50,
+        s_transport_mode="capacity_partial",
+        s_partial_mass_fraction=0.5,
+        relative_kd=True,
+        relative_kd_rms_weight=0.5,
+    )
+    output = objective(
+        features,
+        gt=gt,
+        base_error=base_error,
+        expert_error=expert_error,
+        valid_z=torch.ones(1, 1, dtype=torch.bool),
+        class_ids=[1],
+    )
+    loss = output["loss_p"] + output["loss_s"]
+    assert torch.isfinite(loss)
+    torch.testing.assert_close(
+        output["levels"][2]["s_accept_ratio"],
+        torch.tensor(0.5),
+        atol=2e-4,
+        rtol=2e-4,
+    )
+    assert output["levels"][2]["s_overused"].item() < 2e-4
+    loss.backward()
+    for key in ("Zb2_p", "Zb2_s", "Zn2_p", "Zn2_s"):
+        assert features[key].grad is not None
+        assert torch.isfinite(features[key].grad).all()
+
+
 def test_multiscale_grid_caps_native_size_without_upsampling():
     objective = MultiScaleOTDistillation(max_grid_size=32)
     assert objective._target_size(torch.empty(1, 1, 128, 96)) == (32, 32)
