@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -24,6 +23,15 @@ from oodka.models.prompts import (
     MYOPS_LGE_ROI_V3_REFINEMENT_PROMPTS,
 )
 from oodka.train.lge_roi_engine import LGEROIMixedTrainer
+from oodka.train.cli import (
+    add_augmentation_switch,
+    add_common_training_arguments,
+    add_fusion_training_arguments,
+    common_train_config_kwargs,
+    fusion_builder_kwargs,
+    fusion_train_config_kwargs,
+    record_source_metadata,
+)
 from oodka.train.model_builder import (
     build_fusion_modules,
     build_prompt_features,
@@ -33,35 +41,27 @@ from oodka.train.model_builder import (
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", default="cuda:1")
-    parser.add_argument("--n_epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--image_size", type=int, default=256)
-    parser.add_argument("--num_workers", type=int, default=2)
-    parser.add_argument("--output_dir", required=True)
+    add_common_training_arguments(
+        parser,
+        device_default="cuda:1",
+        n_epochs_default=100,
+        batch_size_default=8,
+        image_size_default=256,
+        num_workers_default=2,
+        output_required=True,
+    )
+    add_fusion_training_arguments(parser)
+    add_augmentation_switch(parser, default=None)
     parser.add_argument("--warmup_epochs", type=int, default=10)
     parser.add_argument("--roi_threshold", type=float, default=0.3)
     parser.add_argument("--roi_expand", type=float, default=1.25)
     parser.add_argument("--roi_fallback", choices=("full", "center"), default="full")
     parser.add_argument("--roi_refresh_every", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--val_every_epochs", type=int, default=5)
-    parser.add_argument("--train_case_limit", type=int, default=0)
-    parser.add_argument("--val_case_limit", type=int, default=0)
-    parser.add_argument("--max_train_batches", type=int, default=0)
-    parser.add_argument("--max_val_batches", type=int, default=0)
-    parser.add_argument("--no_amp", action="store_true")
-    parser.add_argument(
-        "--expert_adapter_variant",
-        choices=("legacy", "direct_shared"),
-        default="legacy",
-    )
     parser.add_argument(
         "--v2",
         action="store_true",
         help="ROI predicts LV/RV/normal/scar-edema with hard spatial switching.",
     )
-    parser.add_argument("--no_augment", action="store_true")
     parser.add_argument(
         "--split_pathology",
         action="store_true",
@@ -76,12 +76,13 @@ def main() -> None:
     parser.add_argument("--best_test_device", default="cuda:2")
     args = parser.parse_args()
 
+    augment_enabled = args.v2 if args.augment is None else args.augment
+    shared_config = common_train_config_kwargs(args)
+    shared_config.update(fusion_train_config_kwargs(args))
     cfg = TrainConfig(
         dataset_name="Dataset011_MYO_LGE_BC_OOD",
         fold=0,
         block_z=1,
-        batch_size=args.batch_size,
-        image_size=args.image_size,
         norm_mode="mri",
         pseudo_rgb_mode="center_repeat",
         biomedparse_preproc_dir=(
@@ -89,10 +90,7 @@ def main() -> None:
             "biomedparse_preprocessed_Dataset011_MYO_LGE_BC_OOD"
         ),
         use_aligned_biomedparse_preprocessing=True,
-        n_epochs=args.n_epochs,
-        num_workers=args.num_workers,
         raw_cache_cases=max(2, min(8, args.batch_size)),
-        lr=args.lr,
         lr_schedule="cosine",
         lr_warmup_epochs=0,
         min_lr_ratio=0.05,
@@ -118,13 +116,13 @@ def main() -> None:
         lge_split_pathology=args.split_pathology,
         roi_visibility_min_coverage=0.01,
         roi_jitter_center_fraction=(
-            0.03 if args.v2 and not args.no_augment else 0.0
+            0.03 if args.v2 and augment_enabled else 0.0
         ),
         roi_jitter_scale_min=1.0,
         roi_jitter_scale_max=(
-            1.15 if args.v2 and not args.no_augment else 1.0
+            1.15 if args.v2 and augment_enabled else 1.0
         ),
-        lge_augment=args.v2 and not args.no_augment,
+        lge_augment=augment_enabled,
         augment_rotation_degrees=10.0,
         augment_scale_min=0.95,
         augment_scale_max=1.05,
@@ -135,27 +133,10 @@ def main() -> None:
         best_test_on_improvement=args.test_best_on_improvement,
         best_test_device=args.best_test_device,
         best_test_batch_size=args.batch_size,
-        amp=not args.no_amp,
-        expert_adapter_variant=args.expert_adapter_variant,
-        device=args.device,
-        output_dir=args.output_dir,
-        val_every_epochs=args.val_every_epochs,
-        train_case_limit=args.train_case_limit,
-        val_case_limit=args.val_case_limit,
-        max_train_batches=args.max_train_batches,
-        max_val_batches=args.max_val_batches,
+        **shared_config,
     )
     cfg.resolve_paths()
-    cfg.source_commit = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=os.path.dirname(__file__), text=True
-    ).strip()
-    cfg.source_branch = subprocess.check_output(
-        ["git", "branch", "--show-current"],
-        cwd=os.path.dirname(__file__), text=True,
-    ).strip()
-    cfg.source_tracked_dirty = subprocess.run(
-        ["git", "diff", "--quiet"], cwd=os.path.dirname(__file__)
-    ).returncode != 0
+    record_source_metadata(cfg, os.path.dirname(os.path.abspath(__file__)))
 
     device = torch.device(cfg.device)
     print(f"Loading frozen backbones on {device} ...")
@@ -196,24 +177,7 @@ def main() -> None:
         len(anatomy_groups),
         device,
         text_dim=int(anatomy_features["class_emb"].shape[-1]),
-        route_prior_p_mean=cfg.route_prior_p_mean,
-        route_prior_concentration=cfg.route_prior_concentration,
-        route_spatial_basis_grid_size=cfg.route_spatial_basis_grid_size,
-        route_spatial_basis_sigma=cfg.route_spatial_basis_sigma,
-        ot_feature_weight=cfg.ot_feature_weight,
-        ot_coordinate_weight=cfg.ot_coordinate_weight,
-        ot_coordinate_radius=cfg.ot_coordinate_radius,
-        p_ot_semantic_weight=cfg.p_ot_semantic_weight,
-        s_gain_mode=cfg.s_gain_mode,
-        s_gain_temperature=cfg.s_gain_temperature,
-        p_ot_epsilon=cfg.p_ot_epsilon,
-        s_ot_epsilon=cfg.s_ot_epsilon,
-        s_ot_rho_base=cfg.s_ot_rho_base,
-        s_ot_rho_expert=cfg.s_ot_rho_expert,
-        ot_sinkhorn_iterations=cfg.ot_sinkhorn_iterations,
-        ot_max_grid_size=cfg.ot_max_grid_size,
-        expert_adapter_variant=cfg.expert_adapter_variant,
-        remove_res5_expert_branch_norm=cfg.remove_res5_expert_branch_norm,
+        **fusion_builder_kwargs(cfg),
     )
     prompt_texts = (
         {"flat": anatomy_prompts}

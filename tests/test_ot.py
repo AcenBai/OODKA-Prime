@@ -249,6 +249,7 @@ def test_multiscale_objective_filters_invalid_z_and_backpropagates_student_only(
     objective = MultiScaleOTDistillation(
         max_grid_size=4,
         sinkhorn_iterations=20,
+        relative_kd=False,
     )
     output = objective(
         features,

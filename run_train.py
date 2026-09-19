@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -14,22 +13,37 @@ import torch
 
 from oodka.config import TrainConfig, ensure_nnunet_on_path, ensure_biomedparse_on_path
 from oodka.models.prompts import build_text_prompts_for_dataset
+from oodka.train.cli import (
+    add_common_training_arguments,
+    add_fusion_training_arguments,
+    common_train_config_kwargs,
+    fusion_builder_kwargs,
+    fusion_train_config_kwargs,
+    record_source_metadata,
+)
 from oodka.train.model_builder import load_frozen_backbones, build_fusion_modules, build_prompt_features
 from oodka.train.engine import OODKATrainer
 
 
 def main():
     parser = argparse.ArgumentParser(description="OODKA training")
+    add_common_training_arguments(
+        parser,
+        device_default="cuda:0",
+        n_epochs_default=100,
+        batch_size_default=1,
+        image_size_default=512,
+        num_workers_default=2,
+        output_required=False,
+        raw_cache_cases_default=2,
+    )
+    add_fusion_training_arguments(parser)
     parser.add_argument("--dataset_name", type=str, default="Dataset009_CT_OOD")
     parser.add_argument("--nnunet_trainer_tag", type=str, default="nnUNetTrainer_500epochs__nnUNetPlans__2d")
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--block_z", type=int, default=4,
                         help="Number Z of consecutive slices per block")
     parser.add_argument("--norm_mode", type=str, default="ct", choices=("ct", "mri"))
-    parser.add_argument("--n_epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=1,
-                        help="Number B of independent contiguous-Z blocks")
-    parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument(
         "--biomedparse_preproc_dir",
         type=str,
@@ -41,17 +55,6 @@ def main():
     )
     parser.add_argument("--low_percentile", type=float, default=1.0)
     parser.add_argument("--high_percentile", type=float, default=99.0)
-    parser.add_argument("--num_workers", type=int, default=2)
-    parser.add_argument(
-        "--raw_cache_cases",
-        type=int,
-        default=2,
-        help=(
-            "Cases kept per worker and shuffled together; use 4 for "
-            "shallow Dataset011 volumes with batch_size 8"
-        ),
-    )
-    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument(
         "--lr_schedule",
         choices=("constant", "cosine"),
@@ -59,18 +62,10 @@ def main():
     )
     parser.add_argument("--lr_warmup_epochs", type=int, default=0)
     parser.add_argument("--min_lr_ratio", type=float, default=0.05)
-    parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--output_dir", type=str, default="")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--w_seg", type=float, default=3.0)
     parser.add_argument("--w_ae", type=float, default=0.2)
     parser.add_argument("--w_ort", type=float, default=0.3)
-    parser.add_argument(
-        "--expert_ortho_weight",
-        type=float,
-        default=1.0,
-        help="Multiplier on only the Expert-side P/S orthogonality term",
-    )
     parser.add_argument("--w_route", type=float, default=1e-3)
     parser.add_argument("--route_warmup_epochs", type=int, default=5)
     parser.add_argument("--w_p_ot", type=float, default=0.1)
@@ -79,92 +74,30 @@ def main():
     parser.add_argument("--s_ot_start_epoch", type=int, default=3)
     parser.add_argument("--ot_warmup_epochs", type=int, default=5)
     parser.add_argument("--ot_max_grid_size", type=int, default=32)
-    parser.add_argument(
-        "--s_transport_mode",
-        choices=("unbalanced", "capacity_partial"),
-        default="unbalanced",
-    )
-    parser.add_argument(
-        "--s_partial_mass_fraction",
-        type=float,
-        default=0.5,
-        help="Real transported mass fraction for capacity-constrained S partial OT",
-    )
-    parser.add_argument(
-        "--relative_kd",
-        action="store_true",
-        help=(
-            "Reuse each detached OT correspondence for student-to-expert "
-            "distillation in addition to the original expert-to-student KD"
-        ),
-    )
-    parser.add_argument(
-        "--relative_kd_expert_weight",
-        type=float,
-        default=1.0,
-        help="Multiplier on the reverse student-to-expert KD term",
-    )
-    parser.add_argument(
-        "--relative_kd_branches",
-        choices=("both", "p", "s"),
-        default="both",
-        help="Reverse-KD branches to enable when --relative_kd is set",
-    )
-    parser.add_argument(
-        "--relative_kd_rms_weight",
-        type=float,
-        default=0.0,
-        help=(
-            "Weight of transported reverse log-RMS alignment, in addition "
-            "to reverse cosine KD"
-        ),
-    )
-    parser.add_argument(
-        "--expert_adapter_variant",
-        choices=("legacy", "direct_shared"),
-        default="legacy",
-        help=(
-            "Expert decomposition architecture. direct_shared uses two "
-            "direct Conv3d projections and one shared Conv3d decoder on P+S"
-        ),
-    )
-    parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--resume_checkpoint", type=str, default="")
-    parser.add_argument("--val_every_epochs", type=int, default=5)
-    parser.add_argument("--train_case_limit", type=int, default=0)
-    parser.add_argument("--val_case_limit", type=int, default=0)
-    parser.add_argument("--max_train_batches", type=int, default=0)
-    parser.add_argument("--max_val_batches", type=int, default=0)
     args = parser.parse_args()
 
+    shared_config = common_train_config_kwargs(args)
+    shared_config.update(fusion_train_config_kwargs(args))
     cfg = TrainConfig(
         dataset_name=args.dataset_name,
         nnunet_trainer_tag=args.nnunet_trainer_tag,
         fold=args.fold,
         block_z=args.block_z,
         norm_mode=args.norm_mode,
-        n_epochs=args.n_epochs,
-        batch_size=args.batch_size,
-        image_size=args.image_size,
         biomedparse_preproc_dir=args.biomedparse_preproc_dir,
         use_aligned_biomedparse_preprocessing=bool(
             args.biomedparse_preproc_dir
         ),
         low_percentile=args.low_percentile,
         high_percentile=args.high_percentile,
-        num_workers=args.num_workers,
-        raw_cache_cases=args.raw_cache_cases,
-        lr=args.lr,
         lr_schedule=args.lr_schedule,
         lr_warmup_epochs=args.lr_warmup_epochs,
         min_lr_ratio=args.min_lr_ratio,
-        device=args.device,
-        output_dir=args.output_dir,
         seed=args.seed,
         w_seg=args.w_seg,
         w_ae=args.w_ae,
         w_ort=args.w_ort,
-        expert_ortho_weight=args.expert_ortho_weight,
         w_route=args.w_route,
         route_warmup_epochs=args.route_warmup_epochs,
         w_p_ot=args.w_p_ot,
@@ -173,44 +106,11 @@ def main():
         s_ot_start_epoch=args.s_ot_start_epoch,
         ot_warmup_epochs=args.ot_warmup_epochs,
         ot_max_grid_size=args.ot_max_grid_size,
-        s_transport_mode=args.s_transport_mode,
-        s_partial_mass_fraction=args.s_partial_mass_fraction,
-        relative_kd=args.relative_kd,
-        relative_kd_expert_weight=args.relative_kd_expert_weight,
-        relative_kd_rms_weight=args.relative_kd_rms_weight,
-        relative_kd_branches=args.relative_kd_branches,
-        expert_adapter_variant=args.expert_adapter_variant,
-        amp=not args.no_amp,
         resume_checkpoint=args.resume_checkpoint,
-        val_every_epochs=args.val_every_epochs,
-        train_case_limit=args.train_case_limit,
-        val_case_limit=args.val_case_limit,
-        max_train_batches=args.max_train_batches,
-        max_val_batches=args.max_val_batches,
+        **shared_config,
     )
     cfg.resolve_paths()
-    try:
-        cfg.source_commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            text=True,
-        ).strip()
-        cfg.source_branch = subprocess.check_output(
-            ["git", "branch", "--show-current"],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            text=True,
-        ).strip()
-        cfg.source_tracked_dirty = (
-            subprocess.run(
-                ["git", "diff", "--quiet"],
-                cwd=os.path.dirname(os.path.abspath(__file__)),
-                check=False,
-            ).returncode
-            != 0
-        )
-    except (OSError, subprocess.CalledProcessError):
-        # Training remains usable from a source archive without .git.
-        pass
+    record_source_metadata(cfg, os.path.dirname(os.path.abspath(__file__)))
     if cfg.resume_checkpoint:
         # Resume means exact continuation. Checkpoints before this refinement
         # used the original coordinate cost, hard-positive gain, and res5
@@ -236,6 +136,10 @@ def main():
         )
         cfg.expert_adapter_variant = str(
             resume_cfg.get("expert_adapter_variant", "legacy")
+        )
+        cfg.relative_kd = bool(resume_cfg.get("relative_kd", False))
+        cfg.relative_kd_expert_weight = float(
+            resume_cfg.get("relative_kd_expert_weight", 1.0)
         )
         cfg.expert_ortho_weight = float(
             resume_cfg.get("expert_ortho_weight", 1.0)
@@ -320,30 +224,7 @@ def main():
         P,
         device,
         text_dim=text_dim,
-        route_prior_p_mean=cfg.route_prior_p_mean,
-        route_prior_concentration=cfg.route_prior_concentration,
-        route_spatial_basis_grid_size=cfg.route_spatial_basis_grid_size,
-        route_spatial_basis_sigma=cfg.route_spatial_basis_sigma,
-        ot_feature_weight=cfg.ot_feature_weight,
-        ot_coordinate_weight=cfg.ot_coordinate_weight,
-        ot_coordinate_radius=cfg.ot_coordinate_radius,
-        p_ot_semantic_weight=cfg.p_ot_semantic_weight,
-        s_gain_mode=cfg.s_gain_mode,
-        s_gain_temperature=cfg.s_gain_temperature,
-        p_ot_epsilon=cfg.p_ot_epsilon,
-        s_ot_epsilon=cfg.s_ot_epsilon,
-        s_ot_rho_base=cfg.s_ot_rho_base,
-        s_ot_rho_expert=cfg.s_ot_rho_expert,
-        ot_sinkhorn_iterations=cfg.ot_sinkhorn_iterations,
-        ot_max_grid_size=cfg.ot_max_grid_size,
-        s_transport_mode=cfg.s_transport_mode,
-        s_partial_mass_fraction=cfg.s_partial_mass_fraction,
-        relative_kd=cfg.relative_kd,
-        relative_kd_expert_weight=cfg.relative_kd_expert_weight,
-        relative_kd_rms_weight=cfg.relative_kd_rms_weight,
-        relative_kd_branches=cfg.relative_kd_branches,
-        expert_adapter_variant=cfg.expert_adapter_variant,
-        remove_res5_expert_branch_norm=cfg.remove_res5_expert_branch_norm,
+        **fusion_builder_kwargs(cfg),
     )
     n_params = sum(p.numel() for m in fusion_modules.values() for p in m.parameters() if p.requires_grad)
     print(f"Trainable parameters: {n_params:,}")

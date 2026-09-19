@@ -138,6 +138,15 @@ def main() -> None:
         default=0.5,
         help="Sigmoid threshold for independent non-exclusive masks.",
     )
+    parser.add_argument(
+        "--block_diagnostics_jsonl",
+        default="",
+        help=(
+            "Optional JSONL export with one record per inference block: ROI "
+            "coordinates, per-class ROI coverage/composition, and model-grid "
+            "confusions. Empty disables the diagnostic without changing inference."
+        ),
+    )
     args = parser.parse_args()
     if not 0.0 < args.independent_threshold < 1.0:
         raise ValueError("--independent_threshold must be in (0,1)")
@@ -313,6 +322,7 @@ def main() -> None:
     probability_outside = []
     independent_predicted = np.zeros(final_count + 1, dtype=np.int64)
     independent_target = np.zeros(final_count + 1, dtype=np.int64)
+    block_diagnostics = []
 
     task_label = "WHS ROI" if is_whs else f"LGE {'flat' if is_flat else 'ROI'}"
     for case_id in tqdm(case_ids, desc=f"{task_label} {args.split}"):
@@ -463,6 +473,93 @@ def main() -> None:
                     else:
                         foreground_scores = torch.cat(
                             [anatomy[:, 0:2], restored], dim=1
+                        )
+                if args.block_diagnostics_jsonl and not is_flat:
+                    background = torch.zeros_like(foreground_scores[:, :1])
+                    final_prediction_model = torch.cat(
+                        [background, foreground_scores], dim=1
+                    ).argmax(dim=1).detach().cpu()
+                    local_prediction_model = torch.cat(
+                        [background, restored], dim=1
+                    ).argmax(dim=1).detach().cpu()
+                    for block_index, (z_start, block_valid, roi) in enumerate(
+                        zip(current_starts, valid, rois)
+                    ):
+                        valid_count = int(block_valid.sum())
+                        target_source = torch.from_numpy(
+                            aligned_seg[z_start : z_start + valid_count]
+                        )[:, None].float()
+                        target_resized = F.interpolate(
+                            target_source,
+                            size=(cfg.image_size, cfg.image_size),
+                            mode="nearest",
+                        )[:, 0].long()
+                        target_model = torch.zeros_like(target_resized)
+                        for output_id, source_ids in enumerate(final_groups, start=1):
+                            for source_id in source_ids:
+                                target_model[target_resized == int(source_id)] = output_id
+                        roi_mask = torch.zeros_like(target_model, dtype=torch.bool)
+                        roi_mask[:, roi.y0 : roi.y1, roi.x0 : roi.x1] = True
+                        pred_final = final_prediction_model[block_index, :valid_count]
+                        pred_local = local_prediction_model[block_index, :valid_count]
+                        width = final_count + 1
+
+                        def _confusion_for(prediction, mask):
+                            encoded = (
+                                target_model[mask].to(torch.int64) * width
+                                + prediction[mask].to(torch.int64)
+                            )
+                            return torch.bincount(
+                                encoded, minlength=width * width
+                            ).reshape(width, width).tolist()
+
+                        class_voxels = {}
+                        class_inside = {}
+                        class_coverage = {}
+                        roi_voxels = int(roi_mask.sum())
+                        for class_id in range(1, final_count + 1):
+                            class_mask = target_model == class_id
+                            total = int(class_mask.sum())
+                            inside = int((class_mask & roi_mask).sum())
+                            class_voxels[str(class_id)] = total
+                            class_inside[str(class_id)] = inside
+                            class_coverage[str(class_id)] = (
+                                inside / total if total else None
+                            )
+                        block_diagnostics.append(
+                            {
+                                "case_id": case_id,
+                                "z_start": int(z_start),
+                                "valid_count": valid_count,
+                                "roi": {
+                                    "x0": int(roi.x0), "y0": int(roi.y0),
+                                    "x1": int(roi.x1), "y1": int(roi.y1),
+                                    "fallback": bool(roi.fallback),
+                                    "area_fraction": float(
+                                        (roi.x1 - roi.x0) * (roi.y1 - roi.y0)
+                                        / (cfg.image_size * cfg.image_size)
+                                    ),
+                                },
+                                "class_voxels": class_voxels,
+                                "class_voxels_inside_roi": class_inside,
+                                "class_coverage": class_coverage,
+                                "gt_class_fraction_inside_roi": {
+                                    str(class_id): (
+                                        class_inside[str(class_id)] / roi_voxels
+                                        if roi_voxels else 0.0
+                                    )
+                                    for class_id in range(1, final_count + 1)
+                                },
+                                "confusion_final_full_block": _confusion_for(
+                                    pred_final, torch.ones_like(roi_mask)
+                                ),
+                                "confusion_final_inside_roi": _confusion_for(
+                                    pred_final, roi_mask
+                                ),
+                                "confusion_local_inside_roi": _confusion_for(
+                                    pred_local, roi_mask
+                                ),
+                            }
                         )
                 block_count, _, block_z = foreground_scores.shape[:3]
                 resized = F.interpolate(
@@ -686,6 +783,12 @@ def main() -> None:
         ).tolist()
     with open(os.path.join(args.out_dir, "summary.json"), "w") as handle:
         json.dump(summary, handle, indent=2)
+    if args.block_diagnostics_jsonl:
+        diagnostic_path = os.path.abspath(args.block_diagnostics_jsonl)
+        maybe_mkdir_p(os.path.dirname(diagnostic_path))
+        with open(diagnostic_path, "w", encoding="utf-8") as handle:
+            for record in block_diagnostics:
+                handle.write(json.dumps(record) + "\n")
     print(json.dumps(summary, indent=2))
 
 
