@@ -5,6 +5,7 @@ repo_dir="/data4/baihexiang/SegMan/spatial_combination"
 python_bin="/data4/baihexiang/conda_envs/biomedparse_v2/bin/python"
 gpu_index="${1:?usage: $0 <gpu-index> [output-dir]}"
 experiment_dir="${2:-${repo_dir}/experiments/whs_mri_global_noaug_relative_capacity_s_z4_b1_30ep_20260920}"
+seed="${GLOBAL_SEED:-42}"
 aligned_dir="/data4/baihexiang/SegMan/Distangler3/distangler3_output/biomedparse_preprocessed_Dataset010_WHS_MRI_OOD"
 
 cd "${repo_dir}"
@@ -23,7 +24,7 @@ mkdir -p "${experiment_dir}/logs"
   --lr_schedule cosine \
   --lr_warmup_epochs 0 \
   --min_lr_ratio 0.05 \
-  --seed 42 \
+  --seed "${seed}" \
   --w_seg 1.0 \
   --num_workers 4 \
   --raw_cache_cases 4 \

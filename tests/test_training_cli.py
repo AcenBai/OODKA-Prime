@@ -3,7 +3,9 @@ import argparse
 from oodka.config import TrainConfig
 from oodka.train.cli import (
     add_augmentation_switch,
+    add_common_training_arguments,
     add_fusion_training_arguments,
+    common_train_config_kwargs,
     fusion_builder_kwargs,
     fusion_train_config_kwargs,
 )
@@ -52,3 +54,21 @@ def test_augmentation_switch_is_symmetric_and_can_defer_default():
     assert parser.parse_args([]).augment is None
     assert parser.parse_args(["--augment"]).augment is True
     assert parser.parse_args(["--no-augment"]).augment is False
+
+
+def test_common_training_seed_is_reproducible_and_overridable():
+    parser = argparse.ArgumentParser()
+    add_common_training_arguments(
+        parser,
+        device_default="cpu",
+        n_epochs_default=1,
+        batch_size_default=1,
+        image_size_default=32,
+        num_workers_default=0,
+        output_required=False,
+    )
+
+    assert common_train_config_kwargs(parser.parse_args([]))["seed"] == 42
+    assert common_train_config_kwargs(parser.parse_args(["--seed", "43"]))[
+        "seed"
+    ] == 43

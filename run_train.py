@@ -62,7 +62,6 @@ def main():
     )
     parser.add_argument("--lr_warmup_epochs", type=int, default=0)
     parser.add_argument("--min_lr_ratio", type=float, default=0.05)
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--w_seg", type=float, default=3.0)
     parser.add_argument("--w_ae", type=float, default=0.2)
     parser.add_argument("--w_ort", type=float, default=0.3)
@@ -94,7 +93,6 @@ def main():
         lr_schedule=args.lr_schedule,
         lr_warmup_epochs=args.lr_warmup_epochs,
         min_lr_ratio=args.min_lr_ratio,
-        seed=args.seed,
         w_seg=args.w_seg,
         w_ae=args.w_ae,
         w_ort=args.w_ort,

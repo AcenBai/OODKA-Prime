@@ -32,6 +32,7 @@ def add_common_training_arguments(
             "--raw_cache_cases", type=int, default=raw_cache_cases_default
         )
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", required=output_required, default=None)
     parser.add_argument("--val_every_epochs", type=int, default=5)
     parser.add_argument("--train_case_limit", type=int, default=0)
@@ -103,6 +104,7 @@ def common_train_config_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
         "num_workers",
         "raw_cache_cases",
         "lr",
+        "seed",
         "device",
         "output_dir",
         "val_every_epochs",

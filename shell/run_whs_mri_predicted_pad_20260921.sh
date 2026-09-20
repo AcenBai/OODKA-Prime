@@ -7,6 +7,7 @@ gpu_index="${1:?usage: $0 <gpu-index> <warmup-epochs> [output-dir]}"
 warmup_epochs="${2:?usage: $0 <gpu-index> <warmup-epochs> [output-dir]}"
 roi_threshold="${ROI_THRESHOLD:-0.2}"
 roi_expand="${ROI_EXPAND:-1.4}"
+seed="${ROI_SEED:-42}"
 experiment_dir="${3:-${repo_dir}/experiments/whs_mri_predicted_pad_noaug_relative_capacity_s_z4_b1_w${warmup_epochs}_30ep_20260921}"
 
 cd "${repo_dir}"
@@ -24,6 +25,7 @@ mkdir -p "${experiment_dir}"
   --roi_prompt_loss_reduction prompt_mean \
   --num_workers 4 \
   --raw_cache_cases 4 \
+  --seed "${seed}" \
   --roi_threshold "${roi_threshold}" \
   --roi_expand "${roi_expand}" \
   --roi_fallback full \
@@ -68,7 +70,7 @@ done
   --output_dir "${experiment_dir}/test_best_predicted_none/geometry" \
   --image_size 320 \
   --source_classes 1,2,3,4,5,6,7 \
-  --title "MRI whole-heart predicted ROI: pad, w${warmup_epochs}, t${roi_threshold}, e${roi_expand}" \
+  --title "MRI whole-heart predicted ROI: pad, w${warmup_epochs}, t${roi_threshold}, e${roi_expand}, seed${seed}" \
   > "${experiment_dir}/test_best_predicted_none/geometry.log"
 
 touch "${experiment_dir}/PIPELINE_COMPLETE"
