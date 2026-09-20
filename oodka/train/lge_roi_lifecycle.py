@@ -87,7 +87,9 @@ class LGEROILifecycleMixin:
             )
             gt_recalls.append(recall)
         diagnostics = roi_diagnostics(
-            all_rois, (self.cfg.image_size, self.cfg.image_size)
+            all_rois,
+            (self.cfg.image_size, self.cfg.image_size),
+            transform=self.cfg.roi_transform,
         )
         diagnostics["roi_target_gt_recall_mean"] = float(np.mean(gt_recalls))
         if self.experiment_name == "LGE":
@@ -194,6 +196,7 @@ class LGEROILifecycleMixin:
             "--split", "test",
             "--device", self.cfg.best_test_device,
             "--batch_size", str(self.cfg.best_test_batch_size),
+            "--roi_source", self.cfg.roi_train_source,
             "--decision", "auto",
             "--out_dir", out_dir,
         ]
@@ -263,6 +266,8 @@ class LGEROILifecycleMixin:
             f"B={cfg.batch_size}, Z={cfg.block_z}, image={cfg.image_size}, "
             f"warmup={cfg.roi_warmup_epochs}, threshold={cfg.roi_threshold}, "
             f"expand={cfg.roi_expand}, pseudoRGB={cfg.pseudo_rgb_mode}, "
+            f"roiSource={cfg.roi_train_source}, "
+            f"roiTransform={cfg.roi_transform}, "
             f"augment={cfg.lge_augment}, "
             f"promptReduction={cfg.roi_prompt_loss_reduction}"
         )
@@ -274,7 +279,7 @@ class LGEROILifecycleMixin:
                 not cfg.lge_flat_four_prompt
                 and epoch > cfg.roi_warmup_epochs
             )
-            if mixed and (
+            if mixed and cfg.roi_train_source == "predicted" and (
                 self.roi_cache is None
                 or (
                     cfg.roi_refresh_every > 0

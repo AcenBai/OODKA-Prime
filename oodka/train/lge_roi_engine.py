@@ -23,6 +23,7 @@ from ..data.lge_roi import (
     crop_and_resize_batch,
     hard_switch_foreground_logits,
     jitter_roi,
+    oracle_block_rois,
     remap_grouped_labels,
     restore_roi_logits,
     roi_diagnostics,
@@ -221,6 +222,19 @@ class LGEROIMixedTrainer(LGEROILifecycleMixin, OODKATrainer):
             target |= labels == source_id
         return target
 
+    def _ground_truth_rois(
+        self,
+        labels: torch.Tensor,
+        valid_z: torch.Tensor | None = None,
+    ) -> List[ROICoordinates]:
+        """Build the exact block-coherent oracle ROI used for ceiling runs."""
+        return oracle_block_rois(
+            labels,
+            self.roi_source_labels,
+            self.roi_generator,
+            valid_z,
+        )
+
     def _cached_rois(self, batch_data: dict) -> List[ROICoordinates]:
         if self.roi_cache is None:
             raise RuntimeError("ROI cache has not been generated")
@@ -330,13 +344,34 @@ class LGEROIMixedTrainer(LGEROILifecycleMixin, OODKATrainer):
                     refine_logs = {}
                     rois = []
                     if mixed:
-                        rois = (
-                            self._cached_rois(batch_data)
-                            if train else self._online_rois(
-                                anatomy_logits, batch_data["valid_z"]
+                        if self.cfg.roi_train_source == "ground_truth":
+                            rois = self._ground_truth_rois(
+                                batch_data["gt"], batch_data["valid_z"]
                             )
-                        )
-                        if train and self.cfg.roi_v2_hard_switch:
+                        elif self.cfg.roi_train_source == "full":
+                            height, width = batch_data["gt"].shape[-2:]
+                            rois = [
+                                ROICoordinates(0, 0, width, height)
+                                for _ in range(batch_data["gt"].shape[0])
+                            ]
+                        elif self.cfg.roi_train_source == "predicted":
+                            rois = (
+                                self._cached_rois(batch_data)
+                                if train else self._online_rois(
+                                    anatomy_logits, batch_data["valid_z"]
+                                )
+                            )
+                        else:
+                            raise ValueError(
+                                "roi_train_source must be predicted, "
+                                "ground_truth, or full; got "
+                                f"{self.cfg.roi_train_source!r}"
+                            )
+                        if (
+                            train
+                            and self.cfg.roi_v2_hard_switch
+                            and self.cfg.roi_train_source == "predicted"
+                        ):
                             rois = [
                                 jitter_roi(
                                     roi,
@@ -347,7 +382,11 @@ class LGEROIMixedTrainer(LGEROILifecycleMixin, OODKATrainer):
                                 )
                                 for roi in rois
                             ]
-                        roi_batch = crop_and_resize_batch(batch_data, rois)
+                        roi_batch = crop_and_resize_batch(
+                            batch_data,
+                            rois,
+                            transform=self.cfg.roi_transform,
+                        )
                         if self.cfg.roi_v2_hard_switch:
                             prompt_valid = roi_prompt_visibility(
                                 batch_data["gt"],
@@ -410,6 +449,7 @@ class LGEROIMixedTrainer(LGEROILifecycleMixin, OODKATrainer):
                         refinement_logits,
                         rois,
                         batch_data["gt"].shape[-2:],
+                        transform=self.cfg.roi_transform,
                     )
                     background = torch.zeros_like(anatomy_logits[:, :1])
                     if self.refinement_only_output:

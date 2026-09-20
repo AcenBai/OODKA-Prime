@@ -116,6 +116,8 @@ def evaluate_oodka_blocks(
     P: int,
 ):
     """Evaluate every real slice with the pure BiomedParse/OODKA student."""
+    if cfg.postprocess not in {"none", "largest_per_class"}:
+        raise ValueError(f"Unknown postprocess mode {cfg.postprocess!r}")
     device = torch.device(cfg.device)
     with open(cfg.dataset_json_path, encoding="utf-8") as file_handle:
         dataset_json = json.load(file_handle)
@@ -265,7 +267,8 @@ def evaluate_oodka_blocks(
                     f"!= raw shape={raw_shape}"
                 )
 
-        pred_seg = keep_largest_component_per_class(pred_seg, class_ids)
+        if cfg.postprocess == "largest_per_class":
+            pred_seg = keep_largest_component_per_class(pred_seg, class_ids)
         label_ref = sitk.ReadImage(label_path)
         out_img = sitk.GetImageFromArray(pred_seg)
         out_img.CopyInformation(label_ref)
@@ -296,6 +299,7 @@ def evaluate_oodka_blocks(
 
     summary = {
         "n_cases": len(test_ids),
+        "postprocess": cfg.postprocess,
         "mean_dice_gt_present": float(
             np.mean([row["dice_mean_gt"] for row in all_rows])
         ),

@@ -1,5 +1,6 @@
 import json
 
+import pytest
 import torch
 
 from oodka.data.lge_roi import (
@@ -9,8 +10,10 @@ from oodka.data.lge_roi import (
     augment_lge_batch,
     crop_and_resize_batch,
     hard_switch_foreground_logits,
+    oracle_block_rois,
     remap_grouped_labels,
     restore_roi_logits,
+    roi_placement,
     roi_prompt_visibility,
 )
 from run_eval_lge_roi import _hierarchical_foreground_logits
@@ -62,6 +65,127 @@ def test_crop_and_restore_coordinate_contract():
     assert restored.shape == logits.shape
     assert torch.all(restored[:, :, :, :5] < 0)
     assert torch.allclose(restored[0, :, 0, 5:13, 4:12], torch.ones(2, 8, 8))
+
+
+def test_pad_transform_preserves_native_roi_pixels_and_is_reversible():
+    image = torch.arange(16 * 16).reshape(1, 1, 1, 16, 16).float()
+    gt = torch.zeros((1, 1, 16, 16), dtype=torch.long)
+    gt[:, :, 5:13, 4:10] = 2
+    batch = {
+        "nnunet_image": image,
+        "biomedparse_image": image.repeat(1, 1, 3, 1, 1),
+        "gt": gt,
+        "valid_z": torch.ones((1, 1), dtype=torch.bool),
+    }
+    roi = ROICoordinates(4, 5, 10, 13)
+    placement = roi_placement(roi, (16, 16), "pad")
+    assert placement == type(placement)(4, 5, 8, 6, 16, 16)
+
+    cropped = crop_and_resize_batch(batch, [roi], transform="pad")
+    expected = image[0, 0, 0, 5:13, 4:10]
+    actual = cropped["nnunet_image"][
+        0,
+        0,
+        0,
+        placement.top : placement.top + placement.height,
+        placement.left : placement.left + placement.width,
+    ]
+    torch.testing.assert_close(actual, expected)
+    assert int((cropped["gt"] == 2).sum()) == roi.width * roi.height
+    valid_canvas = torch.zeros((16, 16), dtype=torch.bool)
+    valid_canvas[
+        placement.top : placement.top + placement.height,
+        placement.left : placement.left + placement.width,
+    ] = True
+    assert torch.all(cropped["gt"][0, 0][~valid_canvas] == -1)
+
+    canvas_logits = torch.full((1, 2, 1, 16, 16), -7.0)
+    canvas_logits[
+        :, :, :,
+        placement.top : placement.top + placement.height,
+        placement.left : placement.left + placement.width,
+    ] = 3.0
+    restored = restore_roi_logits(
+        canvas_logits, [roi], (16, 16), transform="pad"
+    )
+    assert torch.all(restored[0, :, 0, 5:13, 4:10] == 3.0)
+    assert torch.all(restored[0, :, 0, :5] < 0.0)
+
+
+def test_letterbox_transform_preserves_aspect_ratio():
+    roi = ROICoordinates(2, 3, 10, 7)  # 8x4 inside a 16x16 canvas.
+    placement = roi_placement(roi, (16, 16), "letterbox")
+    assert (placement.height, placement.width) == (8, 16)
+    assert (placement.top, placement.left) == (4, 0)
+    assert placement.width / roi.width == placement.height / roi.height
+
+
+def test_letterbox_crop_and_restore_uses_only_content_window():
+    image = torch.ones((1, 1, 1, 16, 16))
+    gt = torch.zeros((1, 1, 16, 16), dtype=torch.long)
+    gt[:, :, 3:7, 2:10] = 4
+    batch = {
+        "nnunet_image": image,
+        "biomedparse_image": image.repeat(1, 1, 3, 1, 1),
+        "gt": gt,
+        "valid_z": torch.ones((1, 1), dtype=torch.bool),
+    }
+    roi = ROICoordinates(2, 3, 10, 7)
+    placement = roi_placement(roi, (16, 16), "letterbox")
+    cropped = crop_and_resize_batch(batch, [roi], transform="letterbox")
+    content = cropped["gt"][
+        0, 0,
+        placement.top : placement.top + placement.height,
+        placement.left : placement.left + placement.width,
+    ]
+    assert torch.all(content == 4)
+    assert int((cropped["gt"] == -1).sum()) == 16 * 8
+
+    logits = torch.full((1, 2, 1, 16, 16), -9.0)
+    logits[
+        :, :, :,
+        placement.top : placement.top + placement.height,
+        placement.left : placement.left + placement.width,
+    ] = 5.0
+    restored = restore_roi_logits(
+        logits, [roi], (16, 16), transform="letterbox"
+    )
+    assert torch.all(restored[0, :, 0, 3:7, 2:10] == 5.0)
+
+
+def test_roi_transform_rejects_out_of_bounds_and_mismatched_canvas():
+    tensor = torch.zeros((1, 1, 1, 16, 16))
+    with pytest.raises(ValueError, match="outside image canvas"):
+        crop_and_resize_batch(
+            {
+                "nnunet_image": tensor,
+                "biomedparse_image": tensor.repeat(1, 1, 3, 1, 1),
+                "gt": tensor[:, :, 0].long(),
+            },
+            [ROICoordinates(-1, 0, 8, 8)],
+            transform="pad",
+        )
+    with pytest.raises(ValueError, match="canvas must match"):
+        restore_roi_logits(
+            torch.zeros((1, 2, 1, 8, 8)),
+            [ROICoordinates(0, 0, 8, 8)],
+            (16, 16),
+            transform="pad",
+        )
+
+
+def test_oracle_block_roi_uses_valid_gt_union_and_ignores_padded_tail():
+    labels = torch.zeros((2, 4, 12, 12), dtype=torch.long)
+    labels[0, 0, 2:5, 3:7] = 6
+    labels[0, 1, 7:9, 8:10] = 7
+    labels[1, 3, 0:12, 0:12] = 6  # Invalid padded tail must not affect ROI.
+    valid = torch.tensor([[True, True, True, True], [True, True, True, False]])
+    generator = ROIGenerator(
+        threshold=0.3, expand=1.0, fallback="full", min_size=1
+    )
+    rois = oracle_block_rois(labels, (6, 7), generator, valid)
+    assert rois[0] == ROICoordinates(3, 2, 10, 9, fallback=False)
+    assert rois[1] == ROICoordinates(0, 0, 12, 12, fallback=True)
 
 
 def test_z4_block_roi_uses_one_coherent_cuboid():

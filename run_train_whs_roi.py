@@ -91,6 +91,21 @@ def main() -> None:
     parser.add_argument("--roi_fallback", choices=("full", "center"), default="full")
     parser.add_argument("--roi_refresh_every", type=int, default=0)
     parser.add_argument(
+        "--roi_train_source",
+        choices=("predicted", "ground_truth", "full"),
+        default="predicted",
+        help=(
+            "Use predicted, GT-oracle, or full-image ROIs throughout "
+            "train/validation."
+        ),
+    )
+    parser.add_argument(
+        "--roi_transform",
+        choices=("resize", "pad", "letterbox"),
+        default="resize",
+        help="Map an ROI crop to the fixed model canvas.",
+    )
+    parser.add_argument(
         "--pseudo_rgb_mode",
         choices=("adjacent", "center_repeat"),
         default="center_repeat",
@@ -141,6 +156,8 @@ def main() -> None:
         roi_expand=args.roi_expand,
         roi_fallback=args.roi_fallback,
         roi_refresh_every=args.roi_refresh_every,
+        roi_train_source=args.roi_train_source,
+        roi_transform=args.roi_transform,
         lambda_anchor=1.0,
         lambda_refine=1.0,
         roi_prompt_loss_reduction=args.roi_prompt_loss_reduction,
@@ -214,7 +231,7 @@ def main() -> None:
         refinement_only_output=not great_vessel,
         outside_prompt_mapping=(
             WHS_GV_OUTSIDE_PROMPT_MAPPING
-            if great_vessel else ((0, 0), (1, 1))
+            if great_vessel else ()
         ),
         experiment_name=(
             f"WHS-{str(spec['modality']).upper()}-GV"

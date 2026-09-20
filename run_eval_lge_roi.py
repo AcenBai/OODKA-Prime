@@ -23,8 +23,10 @@ from oodka.data.lge_roi import (
     ROICoordinates,
     ROIGenerator,
     hard_switch_foreground_logits,
+    roi_placement,
     restore_roi_logits,
     roi_diagnostics,
+    transform_roi_tensor,
 )
 from oodka.data.slice_dataset import make_biomedparse_block
 from oodka.models.prompts import (
@@ -59,6 +61,7 @@ from oodka.utils.io_utils import (
     read_nifti_as_zyx_with_spacing,
 )
 from oodka.utils.metrics import dice_no_ignore, precision_recall_hd95_no_ignore
+from oodka.utils.postprocessing import keep_largest_component_per_class
 
 
 def _remap_gt(array: np.ndarray, groups=MYOPS_LGE_ROI_FINAL_GROUPS) -> np.ndarray:
@@ -124,6 +127,15 @@ def main() -> None:
         help="Diagnostic source of the second-pass crop.",
     )
     parser.add_argument(
+        "--roi_transform",
+        choices=("checkpoint", "resize", "pad", "letterbox"),
+        default="checkpoint",
+        help=(
+            "Crop-to-canvas geometry. 'checkpoint' uses the training setting "
+            "and falls back to historical resize for old checkpoints."
+        ),
+    )
+    parser.add_argument(
         "--decision",
         choices=(
             "auto", "flat", "hierarchical", "independent", "spatial",
@@ -131,6 +143,12 @@ def main() -> None:
         ),
         default="auto",
         help="Final cross-pass decision rule.",
+    )
+    parser.add_argument(
+        "--postprocess",
+        choices=("none", "largest_per_class"),
+        default="none",
+        help="Optional per-class largest-component filtering.",
     )
     parser.add_argument(
         "--independent_threshold",
@@ -185,6 +203,11 @@ def main() -> None:
     if is_flat and decision != "flat":
         raise ValueError("Flat checkpoints require --decision flat (or auto)")
     saved = checkpoint["config"]
+    roi_transform = (
+        str(saved.get("roi_transform", "resize"))
+        if args.roi_transform == "checkpoint"
+        else args.roi_transform
+    )
     dataset_name = (
         str(saved.get("dataset_name"))
         if is_whs else "Dataset011_MYO_LGE_BC_OOD"
@@ -426,20 +449,12 @@ def main() -> None:
                             :, int(checkpoint.get("roi_prompt_index", 2))
                         ]
                     ).cpu()
-                    roi_blocks = []
-                    for index, roi in enumerate(rois):
-                        crop = full_blocks[
-                            index, :, :, roi.y0 : roi.y1, roi.x0 : roi.x1
-                        ]
-                        roi_blocks.append(
-                            F.interpolate(
-                                crop,
-                                size=(cfg.image_size, cfg.image_size),
-                                mode="bilinear",
-                                align_corners=False,
-                            )
-                        )
-                    roi_blocks = torch.stack(roi_blocks)
+                    roi_blocks = transform_roi_tensor(
+                        full_blocks,
+                        rois,
+                        transform=roi_transform,
+                        mode="bilinear",
+                    )
                     refinement = predict_block_logits_per_class(
                         roi_blocks,
                         valid,
@@ -454,6 +469,7 @@ def main() -> None:
                         refinement,
                         rois,
                         (cfg.image_size, cfg.image_size),
+                        transform=roi_transform,
                     )
                     if decision == "refinement":
                         foreground_scores = restored
@@ -517,6 +533,11 @@ def main() -> None:
                         class_inside = {}
                         class_coverage = {}
                         roi_voxels = int(roi_mask.sum())
+                        placement = roi_placement(
+                            roi,
+                            (cfg.image_size, cfg.image_size),
+                            roi_transform,
+                        )
                         for class_id in range(1, final_count + 1):
                             class_mask = target_model == class_id
                             total = int(class_mask.sum())
@@ -538,6 +559,17 @@ def main() -> None:
                                     "area_fraction": float(
                                         (roi.x1 - roi.x0) * (roi.y1 - roi.y0)
                                         / (cfg.image_size * cfg.image_size)
+                                    ),
+                                    "transform": roi_transform,
+                                    "canvas_top": int(placement.top),
+                                    "canvas_left": int(placement.left),
+                                    "canvas_height": int(placement.height),
+                                    "canvas_width": int(placement.width),
+                                    "scale_x": float(
+                                        placement.width / max(1, roi.width)
+                                    ),
+                                    "scale_y": float(
+                                        placement.height / max(1, roi.height)
                                     ),
                                 },
                                 "class_voxels": class_voxels,
@@ -661,6 +693,10 @@ def main() -> None:
                     raise ValueError(
                         f"{case_id}: restored={binary.shape}, raw={raw_shape}"
                     )
+                if args.postprocess == "largest_per_class":
+                    binary = keep_largest_component_per_class(
+                        binary.astype(np.int16), (1,)
+                    ) > 0
                 binary_target = target == class_id
                 denominator = int(binary.sum() + binary_target.sum())
                 raw_dice = (
@@ -707,6 +743,11 @@ def main() -> None:
             raise ValueError(
                 f"{case_id}: restored={prediction.shape}, raw={raw_shape}"
             )
+        if args.postprocess == "largest_per_class":
+            prediction = keep_largest_component_per_class(
+                prediction,
+                tuple(range(1, final_count + 1)),
+            )
         width = final_count + 1
         encoded = target.astype(np.int64) * width + prediction.astype(np.int64)
         confusion += np.bincount(
@@ -737,6 +778,8 @@ def main() -> None:
         "n_cases": len(rows),
         "decision": decision,
         "roi_source": args.roi_source,
+        "roi_transform": roi_transform,
+        "postprocess": args.postprocess,
         "checkpoint_format": checkpoint_format,
         "mean_dice_gt_present": float(np.mean([r["dice_mean_gt"] for r in rows])),
         "class_names": final_names,
@@ -746,7 +789,9 @@ def main() -> None:
         summary[f"dice_{class_id}_mean"] = float(np.mean(values)) if values else None
     if not is_flat:
         roi_summary = roi_diagnostics(
-            all_rois, (cfg.image_size, cfg.image_size)
+            all_rois,
+            (cfg.image_size, cfg.image_size),
+            transform=roi_transform,
         )
         roi_summary["total_myo_gt_recall_mean"] = float(
             np.mean(coverage_values)

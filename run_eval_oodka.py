@@ -45,6 +45,12 @@ def main():
         default="",
         help="Diagnostic override for BiomedParse pseudo-RGB construction.",
     )
+    parser.add_argument(
+        "--postprocess",
+        choices=("none", "largest_per_class"),
+        default="largest_per_class",
+        help="Optional connected-component filtering (historically enabled).",
+    )
     args = parser.parse_args()
 
     cfg = EvalConfig(
@@ -59,6 +65,7 @@ def main():
         case_limit=args.case_limit,
         split=args.split,
         fold=args.fold,
+        postprocess=args.postprocess,
     )
     cfg.resolve_paths()
     device = torch.device(cfg.device)

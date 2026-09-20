@@ -96,6 +96,14 @@ class TrainConfig:
     roi_expand: float = 1.25
     roi_fallback: str = "full"
     roi_refresh_every: int = 0
+    # ``predicted`` preserves the deployable two-pass pipeline. ``ground_truth``
+    # measures the oracle ceiling, while ``full`` isolates the refinement branch
+    # without localization/cropping.
+    roi_train_source: str = "predicted"
+    # How an XY crop is mapped onto the fixed model canvas. ``resize`` is the
+    # historical anisotropic warp, ``pad`` preserves native pixels, and
+    # ``letterbox`` performs an aspect-preserving resize followed by padding.
+    roi_transform: str = "resize"
     lambda_anchor: float = 1.0
     lambda_refine: float = 1.0
     roi_prompt_loss_reduction: str = "sum"
@@ -246,6 +254,7 @@ class EvalConfig:
     low_percentile: float = 1.0
     high_percentile: float = 99.0
     pseudo_rgb_mode: str = "adjacent"
+    postprocess: str = "largest_per_class"
 
     tile_step_size: float = 0.5
     device: str = "cuda:0"
