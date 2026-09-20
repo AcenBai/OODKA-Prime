@@ -104,6 +104,39 @@ architecture should therefore preserve the strong global prediction and use
 local refinement as a class-selective correction rather than a complete
 seven-class replacement.
 
+## First predicted-box transfer result
+
+The raw zero-training transfer result is now complete: the Oracle-pad
+checkpoint uses its jointly trained first pass to predict the box, while all
+weights remain unchanged.
+
+| Raw protocol | Mean Dice | Delta vs historical global | Paired 95% CI | Case wins vs global |
+| --- | ---: | ---: | ---: | ---: |
+| historical global | 0.662654 | - | - | - |
+| Oracle-pad with GT box | 0.715459 | +0.052805 | [+0.040034, +0.065131] | 24/26 |
+| **Oracle-pad checkpoint with predicted box** | **0.653926** | **-0.008728** | **[-0.017255, +0.000079]** | **7/26** |
+
+Predicted-box transfer loses `0.061533` Dice against the same checkpoint with
+a GT box (paired CI `[-0.073349, -0.049820]`) and loses on all 26 cases. Its
+empirical gap capture `(T - G) / (O - G)` is `-0.165`, so merely substituting
+the learned box does not deploy the Oracle gain.
+
+The failure is not explained by gross anatomy coverage. Across positive
+blocks, mean seven-class-union coverage is 0.9887; AO voxel-weighted coverage
+is 0.99998 and PA coverage is 1.0. Only 6/991 positive blocks have zero union
+coverage, and fallback is 2.26%. Predicted boxes are actually looser than the
+GT boxes: median canvas area fraction is 0.262 versus 0.197 for Oracle.
+
+Class-wise transfer deltas versus historical global are LV -0.0063, RV
++0.0327, LA -0.0368, RA -0.0208, Myo -0.0059, AO +0.0259, and PA -0.0500.
+The evidence therefore shifts priority away from simple union-recall tuning
+and toward predicted-box training-distribution robustness, local background
+rejection, and protected global/local fusion. Raw transfer geometry is saved
+at
+`experiments/whs_mri_oracle_pad_noaug_relative_capacity_s_z4_b1_30ep_20260920/test_best_predicted_transfer_none/geometry/roi_geometry_diagnostics.png`.
+Largest-component transfer and the resize/letterbox transfer controls are
+still running, so this is a raw, single-checkpoint readout.
+
 ## Existing deployable evidence
 
 The parallel selective AO/PA worktree already validates this principle using
@@ -150,6 +183,8 @@ Relevant pushed commits:
 - `a5ff934` - strict paired comparison and bootstrap tool;
 - `3816613` / `82b55fa` - predicted-pad experiment pipeline and sweep knobs;
 - `255aab0` - Oracle-checkpoint to predicted-ROI transfer evaluation.
+- `a8f4ab5` - shared seed control, replication queue, automatic comparisons,
+  and this stage report.
 
 ## Running and queued experiments
 
@@ -194,13 +229,17 @@ same mixed-training budget: in a 30-epoch run they receive 25 versus 20 mixed
 epochs. A lower warmup-10 result would therefore be ambiguous; only if that
 comparison matters should it be repeated for 35 total epochs.
 
-Snapshot at 2026-09-21 01:40 CST:
+Snapshot at 2026-09-21 01:55 CST:
 
-- matched global is in epoch 13; best validation Dice is 0.7589 at epoch 10;
-- full-canvas control is in epoch 7; best validation Dice is 0.7770 at epoch 5;
-- predicted-pad warmup-5 is in epoch 3, still in anatomy-only warmup, so it is
-  too early to infer anything about predicted-ROI refinement;
-- Oracle-pad to predicted-ROI raw transfer is 5/26 cases complete and healthy;
+- matched global has completed epoch 16; best validation Dice is 0.7718 at
+  epoch 15;
+- full-canvas control has completed epoch 8; best validation Dice is 0.7770 at
+  epoch 5;
+- predicted-pad warmup-5 has completed epoch 5; it has not yet completed a
+  predicted-ROI mixed epoch, so its warmup validation score is not evidence
+  about refinement;
+- Oracle-pad to predicted-ROI raw transfer is complete; largest-component
+  transfer is running;
 - no active job has reported OOM, traceback, NaN, or a killed process.
 
 GPU 7 has only about 2 GiB free because of an unrelated resident workload.
