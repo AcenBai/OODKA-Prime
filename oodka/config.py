@@ -88,7 +88,8 @@ class TrainConfig:
     high_percentile: float = 99.0
     pseudo_rgb_mode: str = "adjacent"
 
-    # LGE full-image anatomy + predicted-myocardium ROI refinement.
+    # Historical checkpoint metadata, not an independent runtime switch.
+    # The ROI trainer's warmup/flat-mode lifecycle controls two-pass execution.
     lge_roi_two_pass: bool = False
     lge_flat_four_prompt: bool = False
     roi_warmup_epochs: int = 10

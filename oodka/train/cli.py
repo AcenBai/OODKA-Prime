@@ -95,6 +95,38 @@ def add_augmentation_switch(
     parser.set_defaults(augment=default)
 
 
+def add_roi_training_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the ROI controls shared by LGE, CT, and MRI training.
+
+    Defaults match the historical entry points. Task-specific switches such
+    as WHS ROI strategy or LGE pathology grouping stay in their own parsers.
+    """
+    parser.add_argument("--warmup_epochs", type=int, default=10)
+    parser.add_argument("--roi_threshold", type=float, default=0.3)
+    parser.add_argument("--roi_expand", type=float, default=1.25)
+    parser.add_argument(
+        "--roi_fallback", choices=("full", "center"), default="full"
+    )
+    parser.add_argument("--roi_refresh_every", type=int, default=0)
+    parser.add_argument(
+        "--roi_train_source",
+        choices=("predicted", "ground_truth", "full"),
+        default="predicted",
+        help="Predicted, GT-oracle, or full-image ROIs during train/validation.",
+    )
+    parser.add_argument(
+        "--roi_transform",
+        choices=("resize", "pad", "letterbox"),
+        default="resize",
+        help="Map an ROI crop to the fixed model canvas.",
+    )
+    parser.add_argument(
+        "--roi_prompt_loss_reduction",
+        choices=("sum", "mean", "prompt_mean"),
+        default="sum",
+    )
+
+
 def common_train_config_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
     """Translate shared CLI arguments into ``TrainConfig`` keyword values."""
     names = (

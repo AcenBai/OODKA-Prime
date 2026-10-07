@@ -27,6 +27,7 @@ from oodka.train.cli import (
     add_augmentation_switch,
     add_common_training_arguments,
     add_fusion_training_arguments,
+    add_roi_training_arguments,
     common_train_config_kwargs,
     fusion_builder_kwargs,
     fusion_train_config_kwargs,
@@ -51,12 +52,8 @@ def main() -> None:
         output_required=True,
     )
     add_fusion_training_arguments(parser)
+    add_roi_training_arguments(parser)
     add_augmentation_switch(parser, default=None)
-    parser.add_argument("--warmup_epochs", type=int, default=10)
-    parser.add_argument("--roi_threshold", type=float, default=0.3)
-    parser.add_argument("--roi_expand", type=float, default=1.25)
-    parser.add_argument("--roi_fallback", choices=("full", "center"), default="full")
-    parser.add_argument("--roi_refresh_every", type=int, default=0)
     parser.add_argument(
         "--v2",
         action="store_true",
@@ -110,6 +107,9 @@ def main() -> None:
         roi_expand=args.roi_expand,
         roi_fallback=args.roi_fallback,
         roi_refresh_every=args.roi_refresh_every,
+        roi_train_source=args.roi_train_source,
+        roi_transform=args.roi_transform,
+        roi_prompt_loss_reduction=args.roi_prompt_loss_reduction,
         lambda_anchor=1.0,
         lambda_refine=1.0,
         roi_v2_hard_switch=args.v2 and not args.flat_four_prompt,

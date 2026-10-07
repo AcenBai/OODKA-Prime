@@ -19,34 +19,24 @@ from tqdm import tqdm
 
 from oodka.config import EvalConfig
 from oodka.data.aligned_preprocessing import AlignedBiomedParsePreprocessor
-from oodka.data.lge_roi import (
-    ROICoordinates,
-    ROIGenerator,
-    hard_switch_foreground_logits,
-    roi_placement,
+from oodka.data.roi_geometry import (
     restore_roi_logits,
     roi_diagnostics,
     transform_roi_tensor,
 )
+from oodka.data.roi_policy import ROIGenerator
 from oodka.data.slice_dataset import make_biomedparse_block
-from oodka.models.prompts import (
-    MYOPS_LGE_ROI_ANATOMY_PROMPTS,
-    MYOPS_LGE_ROI_FINAL_GROUPS,
-    MYOPS_LGE_ROI_FINAL_NAMES,
-    MYOPS_LGE_ROI_REFINEMENT_PROMPTS,
-    MYOPS_LGE_ROI_SPLIT_FINAL_GROUPS,
-    MYOPS_LGE_ROI_SPLIT_FINAL_NAMES,
-    MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS,
-    MYOPS_LGE_ROI_V3_REFINEMENT_PROMPTS,
-    WHS_CT_ROI_LOCALIZATION_PROMPTS,
-    WHS_CT_ROI_REFINEMENT_PROMPTS,
-    WHS_CT_GV_LOCALIZATION_PROMPTS,
-    WHS_CT_GV_REFINEMENT_PROMPTS,
-    WHS_MRI_ROI_LOCALIZATION_PROMPTS,
-    WHS_MRI_ROI_REFINEMENT_PROMPTS,
-    WHS_MRI_GV_LOCALIZATION_PROMPTS,
-    WHS_MRI_GV_REFINEMENT_PROMPTS,
-    WHS_ROI_REFINEMENT_GROUPS,
+from oodka.eval.roi_block_diagnostics import collect_block_diagnostics
+from oodka.eval.roi_case_reporting import (
+    remap_gt as _remap_gt,
+    score_exclusive_case,
+    score_independent_case,
+)
+from oodka.eval.roi_checkpoint import resolve_roi_eval_profile
+from oodka.eval.roi_inference import (
+    _hierarchical_foreground_logits,
+    combine_roi_foreground_logits,
+    select_block_rois,
 )
 from oodka.train.forward import predict_block_logits_per_class
 from oodka.train.model_builder import (
@@ -60,54 +50,6 @@ from oodka.utils.io_utils import (
     maybe_mkdir_p,
     read_nifti_as_zyx_with_spacing,
 )
-from oodka.utils.metrics import dice_no_ignore, precision_recall_hd95_no_ignore
-from oodka.utils.postprocessing import keep_largest_component_per_class
-
-
-def _remap_gt(array: np.ndarray, groups=MYOPS_LGE_ROI_FINAL_GROUPS) -> np.ndarray:
-    output = np.zeros(array.shape, dtype=np.int16)
-    for class_id, source_ids in enumerate(groups, start=1):
-        output[np.isin(array, source_ids)] = class_id
-    return output
-
-
-def _hierarchical_foreground_logits(
-    anatomy_logits: torch.Tensor,
-    refinement_logits: torch.Tensor,
-    *,
-    selected_logit: float = 20.0,
-    rejected_logit: float = -20.0,
-) -> torch.Tensor:
-    """Encode strict coarse-to-fine decisions as four foreground logits."""
-    if anatomy_logits.ndim != 5 or anatomy_logits.shape[1:3] != (3, 1):
-        raise ValueError("anatomy_logits must be [B,3,1,H,W]")
-    if refinement_logits.ndim != 5 or refinement_logits.shape[1:3] != (2, 1):
-        raise ValueError("refinement_logits must be [B,2,1,H,W]")
-    if (
-        anatomy_logits.shape[0] != refinement_logits.shape[0]
-        or anatomy_logits.shape[-2:] != refinement_logits.shape[-2:]
-    ):
-        raise ValueError(
-            "Anatomy and refinement logits must share batch/spatial shape"
-        )
-
-    anatomy = anatomy_logits[:, :, 0]
-    refinement = refinement_logits[:, :, 0]
-    background = torch.zeros_like(anatomy[:, :1])
-    coarse = torch.cat([background, anatomy], dim=1).argmax(dim=1)
-    fine = refinement.argmax(dim=1) + 3  # normal=3, scar-edema=4
-    final_label = torch.where(coarse == 3, fine, coarse)
-
-    foreground = anatomy.new_full(
-        (anatomy.shape[0], 4, *anatomy.shape[-2:]), rejected_logit
-    )
-    for class_id in range(1, 5):
-        foreground[:, class_id - 1] = torch.where(
-            final_label == class_id,
-            foreground.new_tensor(selected_logit),
-            foreground[:, class_id - 1],
-        )
-    return foreground[:, :, None]
 
 
 def main() -> None:
@@ -171,47 +113,16 @@ def main() -> None:
 
     device = torch.device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location=device)
-    checkpoint_format = checkpoint.get("format")
-    if checkpoint_format not in {
-        "oodka_lge_roi_v1", "oodka_lge_roi_v2",
-        "oodka_lge_roi_v3_split5", "oodka_lge_flat_v1",
-        "oodka_whs_roi_v1",
-        "oodka_whs_gv_roi_v1",
-    }:
-        raise ValueError("Checkpoint is not a supported OODKA ROI model")
-    is_whs_gv = checkpoint_format == "oodka_whs_gv_roi_v1"
-    is_whs = checkpoint_format in {
-        "oodka_whs_roi_v1", "oodka_whs_gv_roi_v1"
-    }
-    is_split = checkpoint_format == "oodka_lge_roi_v3_split5"
-    is_v2 = checkpoint_format in {"oodka_lge_roi_v2", "oodka_lge_roi_v3_split5"}
-    is_flat = checkpoint_format == "oodka_lge_flat_v1"
-    decision = args.decision
-    if decision == "auto":
-        decision = (
-            "spatial" if is_whs_gv else "refinement" if is_whs
-            else "spatial" if is_v2 else "flat"
-        )
-    if is_whs_gv and decision != "spatial":
-        raise ValueError("WHS-GV checkpoints require --decision spatial (or auto)")
-    if is_whs and not is_whs_gv and decision != "refinement":
-        raise ValueError("WHS whole-heart checkpoints require refinement (or auto)")
-    if is_v2 and decision != "spatial":
-        raise ValueError("V2 checkpoints require --decision spatial (or auto)")
-    if not is_v2 and not is_whs and decision == "spatial":
-        raise ValueError("Spatial hard switching requires a V2 checkpoint")
-    if is_flat and decision != "flat":
-        raise ValueError("Flat checkpoints require --decision flat (or auto)")
+    profile = resolve_roi_eval_profile(
+        checkpoint, decision=args.decision, roi_transform=args.roi_transform
+    )
+    checkpoint_format = profile.checkpoint_format
+    is_whs = profile.is_whs
+    is_flat = profile.is_flat
+    decision = profile.decision
     saved = checkpoint["config"]
-    roi_transform = (
-        str(saved.get("roi_transform", "resize"))
-        if args.roi_transform == "checkpoint"
-        else args.roi_transform
-    )
-    dataset_name = (
-        str(saved.get("dataset_name"))
-        if is_whs else "Dataset011_MYO_LGE_BC_OOD"
-    )
+    roi_transform = profile.roi_transform
+    dataset_name = profile.dataset_name
     cfg = EvalConfig(
         dataset_name=dataset_name,
         fold=int(saved.get("fold", 0)),
@@ -240,51 +151,11 @@ def main() -> None:
         case_ids = case_ids[: args.case_limit]
 
     model = load_frozen_biomedparse(device)
-    if is_whs:
-        if dataset_name == "Dataset009_CT_OOD":
-            anatomy_prompts = (
-                WHS_CT_GV_LOCALIZATION_PROMPTS
-                if is_whs_gv else WHS_CT_ROI_LOCALIZATION_PROMPTS
-            )
-            refinement_prompts = (
-                WHS_CT_GV_REFINEMENT_PROMPTS
-                if is_whs_gv else WHS_CT_ROI_REFINEMENT_PROMPTS
-            )
-        elif dataset_name == "Dataset010_WHS_MRI_OOD":
-            anatomy_prompts = (
-                WHS_MRI_GV_LOCALIZATION_PROMPTS
-                if is_whs_gv else WHS_MRI_ROI_LOCALIZATION_PROMPTS
-            )
-            refinement_prompts = (
-                WHS_MRI_GV_REFINEMENT_PROMPTS
-                if is_whs_gv else WHS_MRI_ROI_REFINEMENT_PROMPTS
-            )
-        else:
-            raise ValueError(f"Unsupported WHS dataset: {dataset_name}")
-    else:
-        anatomy_prompts = (
-            MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
-            if is_flat else MYOPS_LGE_ROI_ANATOMY_PROMPTS
-        )
-        refinement_prompts = (
-            MYOPS_LGE_ROI_V3_REFINEMENT_PROMPTS
-            if is_split else MYOPS_LGE_ROI_V2_REFINEMENT_PROMPTS
-            if is_v2 else MYOPS_LGE_ROI_REFINEMENT_PROMPTS
-        )
+    anatomy_prompts = profile.anatomy_prompts
+    refinement_prompts = profile.refinement_prompts
     anatomy_features = build_prompt_features(model, anatomy_prompts, device)
-    final_groups = (
-        WHS_ROI_REFINEMENT_GROUPS
-        if is_whs else MYOPS_LGE_ROI_SPLIT_FINAL_GROUPS
-        if is_split else MYOPS_LGE_ROI_FINAL_GROUPS
-    )
-    final_names = (
-        {
-            1: "LV", 2: "RV", 3: "LA", 4: "RA",
-            5: "Myo", 6: "AO", 7: "PA",
-        }
-        if is_whs else MYOPS_LGE_ROI_SPLIT_FINAL_NAMES
-        if is_split else MYOPS_LGE_ROI_FINAL_NAMES
-    )
+    final_groups = profile.final_groups
+    final_names = profile.final_names
     final_count = len(final_groups)
     refinement_features = build_prompt_features(
         model, refinement_prompts, device
@@ -398,52 +269,16 @@ def main() -> None:
                     rois = []
                     anatomy_probabilities = None
                 else:
-                    if args.roi_source == "predicted":
-                        block_probability = torch.sigmoid(
-                            anatomy[
-                                :, int(checkpoint.get("roi_prompt_index", 2))
-                            ]
-                        ).masked_fill(
-                            ~valid.to(device)[:, :, None, None], 0.0
-                        ).amax(dim=1)
-                        rois = [
-                            roi_generator.from_probability(value)
-                            for value in block_probability.detach()
-                        ]
-                    elif args.roi_source == "ground_truth":
-                        foreground_source_ids = tuple(
-                            int(source_id) for source_id in checkpoint.get(
-                                "roi_source_labels",
-                                tuple(
-                                    source_id
-                                    for group in final_groups
-                                    for source_id in group
-                                ),
-                            )
-                        )
-                        rois = []
-                        for z_start, block_valid in zip(current_starts, valid):
-                            valid_count = int(block_valid.sum())
-                            target_mask = np.isin(
-                                aligned_seg[z_start : z_start + valid_count],
-                                foreground_source_ids,
-                            ).any(axis=0)
-                            target_resized = F.interpolate(
-                                torch.from_numpy(target_mask)[None, None].float(),
-                                size=(cfg.image_size, cfg.image_size),
-                                mode="nearest",
-                            )[0, 0]
-                            rois.append(
-                                roi_generator.from_probability(target_resized)
-                            )
-                    else:
-                        rois = [
-                            ROICoordinates(
-                                0, 0, cfg.image_size, cfg.image_size,
-                                fallback=False,
-                            )
-                            for _ in current_starts
-                        ]
+                    rois = select_block_rois(
+                        anatomy, valid, current_starts,
+                        roi_source=args.roi_source,
+                        generator=roi_generator,
+                        checkpoint=checkpoint,
+                        final_groups=final_groups,
+                        aligned_seg=aligned_seg,
+                        image_size=cfg.image_size,
+                        device=device,
+                    )
                     anatomy_probabilities = torch.sigmoid(
                         anatomy[
                             :, int(checkpoint.get("roi_prompt_index", 2))
@@ -471,128 +306,28 @@ def main() -> None:
                         (cfg.image_size, cfg.image_size),
                         transform=roi_transform,
                     )
-                    if decision == "refinement":
-                        foreground_scores = restored
-                    elif decision == "spatial":
-                        foreground_scores = hard_switch_foreground_logits(
-                            anatomy,
-                            restored,
-                            rois,
-                            checkpoint.get(
-                                "outside_prompt_mapping", ((0, 0), (1, 1))
-                            ),
-                        )
-                    elif decision == "hierarchical":
-                        foreground_scores = _hierarchical_foreground_logits(
-                            anatomy, restored
-                        )
-                    else:
-                        foreground_scores = torch.cat(
-                            [anatomy[:, 0:2], restored], dim=1
-                        )
+                    foreground_scores = combine_roi_foreground_logits(
+                        anatomy,
+                        restored,
+                        rois,
+                        decision=decision,
+                        outside_prompt_mapping=checkpoint.get(
+                            "outside_prompt_mapping", ((0, 0), (1, 1))
+                        ),
+                    )
                 if args.block_diagnostics_jsonl and not is_flat:
-                    background = torch.zeros_like(foreground_scores[:, :1])
-                    final_prediction_model = torch.cat(
-                        [background, foreground_scores], dim=1
-                    ).argmax(dim=1).detach().cpu()
-                    local_prediction_model = torch.cat(
-                        [background, restored], dim=1
-                    ).argmax(dim=1).detach().cpu()
-                    for block_index, (z_start, block_valid, roi) in enumerate(
-                        zip(current_starts, valid, rois)
-                    ):
-                        valid_count = int(block_valid.sum())
-                        target_source = torch.from_numpy(
-                            aligned_seg[z_start : z_start + valid_count]
-                        )[:, None].float()
-                        target_resized = F.interpolate(
-                            target_source,
-                            size=(cfg.image_size, cfg.image_size),
-                            mode="nearest",
-                        )[:, 0].long()
-                        target_model = torch.zeros_like(target_resized)
-                        for output_id, source_ids in enumerate(final_groups, start=1):
-                            for source_id in source_ids:
-                                target_model[target_resized == int(source_id)] = output_id
-                        roi_mask = torch.zeros_like(target_model, dtype=torch.bool)
-                        roi_mask[:, roi.y0 : roi.y1, roi.x0 : roi.x1] = True
-                        pred_final = final_prediction_model[block_index, :valid_count]
-                        pred_local = local_prediction_model[block_index, :valid_count]
-                        width = final_count + 1
-
-                        def _confusion_for(prediction, mask):
-                            encoded = (
-                                target_model[mask].to(torch.int64) * width
-                                + prediction[mask].to(torch.int64)
-                            )
-                            return torch.bincount(
-                                encoded, minlength=width * width
-                            ).reshape(width, width).tolist()
-
-                        class_voxels = {}
-                        class_inside = {}
-                        class_coverage = {}
-                        roi_voxels = int(roi_mask.sum())
-                        placement = roi_placement(
-                            roi,
-                            (cfg.image_size, cfg.image_size),
-                            roi_transform,
-                        )
-                        for class_id in range(1, final_count + 1):
-                            class_mask = target_model == class_id
-                            total = int(class_mask.sum())
-                            inside = int((class_mask & roi_mask).sum())
-                            class_voxels[str(class_id)] = total
-                            class_inside[str(class_id)] = inside
-                            class_coverage[str(class_id)] = (
-                                inside / total if total else None
-                            )
-                        block_diagnostics.append(
-                            {
-                                "case_id": case_id,
-                                "z_start": int(z_start),
-                                "valid_count": valid_count,
-                                "roi": {
-                                    "x0": int(roi.x0), "y0": int(roi.y0),
-                                    "x1": int(roi.x1), "y1": int(roi.y1),
-                                    "fallback": bool(roi.fallback),
-                                    "area_fraction": float(
-                                        (roi.x1 - roi.x0) * (roi.y1 - roi.y0)
-                                        / (cfg.image_size * cfg.image_size)
-                                    ),
-                                    "transform": roi_transform,
-                                    "canvas_top": int(placement.top),
-                                    "canvas_left": int(placement.left),
-                                    "canvas_height": int(placement.height),
-                                    "canvas_width": int(placement.width),
-                                    "scale_x": float(
-                                        placement.width / max(1, roi.width)
-                                    ),
-                                    "scale_y": float(
-                                        placement.height / max(1, roi.height)
-                                    ),
-                                },
-                                "class_voxels": class_voxels,
-                                "class_voxels_inside_roi": class_inside,
-                                "class_coverage": class_coverage,
-                                "gt_class_fraction_inside_roi": {
-                                    str(class_id): (
-                                        class_inside[str(class_id)] / roi_voxels
-                                        if roi_voxels else 0.0
-                                    )
-                                    for class_id in range(1, final_count + 1)
-                                },
-                                "confusion_final_full_block": _confusion_for(
-                                    pred_final, torch.ones_like(roi_mask)
-                                ),
-                                "confusion_final_inside_roi": _confusion_for(
-                                    pred_final, roi_mask
-                                ),
-                                "confusion_local_inside_roi": _confusion_for(
-                                    pred_local, roi_mask
-                                ),
-                            }
-                        )
+                    block_diagnostics.extend(collect_block_diagnostics(
+                        case_id=case_id,
+                        current_starts=current_starts,
+                        valid=valid,
+                        rois=rois,
+                        aligned_seg=aligned_seg,
+                        foreground_scores=foreground_scores,
+                        restored=restored,
+                        final_groups=final_groups,
+                        image_size=cfg.image_size,
+                        roi_transform=roi_transform,
+                    ))
                 block_count, _, block_z = foreground_scores.shape[:3]
                 resized = F.interpolate(
                     foreground_scores.permute(0, 2, 1, 3, 4).reshape(
@@ -674,102 +409,38 @@ def main() -> None:
         gt_raw, spacing = read_nifti_as_zyx_with_spacing(label_path)
         target = _remap_gt(gt_raw, final_groups)
         if decision == "independent":
-            threshold_logit = float(
-                np.log(
-                    args.independent_threshold
-                    / (1.0 - args.independent_threshold)
-                )
-            )
-            row = {"case_id": case_id}
-            present_scores = []
-            for class_id in range(1, final_count + 1):
-                binary = preprocessor.prompt_logits_to_raw_segmentation(
-                    final_prompt_logits[class_id - 1 : class_id]
-                    - threshold_logit,
-                    {0: 1},
-                    properties,
-                ) > 0
-                if tuple(binary.shape) != raw_shape:
-                    raise ValueError(
-                        f"{case_id}: restored={binary.shape}, raw={raw_shape}"
-                    )
-                if args.postprocess == "largest_per_class":
-                    binary = keep_largest_component_per_class(
-                        binary.astype(np.int16), (1,)
-                    ) > 0
-                binary_target = target == class_id
-                denominator = int(binary.sum() + binary_target.sum())
-                raw_dice = (
-                    2.0 * int((binary & binary_target).sum()) / denominator
-                    if denominator > 0
-                    else None
-                )
-                dice_value = raw_dice if binary_target.any() else None
-                row[f"dice_{class_id}"] = dice_value
-                if dice_value is not None:
-                    present_scores.append(dice_value)
-                precision, recall, hd95 = precision_recall_hd95_no_ignore(
-                    binary.astype(np.int16),
-                    binary_target.astype(np.int16),
-                    (1,),
-                    spacing,
-                )
-                row[f"prec_{class_id}"] = precision.get(1)
-                row[f"rec_{class_id}"] = recall.get(1)
-                row[f"hd95_{class_id}"] = hd95.get(1)
-                independent_predicted[class_id] += int(binary.sum())
-                independent_target[class_id] += int(binary_target.sum())
-                output = sitk.GetImageFromArray(binary.astype(np.int16))
-                output.CopyInformation(sitk.ReadImage(label_path))
-                sitk.WriteImage(
-                    output,
-                    os.path.join(independent_dirs[class_id], case_id + ending),
-                )
-            row["dice_mean_gt"] = (
-                float(np.mean(present_scores)) if present_scores else None
-            )
-            # Keep a stable CSV column order shared with the exclusive path.
-            ordered = {"case_id": row.pop("case_id"), "dice_mean_gt": row.pop("dice_mean_gt")}
-            ordered.update(row)
-            rows.append(ordered)
+            rows.append(score_independent_case(
+                case_id=case_id,
+                final_prompt_logits=final_prompt_logits,
+                target=target,
+                spacing=spacing,
+                preprocessor=preprocessor,
+                properties=properties,
+                raw_shape=raw_shape,
+                threshold=args.independent_threshold,
+                postprocess=args.postprocess,
+                independent_dirs=independent_dirs,
+                independent_predicted=independent_predicted,
+                independent_target=independent_target,
+                label_path=label_path,
+                ending=ending,
+            ))
             continue
 
-        prediction = preprocessor.prompt_logits_to_raw_segmentation(
-            final_prompt_logits,
-            {index: index + 1 for index in range(final_count)},
-            properties,
-        )
-        if tuple(prediction.shape) != raw_shape:
-            raise ValueError(
-                f"{case_id}: restored={prediction.shape}, raw={raw_shape}"
-            )
-        if args.postprocess == "largest_per_class":
-            prediction = keep_largest_component_per_class(
-                prediction,
-                tuple(range(1, final_count + 1)),
-            )
-        width = final_count + 1
-        encoded = target.astype(np.int64) * width + prediction.astype(np.int64)
-        confusion += np.bincount(
-            encoded.ravel(), minlength=width * width
-        ).reshape(width, width)
-        dice_pc, dice_mean, _ = dice_no_ignore(
-            prediction, target, tuple(range(1, final_count + 1))
-        )
-        precision, recall, hd95 = precision_recall_hd95_no_ignore(
-            prediction, target, tuple(range(1, final_count + 1)), spacing
-        )
-        row = {"case_id": case_id, "dice_mean_gt": dice_mean}
-        for class_id in range(1, final_count + 1):
-            row[f"dice_{class_id}"] = dice_pc.get(class_id)
-            row[f"prec_{class_id}"] = precision.get(class_id)
-            row[f"rec_{class_id}"] = recall.get(class_id)
-            row[f"hd95_{class_id}"] = hd95.get(class_id)
-        rows.append(row)
-        output = sitk.GetImageFromArray(prediction.astype(np.int16))
-        output.CopyInformation(sitk.ReadImage(label_path))
-        sitk.WriteImage(output, os.path.join(pred_dir, case_id + ending))
-
+        rows.append(score_exclusive_case(
+            case_id=case_id,
+            final_prompt_logits=final_prompt_logits,
+            target=target,
+            spacing=spacing,
+            preprocessor=preprocessor,
+            properties=properties,
+            raw_shape=raw_shape,
+            postprocess=args.postprocess,
+            confusion=confusion,
+            pred_dir=pred_dir,
+            label_path=label_path,
+            ending=ending,
+        ))
     with open(os.path.join(args.out_dir, "metrics.csv"), "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
         writer.writeheader()

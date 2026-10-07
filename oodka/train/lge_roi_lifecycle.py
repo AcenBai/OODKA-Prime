@@ -13,7 +13,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from ..data.lge_roi import ROICache, roi_diagnostics
+from ..data.roi_cache import ROICache
+from ..data.roi_geometry import roi_diagnostics
 from ..utils.io_utils import maybe_mkdir_p
 from .engine import learning_rate_scale, load_fold_cases, set_seed
 from .forward import predict_block_logits_per_class

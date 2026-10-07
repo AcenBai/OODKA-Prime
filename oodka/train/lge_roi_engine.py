@@ -15,18 +15,19 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from ..data.lge_roi import (
-    ROICache,
+from ..data.roi_augmentation import augment_lge_batch
+from ..data.roi_cache import ROICache
+from ..data.roi_geometry import (
     ROICoordinates,
-    ROIGenerator,
-    augment_lge_batch,
     crop_and_resize_batch,
+    restore_roi_logits,
+)
+from ..data.roi_policy import (
+    ROIGenerator,
     hard_switch_foreground_logits,
     jitter_roi,
     oracle_block_rois,
     remap_grouped_labels,
-    restore_roi_logits,
-    roi_diagnostics,
     roi_prompt_visibility,
 )
 from ..utils.io_utils import maybe_mkdir_p

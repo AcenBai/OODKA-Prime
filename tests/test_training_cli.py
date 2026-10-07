@@ -5,6 +5,7 @@ from oodka.train.cli import (
     add_augmentation_switch,
     add_common_training_arguments,
     add_fusion_training_arguments,
+    add_roi_training_arguments,
     common_train_config_kwargs,
     fusion_builder_kwargs,
     fusion_train_config_kwargs,
@@ -15,6 +16,25 @@ def test_new_alignment_defaults_are_relative_capacity():
     cfg = TrainConfig()
     assert cfg.relative_kd is True
     assert cfg.s_transport_mode == "capacity_partial"
+
+
+def test_shared_roi_switches_keep_legacy_defaults_and_allow_oracle_pad():
+    parser = argparse.ArgumentParser()
+    add_roi_training_arguments(parser)
+    defaults = parser.parse_args([])
+    assert defaults.warmup_epochs == 10
+    assert defaults.roi_train_source == "predicted"
+    assert defaults.roi_transform == "resize"
+    assert defaults.roi_prompt_loss_reduction == "sum"
+    selected = parser.parse_args([
+        "--roi_train_source", "ground_truth",
+        "--roi_transform", "pad",
+        "--roi_prompt_loss_reduction", "prompt_mean",
+    ])
+    assert (selected.roi_train_source, selected.roi_transform) == (
+        "ground_truth", "pad"
+    )
+    assert selected.roi_prompt_loss_reduction == "prompt_mean"
 
 
 def test_fusion_cli_defaults_and_soft_disable():

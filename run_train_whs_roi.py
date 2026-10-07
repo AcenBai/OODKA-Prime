@@ -32,6 +32,7 @@ from oodka.train.cli import (
     add_augmentation_switch,
     add_common_training_arguments,
     add_fusion_training_arguments,
+    add_roi_training_arguments,
     common_train_config_kwargs,
     fusion_builder_kwargs,
     fusion_train_config_kwargs,
@@ -77,6 +78,7 @@ def main() -> None:
         raw_cache_cases_default=4,
     )
     add_fusion_training_arguments(parser)
+    add_roi_training_arguments(parser)
     add_augmentation_switch(parser, default=True)
     parser.add_argument("--dataset_name", required=True, choices=tuple(DATASET_SPECS))
     parser.add_argument(
@@ -85,35 +87,10 @@ def main() -> None:
         default="whole_heart",
     )
     parser.add_argument("--block_z", type=int, default=1)
-    parser.add_argument("--warmup_epochs", type=int, default=10)
-    parser.add_argument("--roi_threshold", type=float, default=0.3)
-    parser.add_argument("--roi_expand", type=float, default=1.25)
-    parser.add_argument("--roi_fallback", choices=("full", "center"), default="full")
-    parser.add_argument("--roi_refresh_every", type=int, default=0)
-    parser.add_argument(
-        "--roi_train_source",
-        choices=("predicted", "ground_truth", "full"),
-        default="predicted",
-        help=(
-            "Use predicted, GT-oracle, or full-image ROIs throughout "
-            "train/validation."
-        ),
-    )
-    parser.add_argument(
-        "--roi_transform",
-        choices=("resize", "pad", "letterbox"),
-        default="resize",
-        help="Map an ROI crop to the fixed model canvas.",
-    )
     parser.add_argument(
         "--pseudo_rgb_mode",
         choices=("adjacent", "center_repeat"),
         default="center_repeat",
-    )
-    parser.add_argument(
-        "--roi_prompt_loss_reduction",
-        choices=("sum", "mean", "prompt_mean"),
-        default="sum",
     )
     parser.add_argument("--biomedparse_preproc_dir", default="")
     args = parser.parse_args()
