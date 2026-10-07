@@ -32,3 +32,8 @@ Thumbs.db
 # Runtime logs
 docs/error_logs.txt
 *.log
+
+# Keep this handoff branch focused on code and its handoff document.
+/tests/
+/docs/*
+!/docs/CODE_HANDOFF_20261008.md
